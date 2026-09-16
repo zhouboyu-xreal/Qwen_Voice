@@ -46,10 +46,13 @@ test('desktop owns wake-word detection and forwards only hidden audio to its wor
     audio: 'pcm',
     sampleRate: 16_000,
   }])
+  assert.equal(runtime.reset(), true)
+  assert.deepEqual(worker.messages.at(-1), { type: 'reset' })
 
   worker.emit('message', { type: 'detected' })
   assert.equal(detections, 1)
   runtime.setEnabled(false)
   assert.equal(worker.terminated, true)
   assert.equal(runtime.accept('after-stop'), false)
+  assert.equal(runtime.reset(), false)
 })

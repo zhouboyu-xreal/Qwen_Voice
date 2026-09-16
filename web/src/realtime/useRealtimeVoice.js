@@ -198,6 +198,7 @@ export default function useRealtimeVoice({
   suspended = false,
   outputMuted = false,
   inputOnlyMute = false,
+  wakeWordEnabled = false,
   wakeWordOnly = false,
   clientType = 'web',
   clientLabel = 'WebUI',
@@ -228,6 +229,7 @@ export default function useRealtimeVoice({
   const inputErrorRef = useRef(onInputError)
   const clientActionRef = useRef(onClientAction)
   const wakeWordAudioRef = useRef(onWakeWordAudio)
+  const wakeWordEnabledRef = useRef(wakeWordEnabled)
   const wakeWordOnlyRef = useRef(wakeWordOnly)
   const socketRef = useRef(null)
   const takeoverRef = useRef(false)
@@ -266,6 +268,7 @@ export default function useRealtimeVoice({
   inputErrorRef.current = onInputError
   clientActionRef.current = onClientAction
   wakeWordAudioRef.current = onWakeWordAudio
+  wakeWordEnabledRef.current = wakeWordEnabled
   wakeWordOnlyRef.current = wakeWordOnly
   enabledRef.current = enabled
   outputMutedRef.current = outputMuted
@@ -696,6 +699,7 @@ export default function useRealtimeVoice({
           inputEnabled: mode.inputEnabled,
           outputEnabled: mode.outputEnabled,
           textOnly: mode.textOnly,
+          wakeWordEnabled: wakeWordEnabledRef.current,
           wakeWordOnly: wakeWordOnlyRef.current,
           clientType,
           clientLabel,
@@ -1005,8 +1009,13 @@ export default function useRealtimeVoice({
 
   // 桌面唤起（快捷键/托盘）时显式唤醒 Gateway：唤醒词开启时 socket 在休眠
   // 期间保持连接，不会重发 connect，需要专门的事件恢复前台语音连接。
-  const wake = useCallback(() => (
-    sendSocketEvent({ type: GatewayClientEvent.WAKE })
+  const wake = useCallback(({ preWakeContext = '' } = {}) => (
+    sendSocketEvent({
+      type: GatewayClientEvent.WAKE,
+      ...(String(preWakeContext || '').trim()
+        ? { preWakeContext: String(preWakeContext).trim() }
+        : {}),
+    })
   ), [sendSocketEvent])
 
   const publishClientEvent = useCallback((name, data = {}, deliveryHint) => (

@@ -41,7 +41,7 @@ test('keeps optional frontend tools enabled unless explicitly disabled', () => {
     'fetch_url',
     'knowledge',
     'notes',
-    'recall',
+    'memory_recall',
   ])
 })
 

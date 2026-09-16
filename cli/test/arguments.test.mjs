@@ -35,6 +35,18 @@ test('parses independent TUI and WebUI client commands', () => {
   assert.equal(tui.url, 'https://voice.example.com')
   assert.equal(tui.sessionId, 'project-one')
   assert.equal(tui.audioMode, 'full')
+  assert.equal(parseArguments(['tui', '--wake-word'], {}).wakeWord, true)
+  assert.equal(
+    parseArguments(['tui', '--wake-word', '--prewake-context'], {}).preWakeContext,
+    true,
+  )
+  assert.equal(
+    parseArguments(['tui', '--prewake-context'], {}).preWakeContext,
+    false,
+  )
+  assert.equal(parseArguments(['tui'], {
+    QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED: 'true',
+  }).wakeWord, true)
   assert.equal(parseArguments(['tui'], {
     QWEN_AUDIO_GATEWAY_CLIENT_TOKEN: 'remote-token',
   }).accessToken, 'remote-token')
@@ -46,6 +58,10 @@ test('parses independent TUI and WebUI client commands', () => {
       QWEN_AUDIO_AGENT_TUI_AUDIO_MODE: 'FULL',
     }).audioMode,
     'full',
+  )
+  assert.throws(
+    () => parseArguments(['gateway', '--prewake-context'], {}),
+    /只适用于 tui/,
   )
 
   const web = parseArguments(['webui', '--no-open'], {})

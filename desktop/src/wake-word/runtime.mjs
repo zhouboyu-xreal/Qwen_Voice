@@ -23,6 +23,12 @@ export class DesktopWakeWordRuntime {
     return true
   }
 
+  reset() {
+    if (!this.worker) return false
+    this.worker.postMessage({ type: 'reset' })
+    return true
+  }
+
   #start() {
     if (this.worker) return
     const worker = new this.WorkerClass(

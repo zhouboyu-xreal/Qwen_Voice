@@ -137,6 +137,7 @@ export const GatewaySessionHelloSchema = GatewayClientEnvelopeSchema.extend({
     input_enabled: z.boolean().optional(),
     output_enabled: z.boolean().optional(),
     text_only: z.boolean().optional(),
+    wake_word_enabled: z.boolean().optional(),
     wake_word_only: z.boolean().optional(),
     provider: z.string().min(1).max(80).optional(),
     output_voice: z.string().min(1).max(160).optional(),
@@ -476,6 +477,7 @@ export function gatewayHelloAsLegacyConnect(hello) {
       inputEnabled: parsed.connection.input_enabled ?? audioInput,
       outputEnabled: parsed.connection.output_enabled ?? true,
       textOnly: parsed.connection.text_only ?? !audioInput,
+      wakeWordEnabled: parsed.connection.wake_word_enabled === true,
       wakeWordOnly: parsed.connection.wake_word_only === true,
       ...(parsed.connection.provider ? { provider: parsed.connection.provider } : {}),
       ...(parsed.connection.output_voice

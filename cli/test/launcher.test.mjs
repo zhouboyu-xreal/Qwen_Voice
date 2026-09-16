@@ -637,7 +637,7 @@ test('connects TUI and WebUI without starting services', async () => {
   const tui = harness()
   tui.dependencies.env.QWEN_AUDIO_AGENT_ACCESS_TOKEN = 'remote-token'
   assert.equal(
-    await main(['tui', '--audio-mode', 'full'], tui.dependencies),
+    await main(['tui', '--audio-mode', 'full', '--wake-word', '--prewake-context'], tui.dependencies),
     11,
   )
   assert.deepEqual(tui.calls.map(call => call[0]), [
@@ -645,6 +645,8 @@ test('connects TUI and WebUI without starting services', async () => {
     'instance.release',
   ])
   assert.equal(tui.calls[0][1].audioMode, 'full')
+  assert.equal(tui.calls[0][1].wakeWord, true)
+  assert.equal(tui.calls[0][1].preWakeContext, true)
   assert.equal(tui.calls[0][1].accessToken, 'remote-token')
 
   const web = harness()

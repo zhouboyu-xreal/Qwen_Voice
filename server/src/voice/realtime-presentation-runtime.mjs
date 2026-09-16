@@ -77,6 +77,7 @@ export class RealtimePresentationRuntime {
     announcementQuietMs,
     responseContextCleanupMs,
     turnCitations = null,
+    onAssistantMessageRecorded = null,
   }) {
     this.ownerId = ownerId
     this.sessionId = sessionId
@@ -94,6 +95,11 @@ export class RealtimePresentationRuntime {
     this.announcementQuietMs = announcementQuietMs
     this.responseContextCleanupMs = responseContextCleanupMs
     this.turnCitations = turnCitations
+    this.onAssistantMessageRecorded = (
+      typeof onAssistantMessageRecorded === 'function'
+        ? onAssistantMessageRecorded
+        : null
+    )
     this.contexts = new Map()
     this.playbackTurns = new Map()
     this.lastCorrectionTurn = null
@@ -340,6 +346,7 @@ export class RealtimePresentationRuntime {
     const responseTurnId = context?.turnId || this.turns.turnId
     const responseStatus = event.response?.status
     const failed = ['failed', 'cancelled', 'incomplete'].includes(responseStatus)
+    if (context && !failed) context.responseDone = true
     const suppressToolFollowUp = Boolean(
       failed
       || context?.suppressed
@@ -381,7 +388,7 @@ export class RealtimePresentationRuntime {
       }
     }
     if (context?.hasAudio && !failed) {
-      context.responseDone = true
+      this.#notifyDeliveredAssistantMessage(id, context)
       this.#finishContextIfComplete(id, context)
     } else {
       const nonVoiceClient = this.getNonVoiceClient()
@@ -405,6 +412,7 @@ export class RealtimePresentationRuntime {
       ) {
         this.#flushPendingTranscripts(id, context)
       }
+      if (!failed) this.#notifyDeliveredAssistantMessage(id, context)
       if (context?.origin === 'announcement') {
         if (completedNonVoiceAnnouncement) {
           this.announcements.confirmMany(contextTaskIds(context))
@@ -478,7 +486,7 @@ export class RealtimePresentationRuntime {
       && containsReservedProtocolEnvelope(content),
     )
     if (final && !invalidModelProtocol) {
-      this.conversationSync.record({
+      const message = this.conversationSync.record({
         ownerId: this.ownerId,
         sessionId: this.sessionId,
         id: `voice:assistant:${id}`,
@@ -490,6 +498,11 @@ export class RealtimePresentationRuntime {
         ...(citations.length ? { citations } : {}),
         ...context,
       })
+      // The transcript is immediately available to the current session, but it
+      // is not evidence for long-term memory until the response was actually
+      // delivered. For audio, that additionally requires playback.ended.
+      context.assistantMessage = message
+      this.#notifyDeliveredAssistantMessage(id, context)
     }
     this.send({
       type: final
@@ -516,6 +529,7 @@ export class RealtimePresentationRuntime {
   }
 
   #finishContextIfComplete(id, context) {
+    this.#notifyDeliveredAssistantMessage(id, context)
     if (
       context
       && context.playbackEnded
@@ -524,6 +538,23 @@ export class RealtimePresentationRuntime {
     ) {
       this.contexts.delete(id)
     }
+  }
+
+  #notifyDeliveredAssistantMessage(id, context) {
+    if (
+      !context
+      || context.memoryObservationNotified
+      || context.interrupted
+      || context.suppressed
+      || !context.assistantMessage
+      || !context.transcriptDone
+      || !context.responseDone
+      || (context.hasAudio && !context.playbackEnded)
+    ) return
+    context.memoryObservationNotified = true
+    // The callback must stay synchronous and isolated from the realtime
+    // presentation path. Gateway wires asynchronous memory observation here.
+    try { this.onAssistantMessageRecorded?.(context.assistantMessage) } catch { /* observer isolation */ }
   }
 
   #scheduleContextCleanup(id, context) {
@@ -580,6 +611,7 @@ export class RealtimePresentationRuntime {
     this.playbackTurns.delete(id)
     if (context) {
       context.playbackEnded = true
+      this.#notifyDeliveredAssistantMessage(id, context)
       this.#finishContextIfComplete(id, context)
       if (this.contexts.get(id) === context) {
         this.#scheduleContextCleanup(id, context)
@@ -603,6 +635,7 @@ export class RealtimePresentationRuntime {
 
   cancelPlayback(id, { reason = '' } = {}) {
     const context = this.contexts.get(id)
+    if (context?.suppressed) return
     this.announcementWindow.finishPlayback(id, {
       awaitsToolFollowUp: awaitsToolFollowUp(context),
     })
@@ -623,6 +656,7 @@ export class RealtimePresentationRuntime {
       })
     }
     if (context) {
+      context.interrupted = reason === 'user_interruption'
       context.suppressed = true
       context.playbackEnded = true
       context.pendingTranscripts = []
@@ -635,6 +669,14 @@ export class RealtimePresentationRuntime {
       origin: context?.origin || 'model',
     })
     this.#flushAnnouncementsSoon()
+  }
+
+  interruptActiveResponses() {
+    for (const [id, context] of this.contexts) {
+      if (context.suppressed) continue
+      context.interrupted = true
+      this.cancelPlayback(id, { reason: 'user_interruption' })
+    }
   }
 
   cancelPermission(authorizationId) {

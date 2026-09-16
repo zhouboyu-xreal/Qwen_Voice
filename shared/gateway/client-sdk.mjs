@@ -52,6 +52,7 @@ function connectionConfiguration(value = {}) {
     ...(value.inputEnabled === undefined ? {} : { input_enabled: value.inputEnabled === true }),
     ...(value.outputEnabled === undefined ? {} : { output_enabled: value.outputEnabled === true }),
     ...(value.textOnly === undefined ? {} : { text_only: value.textOnly === true }),
+    ...(value.wakeWordEnabled === undefined ? {} : { wake_word_enabled: value.wakeWordEnabled === true }),
     ...(value.wakeWordOnly === undefined ? {} : { wake_word_only: value.wakeWordOnly === true }),
     ...(value.provider ? { provider: String(value.provider) } : {}),
     ...(value.outputVoice ? { output_voice: String(value.outputVoice) } : {}),

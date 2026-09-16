@@ -1,7 +1,14 @@
 import { GatewayClientEvent } from '../../shared/protocol/realtime-events.mjs'
 import { clientInputCapabilities } from '../../shared/client-input-capabilities.mjs'
+import { preWakeContextEnabled } from '../../shared/voice/prewake-context-runtime.mjs'
 
 const AUDIO_MODES = new Set(['half', 'full'])
+
+function enabled(value) {
+  return ['1', 'true', 'yes', 'on'].includes(
+    String(value || '').trim().toLowerCase(),
+  )
+}
 
 function normalizeAudioMode(value) {
   const mode = String(value || 'half').toLowerCase()
@@ -42,6 +49,8 @@ export function parseArguments(argv, env = process.env) {
     ).trim(),
     sessionId: env.QWEN_AUDIO_AGENT_SESSION_ID || 'tui-main',
     audioMode: env.QWEN_AUDIO_AGENT_TUI_AUDIO_MODE || 'half',
+    wakeWord: enabled(env.QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED),
+    preWakeContext: preWakeContextEnabled(env),
   }
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
@@ -53,12 +62,21 @@ export function parseArguments(argv, env = process.env) {
       options.help = true
     } else if (argument === '--audio-mode') {
       options.audioMode = nextArgumentValue(argv, index++, '--audio-mode')
+    } else if (argument === '--wake-word') {
+      options.wakeWord = true
+    } else if (argument === '--no-wake-word') {
+      options.wakeWord = false
+    } else if (argument === '--prewake-context') {
+      options.preWakeContext = true
+    } else if (argument === '--no-prewake-context') {
+      options.preWakeContext = false
     } else throw new Error(`未知参数：${argument}`)
   }
   options.url = normalizeGatewayUrl(options.url)
   options.sessionId = String(options.sessionId || '').trim()
   if (!options.sessionId) throw new Error('--session 不能为空')
   options.audioMode = normalizeAudioMode(options.audioMode)
+  if (!options.wakeWord) options.preWakeContext = false
   return options
 }
 
@@ -73,6 +91,8 @@ export function connectMessage({
   voiceEnabled,
   inputEnabled,
   outputEnabled,
+  wakeWordEnabled,
+  wakeWordOnly,
   workingDirectory = process.cwd(),
   timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
   locale = Intl.DateTimeFormat().resolvedOptions().locale,
@@ -86,6 +106,12 @@ export function connectMessage({
     ...(outputEnabled === undefined
       ? {}
       : { outputEnabled: outputEnabled === true }),
+    ...(wakeWordEnabled === undefined
+      ? {}
+      : { wakeWordEnabled: wakeWordEnabled === true }),
+    ...(wakeWordOnly === undefined
+      ? {}
+      : { wakeWordOnly: wakeWordOnly === true }),
     clientType: 'cli',
     clientLabel: 'CLI',
     inputCapabilities: clientInputCapabilities('cli'),
@@ -197,7 +223,9 @@ export function audioModeForPlatform(
   }
 }
 
-export function helpText(mode = audioModeForPlatform()) {
+export function helpText(mode = audioModeForPlatform(), {
+  wakeWordEnabled = false,
+} = {}) {
   const description = mode.audioBackend === 'coreaudio'
     ? '语音模式：请直接说话；使用 macOS CoreAudio 全双工回声消除，可用语音打断回复。'
     : mode.fullDuplex
@@ -210,6 +238,7 @@ export function helpText(mode = audioModeForPlatform()) {
     '命令：',
     ...(mode.manualInterrupt ? ['  /interrupt       手动打断当前回复'] : []),
     '  /mute           静音 / 恢复麦克风',
+    ...(wakeWordEnabled ? ['  /sleep          重新进入本地唤醒词监听'] : []),
     '  /help           显示帮助',
     '  /exit           退出（/quit、/q 同义）',
   ].join('\n')

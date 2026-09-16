@@ -467,7 +467,7 @@ export class ToolCallHandler {
           backendAvailability: this.backendAvailability,
           frontendRetrieval: this.frontendRetrieval,
           frontendKnowledge: this.frontendKnowledge,
-          sessionDigests: this.sessionDigests,
+          memoryService: this.memoryService,
           permissionPending: this.hasPendingBackendPermission() || (
             toolName === RESPOND_PERMISSION_TOOL_NAME
             && Boolean(this.agentTaskRuntime.permissionReceipt(args.permission_id, turnId))

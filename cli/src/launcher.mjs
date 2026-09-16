@@ -1,5 +1,5 @@
 import { dirname, resolve } from 'node:path'
-import { runtimePathEnvironment } from '../../shared/runtime-paths.mjs'
+import { runtimePathEnvironment } from '../../shared/path-policy.mjs'
 import { tuiClientDirectory } from '../../shared/client-paths.mjs'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -70,6 +70,8 @@ async function runMinimal(options) {
     accessToken: options.accessToken,
     sessionId: options.sessionId,
     audioMode: options.audioMode,
+    wakeWord: options.wakeWord,
+    preWakeContext: options.preWakeContext,
     takeover: options.takeover,
   })
   return 0

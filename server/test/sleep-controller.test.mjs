@@ -82,3 +82,17 @@ test('can hand inactivity timing to a client without an old timer firing', async
   assert.equal(sleeps, 0)
   controller.close()
 })
+
+test('supports a shorter one-off grace interval after wake', async () => {
+  let sleeps = 0
+  const controller = new SleepController({
+    timeoutMs: 500,
+    onSleep: () => { sleeps += 1 },
+  })
+  controller.enable()
+  controller.holdSleeping()
+  controller.wake({ delayMs: 25 })
+  await wait(80)
+  assert.equal(sleeps, 1)
+  controller.close()
+})

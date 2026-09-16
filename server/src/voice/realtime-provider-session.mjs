@@ -133,6 +133,13 @@ export class RealtimeProviderSession {
     return this.frontend?.updateAgentContext(context, options)
   }
 
+  // 文本上下文同样必须经由 Session 生命周期层转发。Gateway 不能直接持有
+  // RealtimeFrontend，否则在 provider 重连或切换时会绕过当前 frontend。
+  appendUserContext(text) {
+    if (!this.ready || !this.frontend?.appendUserContext) return Promise.resolve(false)
+    return this.frontend.appendUserContext(text)
+  }
+
   appendAudio(audio) {
     if (this.ready) {
       this.frontend.appendAudio(audio)

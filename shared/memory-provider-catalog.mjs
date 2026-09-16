@@ -1,4 +1,8 @@
-export const SUPPORTED_MEMORY_PROVIDERS = Object.freeze(['markdown', 'voicemem'])
+export const SUPPORTED_MEMORY_PROVIDERS = Object.freeze([
+  'markdown',
+  'voicemem',
+  'agent-memory',
+])
 
 export function normalizeMemoryProviderSelection(value) {
   const selected = String(value || 'markdown').trim().toLowerCase()

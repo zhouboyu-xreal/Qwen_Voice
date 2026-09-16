@@ -67,6 +67,10 @@ function harness({
       // 记下第二个参数：这一层曾经只转发 context，把 options 静默吞掉，
       // 而 stub 当时也只记录第一个参数，于是那个断点在测试里完全隐形。
       updateAgentContext: (context, options) => calls.push(['updateAgentContext', context, options]),
+      appendUserContext: text => {
+        calls.push(['appendUserContext', text])
+        return Promise.resolve({ id: 'context-item' })
+      },
       triggerError: error => options.onError(error),
       triggerClose: () => {
         frontend.ready = false
@@ -292,4 +296,22 @@ test('forwards agent context options down to the frontend', async () => {
   const [, context, options] = calls.find(([name]) => name === 'updateAgentContext')
   assert.deepEqual(context, { memories: [] })
   assert.deepEqual(options, { refreshSession: false }, 'options 必须原样到底层')
+})
+
+test('forwards transient user context to the active frontend', async () => {
+  const { runtime, calls } = harness({ connectMode: 'resolve' })
+  await runtime.ensure()
+
+  await runtime.appendUserContext('<pre_wake_context>我明天要去唐山。</pre_wake_context>')
+
+  assert.deepEqual(
+    calls.find(([name]) => name === 'appendUserContext'),
+    ['appendUserContext', '<pre_wake_context>我明天要去唐山。</pre_wake_context>'],
+  )
+})
+
+test('does not claim transient user context was appended before the frontend is ready', async () => {
+  const { runtime } = harness()
+
+  assert.equal(await runtime.appendUserContext('pre-wake'), false)
 })

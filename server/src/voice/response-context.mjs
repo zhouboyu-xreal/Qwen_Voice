@@ -53,6 +53,8 @@ export function ensureResponseContext(contexts, id, fallback = {}) {
     playbackEnded: false,
     responseDone: false,
     transcriptDone: false,
+    interrupted: false,
+    memoryObservationNotified: false,
     ...fallback,
     pendingTranscripts: pendingTranscripts(fallback.pendingTranscripts),
   }

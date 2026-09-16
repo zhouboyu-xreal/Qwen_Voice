@@ -11,6 +11,7 @@ export class DesktopPresence {
     this.shortcut = ''
     this.shortcutRegistered = false
     this.shortcutPaused = false
+    this.wakeReason = ''
   }
 
   send(state, reason = '') {
@@ -28,6 +29,7 @@ export class DesktopPresence {
     window.show()
     window.focus()
     if (this.state === 'hidden') {
+      this.wakeReason = reason
       this.send('waking', reason)
     } else {
       window.webContents.send('qwen-audio-agent:lifecycle', {
@@ -51,8 +53,10 @@ export class DesktopPresence {
 
   ready() {
     if (this.state !== 'waking') return false
+    const reason = this.wakeReason || 'unknown'
+    this.wakeReason = ''
     this.send('active', 'ready')
-    this.logger?.info('desktop.visible')
+    this.logger?.info('desktop.visible', { reason })
     return true
   }
 

@@ -5,6 +5,7 @@ import {
   normalizeBackendProtocol,
 } from '../../shared/backend/catalog.mjs'
 import { parseGatewayConnectionEndpoint } from '../../shared/gateway/remote-access.mjs'
+import { preWakeContextEnabled } from '../../shared/voice/prewake-context-runtime.mjs'
 
 const COMMANDS = new Set([
   'gateway',
@@ -137,6 +138,8 @@ export function parseArguments(argv, env = process.env) {
     audioMode: String(
       env.QWEN_AUDIO_AGENT_TUI_AUDIO_MODE || 'half',
     ).toLowerCase(),
+    wakeWord: enabled(env.QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED),
+    preWakeContext: preWakeContextEnabled(env),
     backend: normalizeBackendProtocol(env.AGENT_PROTOCOL),
     backendPermissionMode: String(
       env.QWEN_AUDIO_AGENT_BACKEND_PERMISSION_MODE || 'native',
@@ -164,6 +167,8 @@ export function parseArguments(argv, env = process.env) {
     urlSpecified: Boolean(env.QWEN_AUDIO_AGENT_URL),
   }
   let audioModeSpecified = false
+  let wakeWordSpecified = false
+  let preWakeContextSpecified = false
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]
@@ -214,6 +219,18 @@ export function parseArguments(argv, env = process.env) {
     } else if (argument === '--audio-mode') {
       options.audioMode = nextValue(args, index++, '--audio-mode').toLowerCase()
       audioModeSpecified = true
+    } else if (argument === '--wake-word') {
+      options.wakeWord = true
+      wakeWordSpecified = true
+    } else if (argument === '--no-wake-word') {
+      options.wakeWord = false
+      wakeWordSpecified = true
+    } else if (argument === '--prewake-context') {
+      options.preWakeContext = true
+      preWakeContextSpecified = true
+    } else if (argument === '--no-prewake-context') {
+      options.preWakeContext = false
+      preWakeContextSpecified = true
     } else if (argument === '--no-open') options.openBrowser = false
     else if (argument === '--takeover') options.takeover = true
     else if (argument === '--skill') {
@@ -313,6 +330,12 @@ export function parseArguments(argv, env = process.env) {
   if (command !== 'tui' && audioModeSpecified) {
     throw new Error('--audio-mode 只适用于 tui')
   }
+  if (command !== 'tui' && wakeWordSpecified) {
+    throw new Error('--wake-word 只适用于 tui')
+  }
+  if (command !== 'tui' && preWakeContextSpecified) {
+    throw new Error('--prewake-context 只适用于 tui')
+  }
   if (command !== 'tui' && options.takeover) {
     throw new Error('--takeover 只适用于 tui')
   }
@@ -341,6 +364,7 @@ export function parseArguments(argv, env = process.env) {
       `不支持的音频模式：${options.audioMode}（可选 half、full）`,
     )
   }
+  if (!options.wakeWord) options.preWakeContext = false
   if (
     command === 'gateway'
     && !['run', 'status', 'pair', 'devices', 'revoke'].includes(options.gatewayAction)
@@ -430,6 +454,8 @@ export function helpText() {
     '界面选项：',
     '  --session ID           复用指定语音会话',
     '  --audio-mode MODE      Linux / Windows 使用 half（默认）或 full',
+    '  --wake-word            启用本地“你好千问”关键词唤醒（仅 TUI）',
+    '  --prewake-context      唤醒前用本地 Agent Memory ASR 提供临时上下文（仅 TUI）',
     '  --takeover             显式接管同一用户的现有活动客户端（仅 TUI）',
     '  --no-open              WebUI 只打印地址，不打开浏览器',
     '  -h, --help             显示帮助',

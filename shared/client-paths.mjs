@@ -1,6 +1,6 @@
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
-import { userConfigDirectory } from './runtime-paths.mjs'
+import { userConfigDirectory } from './path-policy.mjs'
 
 // TUI state belongs to the client, under the product's configuration root.
 // Gateway data/state/cache overrides must never relocate client files.

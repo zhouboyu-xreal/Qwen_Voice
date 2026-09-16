@@ -329,6 +329,7 @@ test('7.0 hello and 5.x connect enter the same legacy business path', () => {
       input_enabled: false,
       output_enabled: true,
       text_only: false,
+      wake_word_enabled: true,
       provider: 'dashscope',
       output_voice: 'longanlufeng',
       working_directory: '/tmp/client-project',
@@ -341,6 +342,7 @@ test('7.0 hello and 5.x connect enter the same legacy business path', () => {
   assert.equal(accepted.event.inputEnabled, false)
   assert.equal(accepted.event.outputEnabled, true)
   assert.equal(accepted.event.textOnly, false)
+  assert.equal(accepted.event.wakeWordEnabled, true)
   assert.equal(accepted.event.provider, 'dashscope')
   assert.equal(accepted.event.outputVoice, 'longanlufeng')
   assert.equal(accepted.event.workingDirectory, '/tmp/client-project')

@@ -32,14 +32,15 @@ export class SleepController {
     return this.timeoutMs
   }
 
-  recordActivity() {
+  recordActivity({ delayMs = this.timeoutMs } = {}) {
     if (!this.enabled || this.sleeping || this.closed) return
-    if (!this.timeoutMs) {
+    const delay = Math.max(0, Number(delayMs) || 0)
+    if (!delay) {
       clearTimeout(this.timer)
       this.timer = null
       return
     }
-    this.schedule(this.timeoutMs)
+    this.schedule(delay)
   }
 
   schedule(delay) {
@@ -64,11 +65,11 @@ export class SleepController {
     }
   }
 
-  wake() {
+  wake(options = {}) {
     if (this.closed) return false
     const wasSleeping = this.sleeping
     this.sleeping = false
-    if (this.enabled) this.recordActivity()
+    if (this.enabled) this.recordActivity(options)
     return wasSleeping
   }
 

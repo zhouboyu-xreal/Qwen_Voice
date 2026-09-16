@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url'
+import { resolve } from 'node:path'
 import WebSocket from 'ws'
 import {
   GatewayClientEvent,
@@ -45,6 +46,13 @@ import {
   inputPartsFromText,
 } from './input-parts.mjs'
 import { isExitCommand } from './terminal-commands.mjs'
+import {
+  DesktopWakeWordRuntime as WakeWordRuntime,
+} from '../../desktop/src/wake-word/runtime.mjs'
+import {
+  PreWakeContextRuntime,
+  resolvePreWakeContextSidecarOptions,
+} from './prewake-context-runtime.mjs'
 
 const ANSI = {
   bold: '\u001b[1m',
@@ -54,6 +62,21 @@ const ANSI = {
   red: '\u001b[31m',
   reset: '\u001b[0m',
   yellow: '\u001b[33m',
+}
+
+// The Gateway wake acknowledgement takes a network round trip. Keep the
+// beginning of a request spoken immediately after the wake phrase instead of
+// silently dropping it while the connection changes from sleeping to active.
+export const TUI_WAKE_WORD_MAX_BUFFERED_AUDIO_CHUNKS = 100
+
+export function appendWakeWordAudioChunk(buffer, chunk, {
+  limit = TUI_WAKE_WORD_MAX_BUFFERED_AUDIO_CHUNKS,
+} = {}) {
+  if (!Buffer.isBuffer(chunk) || !chunk.length) return buffer
+  const boundedLimit = Math.max(1, Number(limit) || 1)
+  const next = [...buffer, chunk]
+  if (next.length <= boundedLimit) return next
+  return next.slice(next.length - boundedLimit)
 }
 
 function style(text, color) {
@@ -112,6 +135,22 @@ export function canStartTuiCapture({
   )
 }
 
+export function canStartTuiWakeWordCapture({
+  muted,
+  closed,
+  bridgeExited,
+  socketOpen,
+  gatewaySleeping,
+}) {
+  return Boolean(
+    !muted
+    && !closed
+    && !bridgeExited
+    && socketOpen
+    && gatewaySleeping,
+  )
+}
+
 export function performManualInterrupt({
   playback,
   transcriptRenderer,
@@ -144,8 +183,8 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     process.stdout.write(
       'qwen-audio-agent Voice TUI\n\n'
       + '用法：qwenaudio tui [--url URL] [--session ID] '
-      + '[--audio-mode half|full]\n\n'
-      + `${helpText(audioMode)}\n`,
+      + '[--audio-mode half|full] [--wake-word] [--prewake-context]\n\n'
+      + `${helpText(audioMode, { wakeWordEnabled: options.wakeWord === true })}\n`,
     )
     return
   }
@@ -167,6 +206,12 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
   let everOwnedVoice = false
   let captureEnabled = false
   let captureStateSent = false
+  let wakeWordEnabled = options.wakeWord === true
+  let wakeWordState = wakeWordEnabled ? 'sleeping' : 'active'
+  let wakeWordGatewaySleeping = false
+  let wakeWordRuntime = null
+  let preWakeContextRuntime = null
+  let wakingAudioChunks = []
   let audioBridge = null
   let playback = null
   let handleTerminalLine = async () => {}
@@ -241,6 +286,8 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     clearTimeout(reconnectTimer)
     playback?.close()
     audioBridge?.close()
+    wakeWordRuntime?.stop()
+    void preWakeContextRuntime?.close()
     transcriptRenderer.close()
     process.off('SIGINT', handleSigint)
     process.off('SIGTERM', handleSigterm)
@@ -250,17 +297,34 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     cleanup()
     if (socket?.readyState < WebSocket.CLOSING) socket.close()
   }
-  const sendMicrophoneAudio = chunk => {
-    if (canSendMicrophoneAudio({
+  const sendAudioChunkToGateway = chunk => {
+    if (!canSendMicrophoneAudio({
       connected: socket?.readyState === WebSocket.OPEN,
       muted,
       captureEnabled,
-    })) {
-      socket.send({
-        type: 'audio.append',
-        audio: chunk.toString('base64'),
-      })
+    })) return false
+    socket.send({
+      type: 'audio.append',
+      audio: chunk.toString('base64'),
+    })
+    return true
+  }
+  const flushWakingAudio = () => {
+    const bufferedChunks = wakingAudioChunks
+    wakingAudioChunks = []
+    for (const chunk of bufferedChunks) sendAudioChunkToGateway(chunk)
+  }
+  const sendMicrophoneAudio = chunk => {
+    if (wakeWordEnabled && wakeWordState !== 'active') {
+      if (wakeWordState === 'sleeping' && !muted && captureEnabled) {
+        wakeWordRuntime?.accept(chunk.toString('base64'), inputSampleRate)
+        preWakeContextRuntime?.appendPcm16(chunk, inputSampleRate)
+      } else if (wakeWordState === 'waking' && !muted && captureEnabled) {
+        wakingAudioChunks = appendWakeWordAudioChunk(wakingAudioChunks, chunk)
+      }
+      return
     }
+    sendAudioChunkToGateway(chunk)
   }
   reconcileStagedInputParts = value => {
     const next = stagedInputParts.filter(part => (
@@ -284,6 +348,89 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
   const reportAudioError = message => {
     print(`${style('[音频]', 'red')} ${message}`)
     printFallbackHint()
+  }
+
+  const wakeWordModelRoot = process.env.QWEN_AUDIO_AGENT_TUI_WAKE_WORD_MODEL_DIR
+    || resolve(tuiClientDirectory(), 'cache/models/wake-word')
+  const resetWakeWordDetector = () => wakeWordRuntime?.reset()
+  if (wakeWordEnabled && inputSampleRate !== 16_000) {
+    wakeWordEnabled = false
+    wakeWordState = 'active'
+    print(style(
+      `[本地唤醒词已关闭：当前 Realtime 输入采样率为 ${inputSampleRate} Hz，需要 16000 Hz]`,
+      'yellow',
+    ))
+  }
+  const activateWakeWordFallback = message => {
+    if (!wakeWordEnabled) return
+    wakeWordEnabled = false
+    wakeWordState = 'active'
+    flushWakingAudio()
+    wakeWordRuntime?.stop()
+    wakeWordRuntime = null
+    preWakeContextRuntime?.clear()
+    reportAudioError(`本地唤醒词不可用，已恢复常规语音输入：${message}`)
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send({ type: GatewayClientEvent.WAKE })
+      if (!muted) socket.send(microphoneControlEvent(false))
+    }
+  }
+  if (wakeWordEnabled) {
+    if (options.preWakeContext) {
+      try {
+        preWakeContextRuntime = new PreWakeContextRuntime(
+          resolvePreWakeContextSidecarOptions(process.env),
+        )
+        void preWakeContextRuntime.startWhenReady().then(() => {
+          if (!closed && wakeWordEnabled) {
+            print(style('[唤醒前上下文已启用：仅在本地处理最近 60 秒语音]', 'dim'))
+          }
+        }).catch(error => {
+          void preWakeContextRuntime?.close()
+          preWakeContextRuntime = null
+          print(style(`[唤醒前上下文不可用，已忽略：${error.message}]`, 'yellow'))
+        })
+      } catch (error) {
+        print(style(`[唤醒前上下文不可用，已忽略：${error.message}]`, 'yellow'))
+      }
+    }
+    wakeWordRuntime = new WakeWordRuntime({
+      modelRoot: wakeWordModelRoot,
+      onDetected: () => {
+        if (wakeWordState !== 'sleeping') return
+        wakeWordState = 'waking'
+        wakeWordGatewaySleeping = false
+        wakingAudioChunks = []
+        resetWakeWordDetector()
+        void (async () => {
+          if (socket?.readyState === WebSocket.OPEN) {
+            let preWakeContext
+            try {
+              preWakeContext = await preWakeContextRuntime?.consumeForWake()
+            } catch {
+              preWakeContextRuntime?.clear()
+            }
+            if (preWakeContext?.text) {
+              print(style(
+                `[唤醒前上下文已发送 · ${[...preWakeContext.text].length} 字] ${preWakeContext.text}`,
+                'dim',
+              ))
+            } else {
+              print(style('[唤醒前上下文为空，未发送]', 'dim'))
+            }
+            socket.send({
+              type: GatewayClientEvent.WAKE,
+              ...(preWakeContext?.text ? { preWakeContext: preWakeContext.text } : {}),
+            })
+            socket.send(microphoneControlEvent(false))
+            setStatus('已检测到唤醒词 · 正在恢复语音会话')
+            print(style('[已检测到“你好千问”，正在唤醒]', 'green'))
+          }
+        })().catch(error => activateWakeWordFallback(error.message))
+      },
+      onError: error => activateWakeWordFallback(error.message),
+    })
+    wakeWordRuntime.setEnabled(true)
   }
 
   let bridgeExited = false
@@ -360,6 +507,20 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
   })
 
   const startMicrophone = () => {
+    if (wakeWordEnabled && wakeWordState !== 'active') {
+      if (!canStartTuiWakeWordCapture({
+        muted,
+        closed,
+        bridgeExited,
+        socketOpen: socket?.readyState === WebSocket.OPEN,
+        gatewaySleeping: wakeWordGatewaySleeping,
+      })) return
+      if (setCaptureEnabled(true)) {
+        setStatus(`本地监听唤醒词 · ${audioMode.shortLabel}`)
+        print(`[本地监听“你好千问” · ${inputSampleRate} Hz]`)
+      }
+      return
+    }
     if (!canStartTuiCapture({
       clientState: gatewayClientState,
       muted,
@@ -373,6 +534,46 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     }
   }
 
+  const activateWakeWordInput = () => {
+    if (!wakeWordEnabled || wakeWordState !== 'waking') return
+    wakeWordState = 'active'
+    resetWakeWordDetector()
+    setStatus(`已唤醒 · 麦克风已开启 · ${audioMode.shortLabel}`)
+    print(style('[已唤醒，开始聆听]', 'green'))
+    startMicrophone()
+    flushWakingAudio()
+  }
+
+  const enterWakeWordListening = () => {
+    const changed = wakeWordState !== 'sleeping'
+    wakeWordState = 'sleeping'
+    wakeWordGatewaySleeping = true
+    wakingAudioChunks = []
+    preWakeContextRuntime?.clear()
+    resetWakeWordDetector()
+    startMicrophone()
+    setStatus(`本地监听唤醒词 · ${audioMode.shortLabel}`)
+    if (changed) {
+      print(style('[已回到本地唤醒词监听，麦克风音频不会上传]', 'yellow'))
+    }
+  }
+
+  const sleepWithWakeWord = () => {
+    if (!wakeWordEnabled) {
+      throw new Error('未启用唤醒词；请以 --wake-word 启动 TUI')
+    }
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send({ type: GatewayClientEvent.SLEEP })
+    }
+    setCaptureEnabled(false)
+    wakeWordState = 'sleeping'
+    wakeWordGatewaySleeping = false
+    wakingAudioChunks = []
+    preWakeContextRuntime?.clear()
+    resetWakeWordDetector()
+    setStatus(`正在进入本地唤醒词监听 · ${audioMode.shortLabel}`)
+  }
+
   const sendTextInput = async text => {
     if (!text.trim()) return
     const referencedParts = stagedInputParts.filter(part => (
@@ -381,6 +582,11 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     const parts = await inputPartsFromText(text, referencedParts)
     if (socket?.readyState !== WebSocket.OPEN) {
       throw new Error('Gateway 尚未连接')
+    }
+    if (wakeWordEnabled && wakeWordState === 'sleeping') {
+      wakeWordState = 'waking'
+      socket.send({ type: GatewayClientEvent.WAKE })
+      socket.send(microphoneControlEvent(false))
     }
     socket.send({
       type: GatewayClientEvent.INPUT_MESSAGE,
@@ -408,7 +614,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         print(style('[正在等待授权，恢复麦克风后再回答]', 'yellow'))
       }
     } else {
-      if (socket?.readyState === WebSocket.OPEN) {
+      if (socket?.readyState === WebSocket.OPEN && wakeWordState === 'active') {
         socket.send(microphoneControlEvent(false))
       }
       print(style('[麦克风已恢复]', 'green'))
@@ -433,6 +639,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         close()
         return
       }
+      if (wakeWordState !== 'waking') activateWakeWordInput()
       if (gatewayClientState.ownership.state === 'active') startMicrophone()
     }
     if (
@@ -445,6 +652,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
     if (event.type === GatewayServerEvent.VOICE_OWNERSHIP) {
       if (event.state === 'active') {
         everOwnedVoice = true
+        if (wakeWordState !== 'waking') activateWakeWordInput()
         startMicrophone()
       } else if (event.state === 'busy') {
         setCaptureEnabled(false)
@@ -468,6 +676,13 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
       playback.clear()
       transcriptRenderer.cancel()
       print(style('[语音已切换到另一窗口]', 'yellow'))
+    }
+    if (event.type === GatewayServerEvent.VOICE_SLEEP) {
+      if (event.state === 'sleeping' && wakeWordEnabled) {
+        enterWakeWordListening()
+      } else if (event.state === 'awake') {
+        activateWakeWordInput()
+      }
     }
     if (event.type === GatewayServerEvent.PLAYBACK_CLEAR) {
       playback.clear(event.reason || '')
@@ -579,6 +794,8 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         voiceEnabled: true,
         inputEnabled: !muted,
         outputEnabled: true,
+        wakeWordEnabled,
+        wakeWordOnly: wakeWordEnabled,
       }),
       locale: Intl.DateTimeFormat().resolvedOptions().locale,
       timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -592,6 +809,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
             type: GatewayServerEvent.GATEWAY_CONNECTED,
           })
           setStatus('Gateway 已连接 · 语音服务准备中')
+          if (wakeWordEnabled && wakeWordState !== 'active') startMicrophone()
           if (connectedOnce) {
             print(style('[qwen-audio-agent 已重新连接]', 'green'))
           } else {
@@ -601,7 +819,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
               + `${realtimeModelStatusText(health)}\n`
               + `会话：${options.sessionId}\n`
               + `音频：${audioMode.label}\n`
-              + `${helpText(audioMode)}\n`,
+              + `${helpText(audioMode, { wakeWordEnabled })}\n`,
             )
           }
         } else if (status.state === 'unavailable') {
@@ -685,6 +903,8 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
       close()
     } else if (['/mute', '/m'].includes(command)) {
       setMuted(!muted)
+    } else if (command === '/sleep') {
+      sleepWithWakeWord()
     } else if (['/interrupt', '/x'].includes(command)) {
       if (!audioMode.manualInterrupt) {
         throw new Error('当前全双工模式支持直接用语音打断，无需手动打断')
@@ -697,7 +917,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         print,
       })
     } else if (['/help', '/h'].includes(command)) {
-      print(helpText(audioMode))
+      print(helpText(audioMode, { wakeWordEnabled }))
     } else if (command.startsWith('/')) {
       throw new Error(`未知命令：${command}；输入 /help 查看帮助`)
     } else {

@@ -3,9 +3,11 @@ import test from 'node:test'
 import { PassThrough } from 'node:stream'
 import {
   assertInteractiveTerminal,
+  appendWakeWordAudioChunk,
   audioModeForPlatform,
   canSendMicrophoneAudio,
   canStartTuiCapture,
+  canStartTuiWakeWordCapture,
   completeTranscript,
   connectMessage,
   createPlayback,
@@ -24,6 +26,10 @@ import {
   websocketUrl,
 } from '../src/index.mjs'
 import { isExitCommand } from '../src/terminal-commands.mjs'
+import {
+  preWakeContextEnabled,
+  resolvePreWakeContextSidecarOptions,
+} from '../src/prewake-context-runtime.mjs'
 
 function readBufferedText(stream) {
   const chunks = []
@@ -102,6 +108,46 @@ test('waits for voice.ready and active ownership before starting capture', () =>
   }), false)
 })
 
+test('keeps local wake-word capture independent from realtime readiness', () => {
+  assert.equal(canStartTuiWakeWordCapture({
+    muted: false,
+    closed: false,
+    bridgeExited: false,
+    socketOpen: true,
+    gatewaySleeping: true,
+  }), true)
+  assert.equal(canStartTuiWakeWordCapture({
+    muted: true,
+    closed: false,
+    bridgeExited: false,
+    socketOpen: true,
+    gatewaySleeping: true,
+  }), false)
+  assert.equal(canStartTuiWakeWordCapture({
+    muted: false,
+    closed: false,
+    bridgeExited: false,
+    socketOpen: true,
+    gatewaySleeping: false,
+  }), false)
+})
+
+test('keeps recent microphone audio while the wake handshake completes', () => {
+  const first = Buffer.from('first')
+  const second = Buffer.from('second')
+  const third = Buffer.from('third')
+  const retained = appendWakeWordAudioChunk(
+    appendWakeWordAudioChunk(
+      appendWakeWordAudioChunk([], first, { limit: 2 }),
+      second,
+      { limit: 2 },
+    ),
+    third,
+    { limit: 2 },
+  )
+  assert.deepEqual(retained, [second, third])
+})
+
 test('shows a permission operation without duplicating the spoken question', () => {
   assert.equal(
     permissionStatusText({
@@ -147,6 +193,18 @@ test('parses a custom gateway, session and audio mode', () => {
     }).audioMode,
     'full',
   )
+  assert.equal(parseArguments(['--wake-word'], {}).wakeWord, true)
+  assert.equal(
+    parseArguments(['--wake-word', '--prewake-context'], {}).preWakeContext,
+    true,
+  )
+  assert.equal(
+    parseArguments(['--prewake-context'], {}).preWakeContext,
+    false,
+  )
+  assert.equal(parseArguments([], {
+    QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED: 'true',
+  }).wakeWord, true)
   assert.throws(
     () => parseArguments(['--audio-mode', 'invalid'], {}),
     /不支持的音频模式/,
@@ -167,6 +225,32 @@ test('parses a custom gateway, session and audio mode', () => {
     parseArguments(['--url', 'https://voice.example.com/path'], {}).url,
     'https://voice.example.com',
   )
+})
+
+test('derives the pre-wake sidecar from the configured Agent Memory sidecar', () => {
+  const options = resolvePreWakeContextSidecarOptions({
+    AGENT_MEMORY_PYTHON: '/opt/venv/bin/python',
+    AGENT_MEMORY_SIDECAR: '/workspace/agent_memory/integrations/qwen_audio_agent/agent_memory_sidecar.py',
+    AGENT_MEMORY_CONFIG: '/workspace/agent_memory/config.yaml',
+    AGENT_MEMORY_STATE_DIR: '/workspace/agent_memory/tmp/qwen_audio_agent_online',
+  })
+  assert.equal(options.command, '/opt/venv/bin/python')
+  assert.equal(
+    options.sidecarPath,
+    '/workspace/agent_memory/integrations/qwen_audio_agent/prewake_context_sidecar.py',
+  )
+  assert.equal(options.configPath, '/workspace/agent_memory/config.yaml')
+  assert.equal(
+    options.logPath,
+    '/workspace/agent_memory/tmp/qwen_audio_agent_online/prewake-context-sidecar.log',
+  )
+})
+
+test('shares the pre-wake feature flag with Desktop', () => {
+  assert.equal(preWakeContextEnabled({}), false)
+  assert.equal(preWakeContextEnabled({
+    AGENT_MEMORY_PREWAKE_CONTEXT_ENABLED: 'true',
+  }), true)
 })
 
 test('builds the realtime websocket URL', () => {
@@ -194,6 +278,33 @@ test('reports the TUI launch directory as client context', () => {
       resource: true,
     },
     workingDirectory: '/Users/me/codes/snake-game',
+    timeZone: 'Asia/Shanghai',
+    locale: 'zh-CN',
+  })
+})
+
+test('requests Gateway sleep when TUI wake-word mode is enabled', () => {
+  assert.deepEqual(connectMessage({
+    voiceEnabled: true,
+    wakeWordEnabled: true,
+    wakeWordOnly: true,
+    workingDirectory: '/workspace',
+    timeZone: 'Asia/Shanghai',
+    locale: 'zh-CN',
+  }), {
+    type: 'connect',
+    voiceEnabled: true,
+    wakeWordEnabled: true,
+    wakeWordOnly: true,
+    clientType: 'cli',
+    clientLabel: 'CLI',
+    inputCapabilities: {
+      text: true,
+      audio: true,
+      image: true,
+      resource: true,
+    },
+    workingDirectory: '/workspace',
     timeZone: 'Asia/Shanghai',
     locale: 'zh-CN',
   })
@@ -318,6 +429,13 @@ test('uses macOS AEC and selectable PortAudio duplex modes elsewhere', () => {
   assert.equal(fullDuplexFallbackHint(mac), '')
   assert.equal(fullDuplexFallbackHint(linux), '')
   assert.match(fullDuplexFallbackHint(linuxFull), /--audio-mode half/)
+})
+
+test('shows /sleep only when wake-word mode is enabled', () => {
+  assert.doesNotMatch(helpText(), /\/sleep/)
+  assert.match(helpText(audioModeForPlatform(), {
+    wakeWordEnabled: true,
+  }), /\/sleep/)
 })
 
 test('keeps a fixed composer active while asynchronous output arrives', async () => {

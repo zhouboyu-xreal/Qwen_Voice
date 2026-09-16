@@ -9,7 +9,7 @@ import {
 } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
-import { resolveRuntimePaths } from './runtime-paths.mjs'
+import { resolveRuntimePaths } from './path-policy.mjs'
 
 export const LOG_SCHEMA = 'qwaudio.log/v1'
 export const LOG_LEVELS = Object.freeze({

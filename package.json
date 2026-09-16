@@ -61,6 +61,7 @@
     "./knowledge-provider": "./server/src/frontend/knowledge/provider.mjs",
     "./memory-provider": "./server/src/conversation/memory/provider.mjs",
     "./voicemem-provider": "./server/src/conversation/memory/providers/voicemem/provider.mjs",
+    "./agent-memory-provider": "./server/src/conversation/memory/providers/agent-memory/provider.mjs",
     "./settings": "./desktop/src/settings-store.mjs",
     "./skin-store": "./desktop/src/skin-store.mjs",
     "./orb/main": "./desktop/src/orb-shell.mjs",

@@ -8,7 +8,7 @@ import {
 } from 'node:fs'
 import { dirname, resolve, win32 } from 'node:path'
 
-import { resolveRuntimePaths } from './runtime-paths.mjs'
+import { resolveRuntimePaths } from './path-policy.mjs'
 
 const PATH_MARK = 'QWEN_AUDIO_AGENT_PATH'
 

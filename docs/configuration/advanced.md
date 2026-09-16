@@ -183,6 +183,12 @@ them to the configuration file:
 | `MINICPM_O_AUTH_TOKEN` | Empty; only for proxies with Bearer authentication |
 | `QWEN_AUDIO_AGENT_IDENTITY_MODE` | `personal` |
 | `QWEN_AUDIO_AGENT_TUI_AUDIO_MODE` | `half` |
+| `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED` | `false`; enables local “你好千问” wake-word detection in TUI |
+| `AGENT_MEMORY_PREWAKE_CONTEXT_ENABLED` | `false`; with local wake-word mode in TUI or Desktop, sends the local Agent Memory pre-wake ASR snapshot to the next Realtime turn only |
+| `QWEN_AUDIO_AGENT_WAKE_WORD_IDLE_SECONDS` | `15`; seconds before TUI or Desktop returns to local wake-word listening after an interaction; `0` disables it |
+| `QWEN_AUDIO_AGENT_WAKE_WORD_WAKE_GRACE_SECONDS` | `10`; grace period after a wake word with no effective interaction in TUI or Desktop |
+| `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_IDLE_SECONDS` | Legacy fallback when the unified idle setting is absent |
+| `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_WAKE_GRACE_SECONDS` | Legacy fallback when the unified grace setting is absent |
 | `AGENT_TIMEOUT_MS` | `300000`; timeout for ACP connection initialization and bounded control requests, not active Agent turns |
 
 The macOS TUI CoreAudio helper is compiled by default to

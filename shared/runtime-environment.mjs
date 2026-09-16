@@ -8,7 +8,7 @@ import {
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { parseEnv } from 'node:util'
-import { resolveRuntimePaths, runtimePathEnvironment, userConfigDirectory } from './runtime-paths.mjs'
+import { resolveRuntimePaths, runtimePathEnvironment, userConfigDirectory } from './path-policy.mjs'
 import { backendDefinitions } from './backend/catalog.mjs'
 import { resolveRealtimeFrontendConfiguration } from './realtime-provider-catalog.mjs'
 

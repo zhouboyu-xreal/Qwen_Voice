@@ -64,12 +64,12 @@ test('fixed policy and tool definitions never depend on optional tool names', ()
   }
   // Optional tools may use stable core contracts, without reverse coupling.
   assert.match(frontendToolRegistry.get('schedule_reminder').definition.function.description, /get_current_time/)
-  assert.match(frontendToolRegistry.get('recall').definition.function.description, /get_agent_task_status/)
+  assert.match(frontendToolRegistry.get('memory_recall').definition.function.description, /长期记忆/)
 })
 
 test('disabling any optional tool removes its instructions without changing fixed policy', () => {
   const context = {
-    frontend: { capabilities: ['web-search', 'url-fetch', 'knowledge', 'recall'] },
+    frontend: { capabilities: ['web-search', 'url-fetch', 'knowledge', 'memory_recall'] },
     client: { actions: ['desktop.presence.enter_sleep'] },
   }
   const tools = frontendTools(context)
@@ -230,13 +230,13 @@ test('exposes retrieval tools only when the frontend advertises each capability'
 test('hides explicitly disabled optional tools after capability checks', () => {
   assert.deepEqual(names(frontendTools({
     frontend: {
-      capabilities: ['web-search', 'url-fetch', 'knowledge', 'recall'],
+      capabilities: ['web-search', 'url-fetch', 'knowledge', 'memory_recall'],
       disabledTools: [
         'schedule_reminder',
         'web_search',
         'fetch_url',
         'knowledge',
-        'recall',
+        'memory_recall',
         'notes',
       ],
     },
@@ -277,12 +277,12 @@ test('availability projection combines configured features and pending requests'
     backendAvailability: { snapshot: () => ({ configured: true, ok: false, known: true }) },
     frontendRetrieval: { capabilities: () => ['web-search', 'url-fetch'] },
     frontendKnowledge: { capabilities: () => ['knowledge'] },
-    sessionDigests: {},
+    memoryService: { query: () => {} },
     permissionPending: true,
     inputPending: true,
   })
   assert.deepEqual(frontend.capabilities, [
-    'web-search', 'url-fetch', 'knowledge', 'recall',
+    'web-search', 'url-fetch', 'knowledge', 'memory_recall',
     PERMISSION_RESPONSE_CAPABILITY, BACKEND_INPUT_RESPONSE_CAPABILITY,
   ])
   const visible = names(frontendTools({ frontend }))
@@ -308,7 +308,7 @@ test('disabled tools cannot execute or consume the tool-loop budget', async () =
     turnId: 'disabled-turn',
     generation: 1,
     frontend: {
-      capabilities: ['web-search', 'url-fetch', 'knowledge', 'recall',
+      capabilities: ['web-search', 'url-fetch', 'knowledge', 'memory_recall',
         PERMISSION_RESPONSE_CAPABILITY, BACKEND_INPUT_RESPONSE_CAPABILITY],
       disabledTools: frontendToolRegistry.names(),
     },

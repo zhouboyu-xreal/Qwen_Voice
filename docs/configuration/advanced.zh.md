@@ -162,6 +162,12 @@ QWEN_AUDIO_AGENT_OPENCODE_ISOLATE_USER_CONFIG=true
 | `MINICPM_O_AUTH_TOKEN` | 空；仅用于带 Bearer 认证的代理 |
 | `QWEN_AUDIO_AGENT_IDENTITY_MODE` | `personal` |
 | `QWEN_AUDIO_AGENT_TUI_AUDIO_MODE` | `half` |
+| `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED` | `false`；TUI 本地“你好千问”关键词唤醒 |
+| `AGENT_MEMORY_PREWAKE_CONTEXT_ENABLED` | `false`；与 TUI 或 Desktop 的本地唤醒词配合，将本地 Agent Memory 的唤醒前 ASR 快照只注入下一轮 Realtime，不写入长期记忆 |
+| `QWEN_AUDIO_AGENT_WAKE_WORD_IDLE_SECONDS` | `15`；TUI 与 Desktop 在有效交互结束后回到本地唤醒监听的秒数，`0` 表示关闭 |
+| `QWEN_AUDIO_AGENT_WAKE_WORD_WAKE_GRACE_SECONDS` | `10`；TUI 与 Desktop 仅唤醒、尚未有效交互时的等待秒数 |
+| `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_IDLE_SECONDS` | 兼容旧配置；未设置统一变量时作为其回退值 |
+| `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_WAKE_GRACE_SECONDS` | 兼容旧配置；未设置统一变量时作为其回退值 |
 | `AGENT_TIMEOUT_MS` | `300000`；ACP 连接初始化与有界控制请求的超时，不限制正在执行的 Agent 轮次 |
 
 macOS TUI 的 CoreAudio 辅助程序默认编译到

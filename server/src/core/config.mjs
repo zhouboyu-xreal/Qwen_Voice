@@ -3,7 +3,7 @@ import { fileURLToPath } from 'url'
 import {
   loadRuntimeEnvironment,
 } from '../../../shared/runtime-environment.mjs'
-import { defaultBackendWorkspace } from '../../../shared/runtime-paths.mjs'
+import { defaultBackendWorkspace } from '../../../shared/path-policy.mjs'
 import {
   backendDefinition,
   backendNames,
@@ -56,7 +56,7 @@ export function resolveDisabledFrontendTools(env = process.env) {
     ...(!featureEnabled(env.QWEN_AUDIO_NOTES_TOOL_ENABLED)
       ? ['notes'] : []),
     ...(!featureEnabled(env.QWEN_AUDIO_RECALL_TOOL_ENABLED)
-      ? ['recall'] : []),
+      ? ['memory_recall'] : []),
   ]
 }
 
@@ -304,6 +304,16 @@ export const config = {
   voiceMemPython: String(process.env.VOICEMEM_PYTHON || '').trim(),
   voiceMemSidecarPath: process.env.VOICEMEM_SIDECAR
     ? resolve(root, process.env.VOICEMEM_SIDECAR)
+    : '',
+  agentMemoryStateDirectory: process.env.AGENT_MEMORY_STATE_DIR
+    ? resolve(root, process.env.AGENT_MEMORY_STATE_DIR)
+    : resolve(runtimeEnvironment.dataDirectory, 'memory/agent-memory'),
+  agentMemoryPython: String(process.env.AGENT_MEMORY_PYTHON || '').trim(),
+  agentMemorySidecarPath: process.env.AGENT_MEMORY_SIDECAR
+    ? resolve(root, process.env.AGENT_MEMORY_SIDECAR)
+    : '',
+  agentMemoryConfigPath: process.env.AGENT_MEMORY_CONFIG
+    ? resolve(root, process.env.AGENT_MEMORY_CONFIG)
     : '',
   gatewayAccessToken: String(
     process.env.QWEN_AUDIO_GATEWAY_ACCESS_TOKEN
@@ -580,8 +590,8 @@ export const config = {
     runtimeEnvironment.stateDirectory,
     'preference-candidates.json',
   ),
-  // 会话摘要：每场会话结束时记一条「聊了哪些话题 + 一句要点」，供用户日后问
-  // 「前几天我们聊的那个」时用 recall 工具查。默认关闭 —— 它留存的是
+  // 会话摘要：每场会话结束时记一条「聊了哪些话题 + 一句要点」，供内部的
+  // 会话恢复与后续摘要使用。默认关闭 —— 它留存的是
   // 对话内容的概括，属于需要用户显式同意的一档。只存话题与一句要点，不存转写。
   sessionDigestEnabled: String(
     process.env.QWEN_AUDIO_SESSION_DIGEST || 'off',
@@ -634,6 +644,18 @@ export const config = {
     process.env.QWEN_AUDIO_DESKTOP_AUTO_HIDE_SECONDS,
     0,
     { min: 0, max: 86_400 },
+  ) * 1000,
+  wakeWordIdleTimeoutMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_WAKE_WORD_IDLE_SECONDS
+      ?? process.env.QWEN_AUDIO_AGENT_TUI_WAKE_WORD_IDLE_SECONDS,
+    15,
+    { min: 0, max: 3_600 },
+  ) * 1000,
+  wakeWordWakeGraceTimeoutMs: numberSetting(
+    process.env.QWEN_AUDIO_AGENT_WAKE_WORD_WAKE_GRACE_SECONDS
+      ?? process.env.QWEN_AUDIO_AGENT_TUI_WAKE_WORD_WAKE_GRACE_SECONDS,
+    10,
+    { min: 0, max: 300 },
   ) * 1000,
 }
 

@@ -8,6 +8,7 @@ function harness({
   turnCitations = null,
   terminalToolResponses = [],
   perResponseInstructions = false,
+  onAssistantMessageRecorded = null,
 } = {}) {
   const events = []
   const records = []
@@ -27,7 +28,12 @@ function harness({
     ownerId: 'owner-1',
     sessionId: 'session-1',
     turns,
-    conversationSync: { record: value => records.push(value) },
+    conversationSync: {
+      record: value => {
+        records.push(value)
+        return value
+      },
+    },
     announcementWindow: {
       queueAudio: (...args) => calls.push(['queueAudio', ...args]),
       startPlayback: (...args) => calls.push(['startPlayback', ...args]),
@@ -61,6 +67,7 @@ function harness({
     announcementQuietMs: 60_000,
     responseContextCleanupMs: 60_000,
     turnCitations,
+    onAssistantMessageRecorded,
   })
   return {
     runtime,
@@ -73,6 +80,86 @@ function harness({
     },
   }
 }
+
+test('notifies the turn observer only after a text response is completed', () => {
+  const observed = []
+  const setup = harness({
+    onAssistantMessageRecorded: message => observed.push(message),
+  })
+
+  deliver(setup.runtime, {
+    type: 'response.text.done',
+    response_id: 'response-1',
+    text: '我已经记住了。',
+    __voiceContext: { turnId: 'turn-1', turnGeneration: 1 },
+  })
+
+  assert.equal(setup.records.length, 1)
+  assert.deepEqual(observed, [])
+
+  deliver(setup.runtime, {
+    type: 'response.done',
+    response: { id: 'response-1', status: 'completed' },
+  })
+
+  assert.deepEqual(observed, [setup.records[0]])
+})
+
+test('notifies the turn observer only after an audio response finishes playback', () => {
+  const observed = []
+  const setup = harness({
+    onAssistantMessageRecorded: message => observed.push(message),
+  })
+
+  deliver(setup.runtime, {
+    type: 'response.audio.delta',
+    response_id: 'response-1',
+    delta: 'audio',
+    __voiceContext: { turnId: 'turn-1', turnGeneration: 1 },
+  })
+  setup.runtime.startPlayback('response-1')
+  deliver(setup.runtime, {
+    type: 'response.audio_transcript.done',
+    response_id: 'response-1',
+    transcript: '我已经记住了。',
+  })
+  deliver(setup.runtime, {
+    type: 'response.done',
+    response: { id: 'response-1', status: 'completed' },
+  })
+
+  assert.deepEqual(observed, [])
+  setup.runtime.finishPlayback('response-1')
+  assert.deepEqual(observed, [setup.records[0]])
+})
+
+test('does not notify the turn observer when completed audio is interrupted', () => {
+  const observed = []
+  const setup = harness({
+    onAssistantMessageRecorded: message => observed.push(message),
+  })
+
+  deliver(setup.runtime, {
+    type: 'response.audio.delta',
+    response_id: 'response-1',
+    delta: 'audio',
+    __voiceContext: { turnId: 'turn-1', turnGeneration: 1 },
+  })
+  setup.runtime.startPlayback('response-1')
+  deliver(setup.runtime, {
+    type: 'response.audio_transcript.done',
+    response_id: 'response-1',
+    transcript: '模型已经完整生成，但用户没有听完。',
+  })
+  deliver(setup.runtime, {
+    type: 'response.done',
+    response: { id: 'response-1', status: 'completed' },
+  })
+
+  setup.runtime.interruptActiveResponses()
+  assert.equal(setup.runtime.get('response-1').interrupted, true)
+  assert.deepEqual(observed, [])
+})
 
 test('projects turn citations once on the final assistant transcript', () => {
   const stored = [{

@@ -14,7 +14,12 @@ createSherpaWakeWordDetector({ modelRoot: workerData.modelRoot })
   }))
 
 parentPort.on('message', message => {
-  if (!detector || message?.type !== 'audio') return
+  if (!detector) return
+  if (message?.type === 'reset') {
+    detector.reset()
+    return
+  }
+  if (message?.type !== 'audio') return
   try {
     if (detector.accept(message.audio, message.sampleRate)) {
       parentPort.postMessage({ type: 'detected' })

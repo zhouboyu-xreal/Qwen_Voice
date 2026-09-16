@@ -69,7 +69,7 @@ import {
   realtimeSettingsConfigured,
   updateSettingsContent,
 } from './settings-config.mjs'
-import { runtimePathEnvironment, userConfigDirectory } from '../../shared/runtime-paths.mjs'
+import { runtimePathEnvironment, userConfigDirectory } from '../../shared/path-policy.mjs'
 import { DesktopWakeWordRuntime } from './wake-word/runtime.mjs'
 import {
   effectiveOrbSkin as resolveEffectiveOrbSkin,
@@ -92,6 +92,11 @@ import {
 import { createGracefulShutdown } from './graceful-shutdown.mjs'
 import { DesktopPresence } from './desktop-presence.mjs'
 import { createElectronGatewayCredentialStore } from './gateway-credential-store.mjs'
+import {
+  PreWakeContextRuntime,
+  preWakeContextEnabled,
+  resolvePreWakeContextSidecarOptions,
+} from '../../shared/voice/prewake-context-runtime.mjs'
 
 // Gateway paths belong to the Gateway; Electron's userData holds only client
 // preferences, credentials, presentation assets and local caches.
@@ -198,6 +203,9 @@ let gatewayAccessToken = String(
   || '',
 ).trim()
 let pendingGatewayPairingCode = null
+let desktopPreWakeContextRuntime = null
+let desktopPendingPreWakeContext = ''
+let desktopPreWakeContextCapturing = false
 
 const desktopPresence = new DesktopPresence({
   getWindow: () => mainWindow,
@@ -207,10 +215,74 @@ const desktopPresence = new DesktopPresence({
 
 const desktopWakeWord = new DesktopWakeWordRuntime({
   modelRoot: clientPaths.wakeWordModelDirectory,
-  onDetected: () => desktopPresence.wake('wake-word'),
+  onDetected: () => { void wakeDesktopFromWakeWord() },
   onError: error => logger.warn('wake_word.failed', { error }),
 })
 desktopWakeWord.setEnabled(desktopWakeWordEnabled)
+
+async function stopDesktopPreWakeContextRuntime() {
+  const runtime = desktopPreWakeContextRuntime
+  desktopPreWakeContextRuntime = null
+  desktopPendingPreWakeContext = ''
+  desktopPreWakeContextCapturing = false
+  await runtime?.close()
+}
+
+async function ensureDesktopPreWakeContextRuntime() {
+  if (!desktopWakeWordEnabled) {
+    await stopDesktopPreWakeContextRuntime()
+    return false
+  }
+  let environment
+  try {
+    environment = configuredGatewayEnvironment()
+  } catch (error) {
+    logger.warn('desktop.pre_wake_context.configuration_unavailable', { error })
+    return false
+  }
+  if (!preWakeContextEnabled(environment)) {
+    await stopDesktopPreWakeContextRuntime()
+    return false
+  }
+  if (desktopPreWakeContextRuntime?.ready) return true
+  await stopDesktopPreWakeContextRuntime()
+  const runtime = new PreWakeContextRuntime(
+    resolvePreWakeContextSidecarOptions(environment),
+  )
+  desktopPreWakeContextRuntime = runtime
+  try {
+    await runtime.startWhenReady()
+    if (desktopPreWakeContextRuntime !== runtime) {
+      await runtime.close()
+      return false
+    }
+    logger.info('desktop.pre_wake_context.ready')
+    return true
+  } catch (error) {
+    if (desktopPreWakeContextRuntime === runtime) {
+      desktopPreWakeContextRuntime = null
+    }
+    await runtime.close()
+    logger.warn('desktop.pre_wake_context.unavailable', { error })
+    return false
+  }
+}
+
+async function wakeDesktopFromWakeWord() {
+  let snapshot = null
+  try {
+    snapshot = await desktopPreWakeContextRuntime?.consumeForWake()
+  } catch (error) {
+    desktopPreWakeContextRuntime?.clear()
+    logger.warn('desktop.pre_wake_context.snapshot_failed', { error })
+  }
+  desktopPendingPreWakeContext = String(snapshot?.text || '')
+  desktopPreWakeContextCapturing = false
+  logger.info('desktop.pre_wake_context.wake_snapshot', {
+    characters: [...desktopPendingPreWakeContext].length,
+  })
+  desktopPresence.wake('wake-word')
+}
 
 ipcMain.on('qwen-audio-agent:wake-word-audio', (event, payload) => {
   if (
@@ -224,6 +296,26 @@ ipcMain.on('qwen-audio-agent:wake-word-audio', (event, payload) => {
   const sampleRate = Number(payload?.sampleRate)
   if (!audio || audio.length > 128 * 1024 || sampleRate !== 16_000) return
   desktopWakeWord.accept(audio, sampleRate)
+  const acceptedForPreWake = desktopPreWakeContextRuntime?.appendPcm16(
+    Buffer.from(audio, 'base64'),
+    sampleRate,
+  )
+  if (acceptedForPreWake && !desktopPreWakeContextCapturing) {
+    desktopPreWakeContextCapturing = true
+    logger.info('desktop.pre_wake_context.capturing', { sampleRate })
+  }
+})
+
+ipcMain.handle('qwen-audio-agent:consume-prewake-context', event => {
+  if (
+    !mainWindow
+    || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+  ) return { text: '' }
+  const text = desktopPendingPreWakeContext
+  desktopPendingPreWakeContext = ''
+  if (!text) desktopPreWakeContextRuntime?.clear()
+  return { text }
 })
 
 const MAX_GATEWAY_CRASH_RESTARTS = 3
@@ -398,6 +490,9 @@ async function startConfiguredRuntime(settings = configuredOrigin().settings) {
   appOrigin = isLoopbackUrl(configuredGatewayOrigin)
     ? await startLocalGateway(configuredGatewayOrigin)
     : configuredGatewayOrigin
+  // PCM is owned by the Desktop client while it is hidden, so pre-wake ASR
+  // remains local. It shares the same adapter and sidecar as TUI.
+  void ensureDesktopPreWakeContextRuntime()
   process.env.QWEN_AUDIO_AGENT_URL = appOrigin
   process.env.QWEN_AUDIO_ORB_STYLE = settings.orbStyle
   process.env.QWEN_AUDIO_ORB_SKIN = settings.orbSkin
@@ -1119,6 +1214,9 @@ async function applyDesktopSettings(settings) {
   desktopLanguage = normalized.language
   desktopWakeWordEnabled = normalized.wakeWordEnabled
   desktopWakeWord.setEnabled(desktopWakeWordEnabled)
+  void stopDesktopPreWakeContextRuntime().then(
+    () => ensureDesktopPreWakeContextRuntime(),
+  )
   createTray()
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     settingsWindow.setTitle(desktopText('设置'))
@@ -1370,6 +1468,8 @@ if (!app.requestSingleInstanceLock()) {
       logger.info('desktop.stopping')
       desktopPresence.destroy()
       desktopWakeWord.stop()
+      const preWakeContextRuntime = desktopPreWakeContextRuntime
+      desktopPreWakeContextRuntime = null
       tray?.destroy()
       tray = null
       const server = rendererServer
@@ -1377,6 +1477,7 @@ if (!app.requestSingleInstanceLock()) {
       const gateway = embeddedGateway
       embeddedGateway = null
       await Promise.allSettled([
+        preWakeContextRuntime?.close(),
         server?.close(),
         gateway?.stop(),
       ])

@@ -181,6 +181,7 @@ const GatewayClientPayloadSchemas = Object.freeze({
     inputEnabled: z.boolean().optional(),
     outputEnabled: z.boolean().optional(),
     textOnly: z.boolean().optional(),
+    wakeWordEnabled: z.boolean().optional(),
     provider: z.string().min(1).optional(),
     outputVoice: z.string().min(1).max(160).optional(),
     clientType: z.string().min(1).optional(),

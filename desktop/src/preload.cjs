@@ -44,6 +44,9 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
     options,
   ),
   wake: () => ipcRenderer.send('qwen-audio-agent:wake'),
+  consumePreWakeContext: () => ipcRenderer.invoke(
+    'qwen-audio-agent:consume-prewake-context',
+  ),
   acceptWakeWordAudio: (audio, sampleRate) => ipcRenderer.send(
     'qwen-audio-agent:wake-word-audio',
     { audio, sampleRate },

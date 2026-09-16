@@ -3,6 +3,9 @@ import { MarkdownMemoryProvider } from '../conversation/memory/providers/markdow
 import {
   VoiceMemProvider,
 } from '../conversation/memory/providers/voicemem/provider.mjs'
+import {
+  AgentMemoryProvider,
+} from '../conversation/memory/providers/agent-memory/provider.mjs'
 
 function createMarkdownProvider({ config, logger }) {
   const userDocuments = new MarkdownContextStore({
@@ -38,6 +41,15 @@ export function createConfiguredMemoryProvider({
       stateDirectory: config.voiceMemStateDirectory,
       python: config.voiceMemPython || null,
       sidecarPath: config.voiceMemSidecarPath || null,
+      env,
+    })
+  }
+  if (selected === 'agent-memory') {
+    return new AgentMemoryProvider({
+      stateDirectory: config.agentMemoryStateDirectory,
+      python: config.agentMemoryPython || null,
+      sidecarPath: config.agentMemorySidecarPath || null,
+      configPath: config.agentMemoryConfigPath || null,
       env,
     })
   }

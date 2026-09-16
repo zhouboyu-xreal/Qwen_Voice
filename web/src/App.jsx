@@ -819,6 +819,9 @@ export default function App() {
     // WebUI and desktop share one control contract: the toggle only changes
     // microphone capture and never closes or interrupts the output stream.
     inputOnlyMute: true,
+    // A wake-word capable client uses the same Gateway idle/grace policy as
+    // TUI. `wakeWordOnly` below remains the transient local-listening state.
+    wakeWordEnabled: desktopOrbMode && wakeWordEnabled,
     wakeWordOnly: voiceEnabledForWakeWord,
     clientType: activeClientType,
     clientLabel: gatewayClientLabel(desktopOrbMode ? t('桌面端') : 'WebUI'),
@@ -999,7 +1002,22 @@ export default function App() {
   const publishClientEvent = voice.publishClientEvent
   useEffect(() => {
     if (!desktopOrbMode || desktopLifecycle !== 'waking') return
-    wakeGateway()
+    const consumePreWakeContext = (
+      window.qwenAudioAgentDesktop?.consumePreWakeContext
+    )
+    if (typeof consumePreWakeContext !== 'function') {
+      wakeGateway()
+      return undefined
+    }
+    let disposed = false
+    void consumePreWakeContext()
+      .then(snapshot => {
+        if (!disposed) wakeGateway({ preWakeContext: snapshot?.text || '' })
+      })
+      .catch(() => {
+        if (!disposed) wakeGateway()
+      })
+    return () => { disposed = true }
   }, [desktopLifecycle, wakeGateway])
 
   autoHideStateRef.current = {
@@ -1012,7 +1030,10 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!desktopOrbMode || autoHideSeconds === 0) return undefined
+    // Wake-word clients use Gateway's shared idle/grace controller. Keeping
+    // the previous renderer-local timer alive would create a second,
+    // divergent deactivation policy for Desktop.
+    if (!desktopOrbMode || wakeWordEnabled || autoHideSeconds === 0) return undefined
     const check = () => {
       const current = autoHideStateRef.current
       if (!current || current.desktopSurfaceMode === 'panel') return
@@ -1040,7 +1061,7 @@ export default function App() {
     const timer = setInterval(check, 1_000)
     check()
     return () => clearInterval(timer)
-  }, [autoHideSeconds, publishClientEvent])
+  }, [autoHideSeconds, publishClientEvent, wakeWordEnabled])
 
   const modelLabel = (modelStatus.label || t('模型信息不可用'))
     .replace(/\s+Realtime\b/gi, '')

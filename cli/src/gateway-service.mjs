@@ -7,7 +7,7 @@ import {
 } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, resolve } from 'node:path'
-import { resolveRuntimePaths, runtimePathEnvironment } from '../../shared/runtime-paths.mjs'
+import { resolveRuntimePaths, runtimePathEnvironment } from '../../shared/path-policy.mjs'
 
 export const GATEWAY_SERVICE_LABEL = 'com.qwen-audio-agent.gateway'
 

@@ -1,4 +1,3 @@
-import { describeWhen } from '../../../conversation/session-digest.mjs'
 import {
   FRONTEND_RETRIEVAL_CAPABILITIES,
 } from '../../../frontend/retrieval/frontend-retrieval-runtime.mjs'
@@ -10,8 +9,8 @@ import { toolFailure } from '../tool-result.mjs'
 export const WEB_SEARCH_TOOL_NAME = 'web_search'
 export const FETCH_URL_TOOL_NAME = 'fetch_url'
 export const KNOWLEDGE_TOOL_NAME = 'knowledge'
-export const RECALL_TOOL_NAME = 'recall'
-export const FRONTEND_RECALL_CAPABILITY = 'recall'
+export const MEMORY_RECALL_TOOL_NAME = 'memory_recall'
+export const FRONTEND_MEMORY_RECALL_CAPABILITY = 'memory_recall'
 
 const webSearchTool = {
   type: 'function',
@@ -79,25 +78,26 @@ const knowledgeTool = {
   },
 }
 
-const recallTool = {
+const memoryRecallTool = {
   type: 'function',
   function: {
-    name: RECALL_TOOL_NAME,
-    description: '回顾以前的对话摘要与关联工作，不含原话和执行细节，也不检索资料文档。个人长期事实与偏好用 memory。需要工作详情时用返回的 task_id 调用 get_agent_task_status；未返回 ID 的工作已无法从台账查询，不要猜造。没有记录时如实说明，不要编造聊过的内容。',
+    name: MEMORY_RECALL_TOOL_NAME,
+    description: '检索当前用户的长期记忆，以回答其过去的经历、偏好、计划、关系或此前讨论过的个人事实。只在回答确实依赖过往记忆时调用；不用于公开网页、知识库文档或当前对话中已给出的内容。结果只是带证据的记忆线索，缺少记忆时必须如实说明，不能补全或编造。',
     parameters: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: '用户提到的话题或事情的关键词，尽量用用户自己说的原词，不要改写或扩写；用户没有指明时省略。',
+          description: '需要从长期记忆中确认的完整问题或主题。保留用户的关键实体、时间和约束，不要用无意义的泛词。',
         },
         limit: {
           type: 'integer',
           minimum: 1,
           maximum: 10,
-          description: '最多返回几场，默认 5。语音场景下不要一次要太多。',
+          description: '最多返回多少条相关记忆，默认 5；语音场景下应保持较小。',
         },
       },
+      required: ['query'],
       additionalProperties: false,
     },
   },
@@ -112,9 +112,9 @@ export const retrievalToolEntries = [
     },
   },
   {
-    definition: recallTool,
+    definition: memoryRecallTool,
     policy: {
-      requiredCapabilities: [FRONTEND_RECALL_CAPABILITY],
+      requiredCapabilities: [FRONTEND_MEMORY_RECALL_CAPABILITY],
     },
   },
   {
@@ -212,69 +212,45 @@ async function knowledge(runtime, { callId, turnId, args }) {
   }
 }
 
-function describeRecalledWork(runtime, work = []) {
-  return work.map(item => {
-    const task = item.id
-      ? runtime.taskManager.get(item.id, { ownerId: runtime.ownerId })
-      : null
-    return task
-      ? { task_id: task.id, objective: item.objective, status: task.status }
-      : { objective: item.objective, status: 'unknown' }
-  })
-}
-
-function recalledSessions(runtime, query, limit) {
-  if (!runtime.sessionDigests) return []
-  const timeZone = runtime.getClientContext()?.timeZone
-  const now = Date.now()
-  return runtime.sessionDigests
-    .search({ ownerId: runtime.ownerId, keyword: query, limit })
-    .map(digest => {
-      const work = describeRecalledWork(runtime, digest.work)
-      return {
-        ...describeWhen(digest.at, { now, timeZone }),
-        topics: digest.topics,
-        gist: digest.gist,
-        ...(digest.turns ? { turns: digest.turns } : {}),
-        ...(work.length ? { work } : {}),
-      }
-    })
-}
-
-async function recall(runtime, callId, turnId, args) {
+async function memoryRecall(runtime, callId, turnId, args) {
   const query = String(args.query || '').trim()
-  const limit = Number(args.limit)
-  if (!runtime.sessionDigests) {
+  if (!query) {
     await runtime.sendOutput(callId, toolFailure(
-      'recall_unavailable',
-      '回顾以前记录的功能当前不可用。',
+      'missing_memory_query',
+      '需要说明要从长期记忆中检索的内容。',
     ), turnId)
     return
   }
-
-  let sessions = []
-  let degraded = false
+  if (typeof runtime.memoryService?.query !== 'function') {
+    await runtime.sendOutput(callId, toolFailure(
+      'memory_recall_unavailable',
+      '长期记忆检索当前不可用。',
+    ), turnId)
+    return
+  }
   try {
-    sessions = recalledSessions(runtime, query, limit)
+    const result = await runtime.memoryService.query(runtime.ownerId, query, {
+      limit: Number(args.limit),
+    }, {
+      source: 'realtime-memory-recall-tool',
+      sessionId: runtime.sessionId,
+      turnId,
+      traceId: callId,
+    })
+    const context = String(result?.context || '').trim()
+    await runtime.sendOutput(callId, context
+      ? { status: 'found', context }
+      : {
+          status: 'not_found',
+          message: `没有找到和“${query}”有关的可靠长期记忆。`,
+        }, turnId)
   } catch {
-    degraded = true
-  }
-
-  let output
-  if (sessions.length) {
-    output = { status: 'found', sessions }
-  } else if (degraded) {
-    output = toolFailure(
-      'recall_failed',
-      '暂时读不到以前的记录，请稍后再试。',
+    await runtime.sendOutput(callId, toolFailure(
+      'memory_recall_failed',
+      '暂时无法检索长期记忆，请稍后重试。',
       { retryable: true },
-    )
-  } else if (query && (runtime.sessionDigests?.count(runtime.ownerId) || 0) > 0) {
-    output = { status: 'not_found', message: `没有找到和“${query}”有关的记录。` }
-  } else {
-    output = { status: 'empty', message: '还没有攒下以前的记录。' }
+    ), turnId)
   }
-  await runtime.sendOutput(callId, output, turnId)
 }
 
 export function retrievalToolHandlers(runtime) {
@@ -282,8 +258,8 @@ export function retrievalToolHandlers(runtime) {
     [WEB_SEARCH_TOOL_NAME]: context => webSearch(runtime, context),
     [FETCH_URL_TOOL_NAME]: context => fetchUrl(runtime, context),
     [KNOWLEDGE_TOOL_NAME]: context => knowledge(runtime, context),
-    [RECALL_TOOL_NAME]: ({ callId, turnId, args }) => (
-      recall(runtime, callId, turnId, args)
+    [MEMORY_RECALL_TOOL_NAME]: ({ callId, turnId, args }) => (
+      memoryRecall(runtime, callId, turnId, args)
     ),
   }
 }
