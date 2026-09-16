@@ -347,6 +347,14 @@ export class RealtimeProviderSession {
     return this.scheduleReconnect()
   }
 
+  // Rebuild immediately instead of waiting for the normal reconnect backoff.
+  // A keyword wake uses this to create an upstream conversation with no
+  // prior turn state before emitting its fixed acknowledgement.
+  restart({ clearAudio = true } = {}) {
+    this.detach({ clearAudio })
+    return this.ensure()
+  }
+
   close(options) {
     this.detach(options)
   }

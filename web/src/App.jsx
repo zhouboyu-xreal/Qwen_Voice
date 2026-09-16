@@ -251,6 +251,7 @@ export default function App() {
   const autoHideRequestedDeadlineRef = useRef(0)
   const lastWakeAtRef = useRef(0)
   const previousDesktopLifecycle = useRef('active')
+  const desktopWakeReasonRef = useRef('')
   const gatewayCommandsRef = useRef(null)
   const sessionIdRef = useRef(sessionId)
   sessionIdRef.current = sessionId
@@ -953,6 +954,7 @@ export default function App() {
         && previousDesktopLifecycle.current !== 'waking'
       ) {
         triggerSpriteAnimation('wake', { priority: true })
+        desktopWakeReasonRef.current = lifecycle.reason || ''
       }
       previousDesktopLifecycle.current = lifecycle.state
       setDesktopLifecycle(lifecycle.state)
@@ -1006,16 +1008,23 @@ export default function App() {
       window.qwenAudioAgentDesktop?.consumePreWakeContext
     )
     if (typeof consumePreWakeContext !== 'function') {
-      wakeGateway()
+      wakeGateway({ wakeReason: desktopWakeReasonRef.current })
       return undefined
     }
     let disposed = false
     void consumePreWakeContext()
       .then(snapshot => {
-        if (!disposed) wakeGateway({ preWakeContext: snapshot?.text || '' })
+        if (!disposed) {
+          wakeGateway({
+            preWakeContext: snapshot?.text || '',
+            wakeReason: desktopWakeReasonRef.current,
+          })
+        }
       })
       .catch(() => {
-        if (!disposed) wakeGateway()
+        if (!disposed) {
+          wakeGateway({ wakeReason: desktopWakeReasonRef.current })
+        }
       })
     return () => { disposed = true }
   }, [desktopLifecycle, wakeGateway])

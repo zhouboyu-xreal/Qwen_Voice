@@ -145,6 +145,21 @@ test('reads fresh session options when an upstream provider Session is rebuilt',
   assert.equal(frontends[1].options.sessionOptions.voice, 'longanlufeng')
 })
 
+test('restarts immediately with a fresh frontend instead of waiting for backoff', async () => {
+  const { runtime, calls, frontends } = harness({ connectMode: 'resolve' })
+  await runtime.ensure()
+  runtime.appendAudio('stale-audio')
+
+  await runtime.restart()
+
+  assert.equal(frontends.length, 2)
+  assert.equal(runtime.frontend, frontends[1])
+  assert.equal(calls.some(([name, provider]) => (
+    name === 'close' && provider === 'dashscope'
+  )), true)
+  assert.deepEqual(runtime.pendingAudio, [])
+})
+
 test('shares one connection attempt and flushes bounded audio before ready', async () => {
   const { runtime, calls, frontends } = harness()
 

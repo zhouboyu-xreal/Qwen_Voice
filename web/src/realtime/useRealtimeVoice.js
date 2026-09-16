@@ -1009,11 +1009,17 @@ export default function useRealtimeVoice({
 
   // 桌面唤起（快捷键/托盘）时显式唤醒 Gateway：唤醒词开启时 socket 在休眠
   // 期间保持连接，不会重发 connect，需要专门的事件恢复前台语音连接。
-  const wake = useCallback(({ preWakeContext = '' } = {}) => (
+  const wake = useCallback(({
+    preWakeContext = '',
+    wakeReason = '',
+  } = {}) => (
     sendSocketEvent({
       type: GatewayClientEvent.WAKE,
       ...(String(preWakeContext || '').trim()
         ? { preWakeContext: String(preWakeContext).trim() }
+        : {}),
+      ...(String(wakeReason || '').trim()
+        ? { wakeReason: String(wakeReason).trim() }
         : {}),
     })
   ), [sendSocketEvent])

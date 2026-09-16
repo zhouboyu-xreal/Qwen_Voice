@@ -92,6 +92,30 @@ const CLIENT_HEARTBEAT_MS = 30_000
 const MAX_PRE_WAKE_CONTEXT_CHARS = 1_200
 const clientProtocolSessions = new WeakMap()
 
+export const WAKE_ACKNOWLEDGEMENT_TEXT = '你好，我在。'
+
+// This response is deliberately not a normal conversational continuation.
+// `conversation: none` prevents persistence, while these per-response
+// instructions stop the model from treating the preceding turn as a request
+// to answer when the user only said the keyword.
+export function wakeAcknowledgementInstructions() {
+  return [
+    '这是关键词唤醒后的固定语音确认，不是用户提出的新问题。',
+    '忽略此前会话中的所有问题、事实、任务和上下文；绝不能续答、总结或回应它们。',
+    `必须且只能说“${WAKE_ACKNOWLEDGEMENT_TEXT}”。`,
+    '不要增加任何其他字词、解释、问题或标点外的内容；不要调用工具。',
+  ].join(' ')
+}
+
+export function wakeAcknowledgementControlContext() {
+  return [
+    '<wake_acknowledgement>',
+    '系统正在确认关键词唤醒。这不是用户问题，也不代表用户要求继续此前对话。',
+    `请准备且只能播报“${WAKE_ACKNOWLEDGEMENT_TEXT}”。`,
+    '</wake_acknowledgement>',
+  ].join('\n')
+}
+
 // This text is produced from local microphone audio before a keyword wake.
 // Treat it as background context only: it must not be interpreted as a new
 // instruction, and it never enters the normal conversation-observation path.
@@ -102,9 +126,10 @@ export function buildPreWakeContextPrompt(value) {
   if (!text) return ''
   return [
     '<pre_wake_context>',
-    '以下是本次唤醒词前、用户刚刚说出的本地 ASR 转写，仅用于理解紧随其后的一个用户问题。',
+    '以下是本次唤醒词前、用户刚刚说出的本地 ASR 转写，仅可用于理解本次激活期间用户的明确问题或请求。',
     '它不是当前用户的新指令；不要逐字复述，也不要把它保存为长期记忆。',
-    '对于紧随其后的问题，将其中相关的事实陈述视为优先的临时上下文，最新陈述优先。若它已能回答问题，直接回答；不要调用长期记忆，也不要声称需要查询日程、记录或待办。',
+    '若用户只有唤醒词、寒暄、停顿、确认语，或没有后续问题，不得主动提及、总结、回答或推断其中的内容。',
+    '对于本次激活期间明确问题中相关的事实陈述，将其视为优先的临时上下文，最新陈述优先。若它已能回答问题，直接回答；不要调用长期记忆，也不要声称需要查询日程、记录或待办。',
     text,
     '</pre_wake_context>',
   ].join('\n')
@@ -347,6 +372,9 @@ export function attachRealtimeGateway(server, {
     let sleeping = false
     let waking = false
     let preWakeContextInjecting = false
+    let activePreWakeContext = ''
+    let preWakeContextAttachedFrontend = null
+    let preWakeContextGeneration = 0
     let sleepController
     let wakeWordEnabled = false
     let wakeWordGraceActive = false
@@ -375,6 +403,33 @@ export function attachRealtimeGateway(server, {
         error: String(error?.message || error),
       }),
     })
+    const clearActivePreWakeContext = reason => {
+      const characters = [...activePreWakeContext].length
+      activePreWakeContext = ''
+      preWakeContextAttachedFrontend = null
+      preWakeContextGeneration += 1
+      preWakeContextInjecting = false
+      if (characters) {
+        connectionLogger.info('pre_wake_context.cleared', {
+          reason,
+          characters,
+        })
+      }
+    }
+    const stagePreWakeContext = value => {
+      clearActivePreWakeContext('replaced')
+      const text = String(value || '').replaceAll('\0', '').trim()
+      if (!text) {
+        connectionLogger.debug('pre_wake_context.empty')
+        return
+      }
+      activePreWakeContext = text
+      preWakeContextGeneration += 1
+      connectionLogger.info('pre_wake_context.staged', {
+        characters: [...text].length,
+        text,
+      })
+    }
     const announcementWindow = new AnnouncementWindow()
     const notificationClaimantId = `voice_${randomUUID()}`
     let clientContext = normalizeClientContext()
@@ -430,8 +485,13 @@ export function attachRealtimeGateway(server, {
     // Keep visible history intact while excluding only a provider-rejected turn
     // from future Realtime Session restoration.
     const realtimeRecoveryContext = new RealtimeRecoveryContext()
-    const frontendRecentMessages = () => realtimeRecoveryContext.project(
-      conversationSync.frontendContext({ ownerId, sessionId }),
+    let suppressFrontendHistoryRestore = false
+    const frontendRecentMessages = () => (
+      suppressFrontendHistoryRestore
+        ? []
+        : realtimeRecoveryContext.project(
+          conversationSync.frontendContext({ ownerId, sessionId }),
+        )
     )
     const getAgentContext = () => ({
       client: clientContext,
@@ -658,6 +718,11 @@ export function attachRealtimeGateway(server, {
         announcePendingInputs()
       },
       onReady: createdFrontend => {
+        // The fresh Session used for a keyword acknowledgement was built
+        // without the previous activation's conversation. Restore the normal
+        // projection policy after it is configured; this does not retroactively
+        // add history to that upstream Session.
+        suppressFrontendHistoryRestore = false
         const resumedFromSleep = waking
         waking = false
         if (outputEnabled) claimPendingNotifications()
@@ -746,6 +811,7 @@ export function attachRealtimeGateway(server, {
       deactivate: replacement => {
         sleeping = false
         waking = false
+        clearActivePreWakeContext('voice_client_deactivated')
         presenceController.wake()
         sleepController?.disable()
         inputEnabled = false
@@ -936,6 +1002,11 @@ export function attachRealtimeGateway(server, {
       ensurePermissionResponseFor,
       reportFrontendError,
       onSpeechStarted: fields => {
+        // The keyword phrase itself is captured while the client is sleeping
+        // and never reaches this callback. The active local ASR context is
+        // attached on this turn when needed, and remains available through
+        // the rest of the activation without being duplicated per turn.
+        void injectActivePreWakeContext('voice_speech_started')
         presentationRuntime.interruptActiveResponses()
         observeMemoryAudio({ type: 'speech_started', ...fields })
       },
@@ -1163,6 +1234,12 @@ export function attachRealtimeGateway(server, {
         if (event.__voiceRetried) return
         const errorMessage = realtimeEventErrorMessage(event)
         const providerError = realtimeSession.classifyError(errorMessage)
+        if (event.__voiceOrigin === 'wake_acknowledgement') {
+          connectionLogger.warn('wake_acknowledgement.provider_error', {
+            provider: realtimeSession.providerKey,
+            error: errorMessage,
+          })
+        }
         const recoverableInactivity = providerError === 'inactivity'
         // A local or otherwise capacity-bounded provider can still be draining
         // the previous Session. Its close event drives the shared reconnect
@@ -1260,7 +1337,7 @@ export function attachRealtimeGateway(server, {
       clearVisualInput()
       sleeping = true
       waking = false
-      preWakeContextInjecting = false
+      clearActivePreWakeContext('entered_sleep')
       wakeWordGraceActive = false
       sleepController.holdSleeping()
       announcementWindow.reset()
@@ -1290,21 +1367,95 @@ export function attachRealtimeGateway(server, {
       return true
     }
 
+    const injectActivePreWakeContext = source => {
+      if (
+        preWakeContextInjecting
+        || !activePreWakeContext
+        || sleeping
+        || waking
+      ) return null
+      if (
+        realtimeSession.ready
+        && preWakeContextAttachedFrontend === realtimeSession.frontend
+      ) return null
+      const preWakeText = activePreWakeContext
+      const context = buildPreWakeContextPrompt(preWakeText)
+      if (!context) {
+        clearActivePreWakeContext('invalid')
+        return null
+      }
+      const generation = preWakeContextGeneration
+      preWakeContextInjecting = true
+      connectionLogger.info('pre_wake_context.injecting', {
+        source,
+        characters: [...preWakeText].length,
+      })
+      return realtimeSession.ensure()
+        .then(() => {
+          // A sleep, disconnect, or replacement can invalidate this work
+          // while ensure() is still resolving. Do not leak stale local audio
+          // into the next session in that case.
+          if (
+            generation !== preWakeContextGeneration
+            || sleeping
+            || waking
+          ) return false
+          const frontend = realtimeSession.frontend
+          if (!frontend) return false
+          if (preWakeContextAttachedFrontend === frontend) return false
+          return realtimeSession.appendUserContext(context)
+            .then(result => ({ frontend, result }))
+        })
+        .then(outcome => {
+          if (outcome === false || outcome?.result === false) {
+            connectionLogger.debug('pre_wake_context.injection_skipped', {
+              source,
+              reason: generation !== preWakeContextGeneration
+                ? 'invalidated'
+                : outcome?.frontend
+                  ? 'provider_unsupported'
+                  : 'frontend_unavailable',
+            })
+            return
+          }
+          if (
+            generation !== preWakeContextGeneration
+            || realtimeSession.frontend !== outcome.frontend
+          ) {
+            connectionLogger.debug('pre_wake_context.injection_skipped', {
+              source,
+              reason: 'frontend_replaced',
+            })
+            return
+          }
+          preWakeContextAttachedFrontend = outcome.frontend
+          connectionLogger.info('pre_wake_context.appended', {
+            source,
+            characters: [...preWakeText].length,
+          })
+        })
+        .catch(error => {
+          connectionLogger.warn('pre_wake_context.append_failed', {
+            source,
+            message: error.message,
+          })
+        })
+        .finally(() => {
+          if (generation === preWakeContextGeneration) {
+            preWakeContextInjecting = false
+          }
+        })
+    }
+
     const wakeFromSleep = ({
       graceTimeoutMs = 0,
       preWakeContext = '',
+      wakeReason = '',
     } = {}) => {
-      if (!sleeping || waking || preWakeContextInjecting) return
-      const context = buildPreWakeContextPrompt(preWakeContext)
-      const preWakeText = String(preWakeContext || '').replaceAll('\0', '').trim()
-      if (preWakeText) {
-        connectionLogger.info('pre_wake_context.received', {
-          characters: [...preWakeText].length,
-          text: preWakeText,
-        })
-      } else {
-        connectionLogger.debug('pre_wake_context.empty')
-      }
+      if (!sleeping || waking) return
+      // A snapshot must not be appended during wake itself. Keyword wake has
+      // no user request; it is staged until the first real active turn.
+      stagePreWakeContext(preWakeContext)
       const finishWake = () => {
         if (!sleeping) return
         sleeping = false
@@ -1323,29 +1474,53 @@ export function attachRealtimeGateway(server, {
         announcements.flush()
         progressAnnouncements.flush()
       }
-      if (!context) {
-        finishWake()
-        return
-      }
-      preWakeContextInjecting = true
-      realtimeSession.ensure()
-        .then(() => realtimeSession.appendUserContext(context))
-        .then(result => {
-          if (result === false) {
-            throw new Error('当前 Realtime provider 不支持 pre-wake 上下文注入')
+      finishWake()
+      if (wakeReason !== 'wake-word') return
+      suppressFrontendHistoryRestore = true
+      connectionLogger.info('wake_acknowledgement.clean_session_requested')
+      realtimeSession.restart()
+        // DashScope requires a conversation item before response.create. This
+        // control context belongs only to the fresh upstream Session; it is
+        // never projected into local history or long-term memory.
+        .then(() => realtimeSession.appendUserContext(
+          wakeAcknowledgementControlContext(),
+        ))
+        .then(appended => {
+          if (appended === false) {
+            throw new Error('Realtime provider 不支持唤醒确认上下文')
           }
-          connectionLogger.info('pre_wake_context.appended', {
-            characters: [...preWakeText].length,
+          return realtimeSession.frontend?.speak(
+            WAKE_ACKNOWLEDGEMENT_TEXT,
+            'wake_acknowledgement',
+            { transient: true },
+            {
+              shouldSpeak: () => (
+                outputEnabled
+                && !sleeping
+                && !turns.userSpeaking
+              ),
+              responseOptions: {
+                instructions: wakeAcknowledgementInstructions(),
+              },
+            },
+          )
+        })
+        .then(result => {
+          connectionLogger.info('wake_acknowledgement.completed', {
+            completed: result?.completed === true,
+            skipped: result?.skipped === true,
+            failed: result?.failed === true,
+            timedOut: result?.timedOut === true,
+            responseId: result?.responseId || '',
           })
+          if (result?.failed || result?.timedOut) {
+            connectionLogger.warn('wake_acknowledgement.failed', result)
+          }
         })
         .catch(error => {
-          connectionLogger.warn('pre_wake_context.append_failed', {
-            message: error.message,
+          connectionLogger.warn('wake_acknowledgement.failed', {
+            message: String(error?.message || error),
           })
-        })
-        .finally(() => {
-          preWakeContextInjecting = false
-          finishWake()
         })
     }
 
@@ -1869,7 +2044,14 @@ export function attachRealtimeGateway(server, {
         }
         wakeWordGraceActive = false
         sleepController.recordActivity()
-        inputs.submit(event)
+        // Text turns do not emit speech_started, so attach the active
+        // activation context before submitting the first one.
+        const injectingPreWakeContext = injectActivePreWakeContext('text_input')
+        if (injectingPreWakeContext) {
+          injectingPreWakeContext.finally(() => inputs.submit(event))
+        } else {
+          inputs.submit(event)
+        }
       } else if (event.type === GatewayClientEvent.INTERRUPT) {
         wakeWordGraceActive = false
         sleepController.recordActivity()
@@ -1899,7 +2081,14 @@ export function attachRealtimeGateway(server, {
           outputEnabled,
           active: activeVoiceClients.isActive(ownerId, voiceClient),
           responseKnown: presentationRuntime.has(id),
-        })) presentationRuntime.finishPlayback(id)
+        })) {
+          presentationRuntime.finishPlayback(id)
+          // Start the shared CLI/Desktop inactivity window only after the
+          // user has actually heard the complete response. Otherwise a long
+          // response can consume its whole idle budget while playback blocks
+          // sleep, causing the surface to disappear immediately at the end.
+          sleepController.recordActivity()
+        }
       } else if (event.type === GatewayClientEvent.PLAYBACK_CANCELLED) {
         const id = String(event.responseId || '')
         if (acceptsPlaybackReceipt({
@@ -1916,7 +2105,7 @@ export function attachRealtimeGateway(server, {
         releaseVoiceClient()
         sleeping = false
         waking = false
-        preWakeContextInjecting = false
+        clearActivePreWakeContext('muted')
         presenceController.wake()
         sleepController?.disable()
         turns.advanceBoundary()
@@ -1943,6 +2132,7 @@ export function attachRealtimeGateway(server, {
           wakeFromSleep({
             graceTimeoutMs,
             preWakeContext: event.preWakeContext,
+            wakeReason: event.wakeReason,
           })
         }
         else sleepController.recordActivity()
@@ -1972,6 +2162,7 @@ export function attachRealtimeGateway(server, {
       if (!connections?.size) voiceConnections.delete(ownerId)
       unsubscribeTasks()
       clearResponseCandidate()
+      clearActivePreWakeContext('connection_closed')
       turns.close()
       transcripts.close()
       turnCitations.clear()

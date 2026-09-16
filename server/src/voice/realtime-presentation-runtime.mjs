@@ -485,7 +485,7 @@ export class RealtimePresentationRuntime {
       && context.origin === 'model'
       && containsReservedProtocolEnvelope(content),
     )
-    if (final && !invalidModelProtocol) {
+    if (final && !invalidModelProtocol && !context?.transient) {
       const message = this.conversationSync.record({
         ownerId: this.ownerId,
         sessionId: this.sessionId,

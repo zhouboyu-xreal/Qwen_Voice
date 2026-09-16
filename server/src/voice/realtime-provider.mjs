@@ -457,6 +457,7 @@ export class RealtimeFrontend {
 
   speak(text, origin = 'agent', context = {}, {
     shouldSpeak,
+    responseOptions,
   } = {}) {
     const content = String(text || '').trim()
     if (!content) return Promise.resolve()
@@ -466,7 +467,7 @@ export class RealtimeFrontend {
     return this.enqueueResponse(origin, context, () => {
       if (shouldSpeak && !shouldSpeak()) return false
       this.send(this.protocol.responseCreate(
-        this.provider.buildSpeakResponse(content),
+        this.provider.buildSpeakResponse(content, responseOptions),
       ))
     })
   }

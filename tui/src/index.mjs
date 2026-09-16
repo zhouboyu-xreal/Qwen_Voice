@@ -421,6 +421,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
             socket.send({
               type: GatewayClientEvent.WAKE,
               ...(preWakeContext?.text ? { preWakeContext: preWakeContext.text } : {}),
+              wakeReason: 'wake-word',
             })
             socket.send(microphoneControlEvent(false))
             setStatus('已检测到唤醒词 · 正在恢复语音会话')

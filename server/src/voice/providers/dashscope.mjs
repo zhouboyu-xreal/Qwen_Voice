@@ -99,10 +99,14 @@ export const dashscopeProvider = {
     return session
   },
 
-  buildSpeakResponse: content => ({
+  buildSpeakResponse: (content, {
+    instructions = '',
+    toolChoice = '',
+  } = {}) => ({
     conversation: 'none',
     modalities: responseModalities(activeModelProfile()),
-    instructions: speakResponseInstructions(content),
+    instructions: instructions || speakResponseInstructions(content),
+    ...(toolChoice ? { tool_choice: toolChoice } : {}),
   }),
 
   buildResultInjection: (content, { allowTools = false } = {}) => ({
