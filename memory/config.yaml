@@ -1,0 +1,252 @@
+# Main runtime parameters for AI-glasses voice processing.
+# Most runtime/model parameters live here. main.py CLI only keeps startup-level
+# switches such as --config, --list-devices, --assistant_wakup/--no-assistant_wakeup,
+# --kws/--no-kws, --speaker-identification/--no-speaker-identification,
+# and --allday-recording/--no-allday-recording.
+
+voice_runtime:
+
+  # Simulated wall-clock gap between two consecutive audio files.
+  sample_rate: 16000
+  language: zh
+  device: null
+  max_duration_s: null
+
+  vad:
+    frame_ms: 32.0
+    threshold: 0.5
+    min_silence_ms: 250
+    speech_pad_ms: 30
+    # Merge VAD fragments before ASR when the same known speaker resumes quickly.
+    span_merge_enabled: true
+    span_merge_max_gap_seconds: 0.6
+    span_merge_max_duration_seconds: 20.0
+  
+  kws:
+    enabled: false
+    tokens: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt
+    encoder: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.onnx
+    decoder: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx
+    joiner: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.onnx
+    keywords_file: assets/sherp-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/keywords_script.txt
+    inline_keywords: null
+    num_threads: 2
+    provider: cpu
+    device: 0
+    feature_dim: 80
+    max_active_paths: 4
+    keywords_score: 1.0
+    keywords_threshold: 0.25
+    num_trailing_blanks: 1
+  
+  speaker_identification:
+    enabled: true
+    model_id: iic/speech_campplus_sv_zh-cn_16k-common
+    window_s: 2.048
+    similarity_threshold: 0.5
+    # Maximum number of recent high-confidence embeddings retained per speaker.
+    reference_memory_size: 20
+    reference_embeddings_path: tmp/mcp/speaker_reference_embeddings.npz
+    min_reference_segment_duration_s: 1.0
+    min_new_reference_segments: 2
+    min_new_reference_duration_s: 2.0
+    user_similarity_threshold: null
+    user_reference_audio: []
+    speaker_assignment_method: agglomerative
+    embedding_batch_size: 16
+  
+  asr:
+    backend: qwen3_asr
+    common:
+      language: zh
+      device: null
+      dtype: auto
+    backends:
+      whisper:
+        model_id: openai/whisper-large-v3-turbo
+        # model_id: openai/whisper-tiny
+        chunk_length_s: null
+        condition_on_prev_tokens: false
+        max_new_tokens: 64
+        # These can help tiny models avoid repetition, but may distort normal large-model ASR.
+        no_repeat_ngram_size: null
+        repetition_penalty: null
+      qwen3_asr:
+        model_id: Qwen/Qwen3-ASR-0.6B
+        revision: main
+        cache_dir: null
+        dtype: auto
+        device_map: null
+        max_inference_batch_size: 6
+        dynamic_batching_enabled: true
+        max_batch_duration_diff_seconds: 2.0
+        max_new_tokens: 256
+        attn_implementation: null
+      paraformer:
+        model_id: funasr/paraformer-zh
+      paraformer_streaming:
+        model_id: funasr/paraformer-zh-streaming
+        chunk_size: [60, 10, 5]
+        encoder_chunk_look_back: 4
+        decoder_chunk_look_back: 1
+      parakeet:
+        model_id: nvidia/parakeet-tdt-0.6b-v3
+      sherpa_onnx_zipformer:
+        tokens: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt
+        encoder: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.onnx
+        decoder: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx
+        joiner: assets/sherpa-onnx/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.onnx
+        num_threads: 2
+        provider: cpu
+        feature_dim: 80
+        max_active_paths: 4
+        decoding_method: greedy_search
+        hotwords_file: null
+        hotwords_score: 1.0
+        blank_penalty: 0.0
+        tail_padding_s: 0.66
+
+  # Ephemeral local context before a keyword wake. This uses the active ASR
+  # backend above (currently qwen3_asr), never writes PCM or transcripts to
+  # disk, and must not be submitted to MemoryRuntime.
+  prewake_context:
+    enabled: false
+    buffer_seconds: 60.0
+    guard_seconds: 1.5
+    max_context_characters: 800
+    min_text_characters: 2
+    min_speech_seconds: 0.35
+    max_pending_segments: 10
+  
+  output:
+    simplify_chinese: true
+    print_empty: false
+    log_frames: false
+    output_jsonl: null
+  
+chat:
+  enabled: false
+  llm_provider: deepseek
+  llm_name: deepseek-v4-flash
+  llm_base_url: https://api.deepseek.com
+  llm_api_key: ${DEEPSEEK_API_KEY}
+
+memory_mcp_server:
+  result_dir: tmp/mcp
+  db_name: memory.db
+  log_name: memory.log
+  asr_result_dir: asr_result
+  report_name: voice_memory_runtime_report.json
+  log_level: INFO
+  queue_timeout: 30.0
+
+memory_runtime:
+  memory_prompt_language_mode: zh
+  memory_output_language_mode: zh
+  assistant_wakeup_segmentation:
+    max_pending_interaction_turns: 10
+    max_pending_interaction_tokens: 500
+    min_pending_interaction_turns: 2
+    min_pending_interaction_tokens: 200
+    max_time_gap_seconds: 30
+
+    threshold: 0.6
+    bias: -1.1
+    surprise_history_window: 64
+    min_surprise_history: 5
+    robust_surprise_weight: 0.8
+    absolute_surprise_weight: 0.8
+    cohesion_drop_weight: 0.8
+    length_weight: 0.40
+    turn_count_weight: 0.4
+
+  allday_recording_segmentation:
+    max_pending_transcript_units: 40
+    max_pending_transcript_tokens: 1000
+    min_pending_transcript_units: 4
+    min_pending_transcript_tokens: 200
+    max_time_gap_seconds: 60.0
+    episode_summary_trigger_gap_seconds: 600.0
+    
+    segment_merge_max_gap_seconds: 1.0
+    min_transcript_unit_tokens: 40
+    max_transcript_unit_tokens: 120
+    max_transcript_unit_duration_seconds: 20.0
+    short_fragment_max_tokens: 8
+    min_boundary_scoring_incoming_tokens: 5
+    rolling_window_enabled: true
+    rolling_window_tail_units: 3
+    
+    threshold: 0.6
+    bias: -1.1
+    surprise_history_window: 64
+    min_surprise_history: 5
+    robust_surprise_weight: 0.8
+    absolute_surprise_weight: 0.8
+    cohesion_drop_weight: 0.8
+    length_weight: 0.4
+    turn_count_weight: 0.4
+
+    log_decisions: true
+
+memory_manager:
+  memory_enabled: true
+  enable_memory_entity_claim_update: true
+  enable_memory_prospective_update: true
+  llm:
+    llm_provider: deepseek
+    llm_name: deepseek-v4-flash
+    llm_base_url: https://api.deepseek.com
+    llm_api_key: ${DEEPSEEK_API_KEY}
+    llm_timeout: 120
+    llm_thinking: disabled
+    llm_json_mode: true
+  embedding:
+    enabled: true
+    provider: openai
+    model: embedding-3
+    base_url: https://api.z.ai/api/paas/v4
+    api_key: ${GLM_API_KEY}
+    api_key_env: GLM_API_KEY
+    dimensions: 2048
+    normalize: true
+    batch_size: 32
+
+  task_queue_maxsize: 100
+
+  reflect_limit: 100
+  entity_claim_explicit_min_confidence: 0.72
+  entity_claim_signal_max_per_fact: 3
+  entity_claim_induction_min_support_facts: 3
+  entity_claim_induction_min_episodes: 3
+  entity_claim_induction_min_time_windows: 2
+  entity_claim_induction_evidence_limit: 16
+  
+  recall:  
+    recall_top_k: 8
+    recall_budget: mid
+    recall_mode: normal
+    retrieval_source_override:
+
+    recall_detailed_logging: true
+    recall_stage1:
+      recall_stage1_entity_matched_score: 0.30
+      recall_stage1_topic_overlap_score_weight: 0.54
+      recall_stage1_keyword_overlap_score_weight: 0.12
+      recall_stage1_time_score_weight: 0.12
+      recall_stage1_contextual_time_score_multiplier: 2.0
+      recall_stage1_actionable_min_importance: 0.75
+      recall_stage1_evidence_profile_min_term_coverage: 0.5
+    recall_stage2:
+      recall_stage2_fact_min_embedding_similarity: 0.30
+      recall_stage2_state_min_embedding_similarity: 0.25
+      recall_stage2_fact_strong_embedding_similarity: 0.45
+      recall_stage2_state_strong_embedding_similarity: 0.40
+      recall_stage2_strong_topic_pair_score: 0.90
+      recall_stage2_keyword_match_score_weight: 0.12
+      recall_stage2_bm25_score_weight: 0.2
+      recall_stage2_entity_matched_score: 0.20
+      recall_stage2_time_score_weight: 0.12
+      recall_stage2_contextual_time_score_multiplier: 2.0
+    recall_fact_time_score_half_life_seconds: 604800
+    recall_persistent_state_time_score_half_life_seconds: 7776000

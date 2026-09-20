@@ -3,11 +3,18 @@ import { createHash, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 import {
   MEMORY_PROVIDER_PROTOCOL_VERSION,
 } from '../../provider.mjs'
 
 const SENSITIVE = /(?:api[_ -]?key|secret|token|password|passwd|credential|密码|密钥|验证码|令牌|证件号|身份证|详细住址|病史|病历|诊断|用药|\bsk-[a-z0-9_-]+|\b\d{11,19}\b)/iu
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../../..')
+const BUNDLED_AGENT_MEMORY_SIDECAR = resolve(
+  PROJECT_ROOT,
+  'memory/integrations/qwen_audio_agent/agent_memory_sidecar.py',
+)
+const BUNDLED_AGENT_MEMORY_CONFIG = resolve(PROJECT_ROOT, 'memory/config.yaml')
 
 function ownerKey(ownerId) {
   return createHash('sha256').update(String(ownerId || 'anonymous')).digest('hex')
@@ -124,19 +131,14 @@ export class AgentMemoryProvider {
     this.pendingObservations = new Map()
     const sidecarEnvironment = { ...env }
     const configuredSidecar = String(
-      sidecarPath || sidecarEnvironment.AGENT_MEMORY_SIDECAR || '',
+      sidecarPath || sidecarEnvironment.AGENT_MEMORY_SIDECAR || BUNDLED_AGENT_MEMORY_SIDECAR,
     ).trim()
-    if (!sidecar && !configuredSidecar) {
-      throw new Error(
-        'Agent Memory 需要外部 sidecar；请设置 AGENT_MEMORY_SIDECAR 为其绝对路径',
-      )
-    }
     const resolvedSidecar = configuredSidecar ? resolve(configuredSidecar) : ''
     if (!sidecar && !existsSync(resolvedSidecar)) {
       throw new Error(`Agent Memory sidecar 不存在：${resolvedSidecar}`)
     }
     const configuredConfig = String(
-      configPath || sidecarEnvironment.AGENT_MEMORY_CONFIG || '',
+      configPath || sidecarEnvironment.AGENT_MEMORY_CONFIG || BUNDLED_AGENT_MEMORY_CONFIG,
     ).trim()
     this.sidecar = sidecar || new JsonLineSidecar({
       command: python || defaultPythonCommand(sidecarEnvironment),

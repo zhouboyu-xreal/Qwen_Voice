@@ -311,10 +311,10 @@ export const config = {
   agentMemoryPython: String(process.env.AGENT_MEMORY_PYTHON || '').trim(),
   agentMemorySidecarPath: process.env.AGENT_MEMORY_SIDECAR
     ? resolve(root, process.env.AGENT_MEMORY_SIDECAR)
-    : '',
+    : resolve(root, 'memory/integrations/qwen_audio_agent/agent_memory_sidecar.py'),
   agentMemoryConfigPath: process.env.AGENT_MEMORY_CONFIG
     ? resolve(root, process.env.AGENT_MEMORY_CONFIG)
-    : '',
+    : resolve(root, 'memory/config.yaml'),
   gatewayAccessToken: String(
     process.env.QWEN_AUDIO_GATEWAY_ACCESS_TOKEN
     || process.env.QWEN_AUDIO_AGENT_ACCESS_TOKEN

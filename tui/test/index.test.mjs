@@ -246,6 +246,12 @@ test('derives the pre-wake sidecar from the configured Agent Memory sidecar', ()
   )
 })
 
+test('uses bundled pre-wake resources without external Agent Memory paths', () => {
+  const options = resolvePreWakeContextSidecarOptions({})
+  assert.match(options.sidecarPath, /memory\/integrations\/qwen_audio_agent\/prewake_context_sidecar\.py$/)
+  assert.match(options.configPath, /memory\/config\.yaml$/)
+})
+
 test('shares the pre-wake feature flag with Desktop', () => {
   assert.equal(preWakeContextEnabled({}), false)
   assert.equal(preWakeContextEnabled({

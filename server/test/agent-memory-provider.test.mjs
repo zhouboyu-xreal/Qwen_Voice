@@ -34,6 +34,15 @@ test('selects Agent Memory through configuration', async () => {
   await provider.close()
 })
 
+test('uses the bundled Agent Memory sidecar without external path settings', async () => {
+  const provider = new AgentMemoryProvider({
+    stateDirectory: mkdtempSync(join(tmpdir(), 'qwaudio-agent-memory-bundled-')),
+    env: {},
+  })
+  assert.equal(provider.describe().key, 'agent-memory')
+  await provider.close()
+})
+
 test('forwards completed sessions and semantic recall to the sidecar', async () => {
   const calls = []
   const sidecar = {

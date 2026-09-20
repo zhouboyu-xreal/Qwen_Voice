@@ -3,9 +3,17 @@ import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
+import { fileURLToPath } from 'node:url'
 
 const DEFAULT_TIMEOUT_MS = 30_000
 const MAX_PENDING_AUDIO_REQUESTS = 4
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+const BUNDLED_MEMORY_DIRECTORY = join(PROJECT_ROOT, 'memory')
+const BUNDLED_PREWAKE_SIDECAR = join(
+  BUNDLED_MEMORY_DIRECTORY,
+  'integrations/qwen_audio_agent/prewake_context_sidecar.py',
+)
+const BUNDLED_MEMORY_CONFIG = join(BUNDLED_MEMORY_DIRECTORY, 'config.yaml')
 
 function clean(value, limit = 2_000) {
   return [...String(value || '').replaceAll('\0', '').trim()]
@@ -31,13 +39,13 @@ export function resolvePreWakeContextSidecarOptions(env = process.env) {
     ? resolve(configuredSidecar)
     : memorySidecar
       ? resolve(dirname(resolve(memorySidecar)), 'prewake_context_sidecar.py')
-      : ''
+      : BUNDLED_PREWAKE_SIDECAR
   const configPath = String(env.AGENT_MEMORY_CONFIG || '').trim()
   const stateDirectory = String(env.AGENT_MEMORY_STATE_DIR || '').trim()
   return {
     command: defaultPythonCommand(env),
     sidecarPath,
-    configPath: configPath ? resolve(configPath) : '',
+    configPath: configPath ? resolve(configPath) : BUNDLED_MEMORY_CONFIG,
     logPath: stateDirectory
       ? join(resolve(stateDirectory), 'prewake-context-sidecar.log')
       : '',

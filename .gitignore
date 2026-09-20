@@ -43,3 +43,4 @@ sidecars/tsnet/dist/
 docs/.vitepress/dist/
 docs/.vitepress/cache/
 docs/.vitepress/.site/
+tmp/
