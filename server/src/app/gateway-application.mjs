@@ -825,6 +825,28 @@ app.patch('/api/memory', async (req, res, next) => {
   }
 })
 
+// A user-created conversation is a semantic boundary for Agent Memory.  This
+// explicit endpoint must not be replaced with a WebSocket-close hook: normal
+// reconnects and desktop sleep also close a transport but do not end a user
+// conversation.
+app.post('/api/memory/session-finalize', async (req, res, next) => {
+  if (!frontendMemoryRuntime) {
+    return res.status(404).json({ error: 'frontend memory is not configured' })
+  }
+  const sessionId = String(req.body?.sessionId || '').trim()
+  if (!sessionId) {
+    return res.status(400).json({ error: 'sessionId is required' })
+  }
+  try {
+    return res.json(await frontendMemoryRuntime.finalizeSession(
+      req.identity.ownerId,
+      { source: 'explicit-session-close', sessionId },
+    ))
+  } catch (error) {
+    return next(error)
+  }
+})
+
 // Host control plane for microphone arbitration. The host announces that it is
 // taking the microphone and the Gateway commands its clients to stop capturing.
 // Both calls are idempotent per owner, and a suspension expires on its own so a

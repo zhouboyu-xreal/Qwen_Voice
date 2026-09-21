@@ -101,29 +101,64 @@ class MemoryRuntime:
         self._transcript_unit_assembler = TranscriptUnitAssembler(
             build_transcript_aggregation_config(runtime_config),
         )
-        allday_segmentation_config = runtime_config.get(
-            "allday_recording_segmentation",
+        interaction_episode_config = runtime_config.get(
+            "assistant_wakeup_segmentation",
         )
+        if not isinstance(interaction_episode_config, dict):
+            interaction_episode_config = {}
+        allday_segmentation_config = runtime_config.get("allday_recording_segmentation")
         if not isinstance(allday_segmentation_config, dict):
             allday_segmentation_config = {}
         self._transcript_segmentation_log_decisions = bool(
             allday_segmentation_config.get("log_decisions", False),
         )
-        self._episode_summary_trigger_gap_seconds = float(
-            allday_segmentation_config.get("episode_summary_trigger_gap_seconds")
-            or allday_segmentation_config.get("max_time_gap_seconds")
-            or 60.0
-        )
         self._interaction_episode_source_type = "assistant_wakeup"
+        self._transcript_episode_source_type = "allday_recording"
+        self._episode_summary_limits = {
+            self._interaction_episode_source_type: {
+                "max_duration_seconds": max(0.0, float(
+                    interaction_episode_config.get(
+                        "episode_summary_max_duration_seconds", 1800.0,
+                    )
+                )),
+                "max_tokens": max(0, int(
+                    interaction_episode_config.get("episode_summary_max_tokens", 6000)
+                )),
+                "min_tokens_for_duration": max(0, int(
+                    interaction_episode_config.get(
+                        "episode_summary_min_tokens_for_duration", 1000,
+                    )
+                )),
+            },
+            self._transcript_episode_source_type: {
+                "max_duration_seconds": max(0.0, float(
+                    allday_segmentation_config.get(
+                        "episode_summary_max_duration_seconds", 3600.0,
+                    )
+                )),
+                "max_tokens": max(0, int(
+                    allday_segmentation_config.get("episode_summary_max_tokens", 8000)
+                )),
+                "min_tokens_for_duration": max(0, int(
+                    allday_segmentation_config.get(
+                        "episode_summary_min_tokens_for_duration", 1500,
+                    )
+                )),
+            },
+        }
         self._interaction_episode_tags: List[str] = []
         self._interaction_episode_prompt_language = "zh"
         self._interaction_has_pending_episode_sources = False
+        self._interaction_episode_started_at: Optional[datetime] = None
+        self._interaction_episode_latest_at: Optional[datetime] = None
+        self._interaction_episode_token_count = 0
 
-        self._transcript_previous_segment_end: Optional[datetime] = None
-        self._transcript_episode_source_type = "allday_recording"
         self._transcript_episode_tags: List[str] = []
         self._transcript_episode_prompt_language = "zh"
         self._transcript_has_pending_episode_sources = False
+        self._transcript_episode_started_at: Optional[datetime] = None
+        self._transcript_episode_latest_at: Optional[datetime] = None
+        self._transcript_episode_token_count = 0
 
     def close(self, timeout: Optional[float] = 30.0) -> None:
         """Drain owned tasks and release resources created by this runtime."""
@@ -258,21 +293,24 @@ class MemoryRuntime:
             "reason": "" if queued else reason,
         }
 
-    def _flush_pending_interaction_turns(self) -> Dict[str, Any]:
+    def _flush_pending_interaction_turns(
+        self,
+        *,
+        evaluate_episode_summary: bool = True,
+    ) -> Dict[str, Any]:
         """Submit the buffered interaction turns and clear them when queued."""
         if not self._interaction_segmenter.has_pending_units():
             return {"queued": False, "reason": "no_pending_turns"}
-        queue_report = self._trigger_memory_store_task_for_pending_interaction()
+        queue_report = self._trigger_memory_store_task_for_pending_interaction(
+            evaluate_episode_summary=evaluate_episode_summary,
+        )
         queued = bool(queue_report.get("queued"))
         if queued:
             self._interaction_segmenter.clear_pending_units()
         return {
-            "queued": queued,
-            "reason": (
-                ""
-                if queued
-                else str(queue_report.get("reason") or "queue_rejected")
-            ),
+            "queued": bool(queue_report.get("queued")),
+            "reason": str(queue_report.get("reason") or ""),
+            "episode_summary": queue_report.get("episode_summary"),
         }
 
     def accept_single_transcript_segment(
@@ -303,17 +341,6 @@ class MemoryRuntime:
             normalized_segment["text"],
         )
 
-        current_start = self._parse_runtime_timestamp(normalized_segment.get("started_at"))
-        gap_trigger = self.should_trigger_episode_summary(normalized_segment)
-        if gap_trigger and (
-            self._transcript_segmenter.has_pending_units()
-            or self._transcript_unit_assembler.has_pending_segments()
-            or self._transcript_has_pending_episode_sources
-        ):
-            gap_summary_report = self.trigger_memory_episode_summary(reason="time_gap")
-        else:
-            gap_summary_report = None
-
         context = {
             "source_type": str(source_type or "allday_recording"),
             "tags": sorted(
@@ -327,15 +354,18 @@ class MemoryRuntime:
         normalized_segment["_memory_context"] = dict(context)
         self._transcript_episode_source_type = context["source_type"]
         self._transcript_episode_tags = sorted(set(self._transcript_episode_tags).union(context["tags"]))
-        self._transcript_previous_segment_end = self._parse_runtime_timestamp(normalized_segment.get("ended_at")) or current_start
-
-        queued = bool((gap_summary_report or {}).get("queued"))
+        queued = False
         completed_unit = self._transcript_unit_assembler.append_new_segment(
             normalized_segment,
         )
         if completed_unit is None:
             final_summary_report = None
             if is_last_segment:
+                final_flush_report = self._flush_pending_transcript_segments(
+                    reason="last_segment",
+                    evaluate_episode_summary=False,
+                )
+                queued = bool(final_flush_report.get("queued")) or queued
                 final_summary_report = self.trigger_memory_episode_summary(reason="last_segment")
             return {
                 "queued": queued or bool((final_summary_report or {}).get("queued")),
@@ -350,6 +380,11 @@ class MemoryRuntime:
                 "reason": str(append_report.get("reason") or "queue_rejected"),
             }
         if is_last_segment:
+            final_flush_report = self._flush_pending_transcript_segments(
+                reason="last_segment",
+                evaluate_episode_summary=False,
+            )
+            queued = bool(final_flush_report.get("queued")) or queued
             final_summary_report = self.trigger_memory_episode_summary(reason="last_segment")
             queued = queued or bool(final_summary_report.get("queued"))
         else:
@@ -357,7 +392,7 @@ class MemoryRuntime:
         return {
             "queued": queued,
             "reason": "" if queued else "threshold_not_reached",
-            "episode_summary": final_summary_report or gap_summary_report,
+            "episode_summary": final_summary_report,
         }
 
     def should_trigger_episode_summary(
@@ -365,24 +400,133 @@ class MemoryRuntime:
         current_segment: Dict[str, Any],
         previous_segment: Optional[Dict[str, Any]] = None,
         *,
+        source_type: Optional[str] = None,
         is_last_segment: bool = False,
     ) -> bool:
-        """Return whether a logical transcript episode boundary was reached."""
+        """Return whether an input would exceed its active episode window.
+
+        This deliberately uses only bounded duration and accumulated content.
+        It is called after a complete store batch was accepted, so the batch
+        that reaches the threshold belongs to the episode being summarized.
+        ``previous_segment`` remains for call compatibility; gaps are no
+        longer an episode trigger.
+        """
         if is_last_segment:
             return True
-        previous_end = self._transcript_previous_segment_end
-        if previous_segment is not None:
-            previous_end = self._parse_runtime_timestamp(
-                previous_segment.get("ended_at") or previous_segment.get("end_time")
-            )
-        if previous_end is None:
-            return False
-        current_start = self._parse_runtime_timestamp(
-            current_segment.get("started_at") or current_segment.get("start_time")
+        resolved_source_type = str(
+            source_type
+            or current_segment.get("source_type")
+            or self._transcript_episode_source_type
+        ).strip()
+        is_interaction = resolved_source_type == self._interaction_episode_source_type
+        limits = self._episode_summary_limits[
+            self._interaction_episode_source_type
+            if is_interaction
+            else self._transcript_episode_source_type
+        ]
+        started_at = (
+            self._interaction_episode_started_at
+            if is_interaction
+            else self._transcript_episode_started_at
         )
-        if current_start is None:
+        accumulated_tokens = (
+            self._interaction_episode_token_count
+            if is_interaction
+            else self._transcript_episode_token_count
+        )
+        if accumulated_tokens <= 0:
             return False
-        return (current_start - previous_end).total_seconds() > self._episode_summary_trigger_gap_seconds
+
+        max_tokens = int(limits["max_tokens"])
+        if max_tokens > 0 and accumulated_tokens >= max_tokens:
+            return True
+
+        if started_at is None:
+            return False
+        max_duration_seconds = float(limits["max_duration_seconds"])
+        if max_duration_seconds <= 0:
+            return False
+        current_time = (
+            self._episode_summary_segment_time(current_segment)
+            or (
+                self._interaction_episode_latest_at
+                if is_interaction
+                else self._transcript_episode_latest_at
+            )
+        )
+        if current_time is None:
+            return False
+        elapsed_seconds = max(0.0, (current_time - started_at).total_seconds())
+        return (
+            elapsed_seconds >= max_duration_seconds
+            and accumulated_tokens >= int(limits["min_tokens_for_duration"])
+        )
+
+    @staticmethod
+    def _episode_summary_segment_token_count(segment: Dict[str, Any]) -> int:
+        text = "\n".join(
+            _compact_whitespace(segment.get(field) or "")
+            for field in ("text", "user_message", "assistant_response")
+        ).strip()
+        return len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]", text))
+
+    def _episode_summary_segment_time(
+        self,
+        segment: Dict[str, Any],
+    ) -> Optional[datetime]:
+        for field in (
+            "turn_timestamp",
+            "started_at",
+            "ended_at",
+            "timestamp",
+            "start_time",
+            "end_time",
+        ):
+            parsed = self._parse_runtime_timestamp(segment.get(field))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _record_episode_summary_input(
+        self,
+        source_type: str,
+        segment: Dict[str, Any],
+    ) -> None:
+        token_count = self._episode_summary_segment_token_count(segment)
+        if token_count <= 0:
+            return
+        started_at = self._episode_summary_segment_time(segment)
+        if source_type == self._interaction_episode_source_type:
+            if self._interaction_episode_started_at is None:
+                self._interaction_episode_started_at = started_at
+            if started_at is not None:
+                self._interaction_episode_latest_at = started_at
+            self._interaction_episode_token_count += token_count
+            return
+        if self._transcript_episode_started_at is None:
+            self._transcript_episode_started_at = started_at
+        if started_at is not None:
+            self._transcript_episode_latest_at = started_at
+        self._transcript_episode_token_count += token_count
+
+    def _record_episode_summary_inputs(
+        self,
+        source_type: str,
+        segments: Sequence[Dict[str, Any]],
+    ) -> None:
+        for segment in segments:
+            if isinstance(segment, dict):
+                self._record_episode_summary_input(source_type, segment)
+
+    def _reset_episode_summary_window(self, source_type: str) -> None:
+        if source_type == self._interaction_episode_source_type:
+            self._interaction_episode_started_at = None
+            self._interaction_episode_latest_at = None
+            self._interaction_episode_token_count = 0
+            return
+        self._transcript_episode_started_at = None
+        self._transcript_episode_latest_at = None
+        self._transcript_episode_token_count = 0
 
     def _parse_runtime_timestamp(self, value: Any) -> Optional[datetime]:
         text = _to_timestamp_text(value)
@@ -406,8 +550,10 @@ class MemoryRuntime:
     ) -> Dict[str, Any]:
         """Queue one completed source episode and its prospective update.
 
-        The manager's single FIFO queue preserves the submission order: any
-        pending store task, then episode summary, then prospective update.
+        Callers must first submit the episode's final store batch.  The
+        manager's FIFO queue then preserves store, summary, and prospective
+        update ordering without this function reaching back into runtime
+        input buffers.
         """
         resolved_source_type = str(
             source_type or self._transcript_episode_source_type
@@ -434,13 +580,10 @@ class MemoryRuntime:
         ).strip() or "zh"
 
         if is_transcript_episode:
-            flush_report = self._flush_pending_transcript_segments(reason=reason)
             has_pending_episode_sources = self._transcript_has_pending_episode_sources
         elif is_interaction_episode:
-            flush_report = self._flush_pending_interaction_turns()
             has_pending_episode_sources = self._interaction_has_pending_episode_sources
         else:
-            flush_report = {"queued": False, "reason": "no_runtime_input_flush"}
             has_pending_episode_sources = False
 
         if not has_pending_episode_sources:
@@ -448,7 +591,6 @@ class MemoryRuntime:
                 "queued": False,
                 "reason": "no_pending_episode_sources",
                 "trigger_reason": reason,
-                "input_flush": flush_report,
             }
         report = self._memory_manager.submit_memory_episode_summary_task(
             source_type=resolved_source_type,
@@ -462,21 +604,24 @@ class MemoryRuntime:
             if is_transcript_episode:
                 self._transcript_has_pending_episode_sources = False
                 self._transcript_episode_tags = []
+                self._reset_episode_summary_window(resolved_source_type)
             elif is_interaction_episode:
                 self._interaction_has_pending_episode_sources = False
                 self._interaction_episode_tags = []
+                self._reset_episode_summary_window(resolved_source_type)
         else:
             report["prospective_update"] = {
                 "queued": False,
                 "reason": "episode_summary_not_queued",
             }
         report["trigger_reason"] = reason
-        report["input_flush"] = flush_report
         return report
 
     def _append_transcript_semantic_unit(
         self,
         unit: OnlineSegmentUnit,
+        *,
+        evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Use one assembled utterance to decide whether the prior episode ends."""
         queued = False
@@ -498,6 +643,7 @@ class MemoryRuntime:
             store_report = (
                 self._trigger_memory_store_task_for_pending_transcript(
                     reason=decision.reason,
+                    evaluate_episode_summary=evaluate_episode_summary,
                 )
                 if should_finalize
                 else None
@@ -527,19 +673,26 @@ class MemoryRuntime:
         self,
         *,
         reason: str = "explicit_flush",
+        evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Finalize the current utterance, then submit pending transcript units."""
         queued = False
         completed_unit = self._transcript_unit_assembler.flush()
         if completed_unit is not None:
-            append_report = self._append_transcript_semantic_unit(completed_unit)
+            append_report = self._append_transcript_semantic_unit(
+                completed_unit,
+                evaluate_episode_summary=evaluate_episode_summary,
+            )
             queued = bool(append_report.get("queued")) or queued
             if not append_report.get("accepted"):
                 return {
                     "queued": queued,
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
-        store_report = self._trigger_memory_store_task_for_pending_transcript(reason=reason)
+        store_report = self._trigger_memory_store_task_for_pending_transcript(
+            reason=reason,
+            evaluate_episode_summary=evaluate_episode_summary,
+        )
         return {
             "queued": bool(store_report.get("queued")) or queued,
             "reason": str(store_report.get("reason") or ""),
@@ -549,6 +702,7 @@ class MemoryRuntime:
         self,
         *,
         reason: str,
+        evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Normalize and submit transcript spans held by the semantic segmenter."""
         pending_units = self._transcript_segmenter.pending_unit_snapshot()
@@ -594,8 +748,16 @@ class MemoryRuntime:
         )
         self._transcript_episode_prompt_language = prompt_language
         queued = bool(queue_report.get("queued"))
+        episode_summary_report = None
         if queued:
             self._transcript_has_pending_episode_sources = True
+            resolved_source_type = str(
+                context.get("source_type") or "allday_recording"
+            )
+            self._record_episode_summary_inputs(
+                resolved_source_type,
+                raw_segments,
+            )
             self._logger.info(
                 "transcript episode queued reason=%s raw_segment_count=%s semantic_unit_count=%s",
                 reason,
@@ -603,13 +765,24 @@ class MemoryRuntime:
                 len(pending_units),
             )
             self._transcript_segmenter.clear_pending_units()
+            if evaluate_episode_summary and self.should_trigger_episode_summary(
+                raw_segments[-1],
+                source_type=resolved_source_type,
+            ):
+                episode_summary_report = self.trigger_memory_episode_summary(
+                    reason="episode_limit",
+                    source_type=resolved_source_type,
+                )
         return {
-            "queued": queued,
+            "queued": queued or bool((episode_summary_report or {}).get("queued")),
             "reason": (
-                ""
+                "episode_limit"
+                if (episode_summary_report or {}).get("queued")
+                else ""
                 if queued
                 else str(queue_report.get("reason") or "queue_rejected")
             ),
+            "episode_summary": episode_summary_report,
         }
 
     @staticmethod
@@ -754,13 +927,23 @@ class MemoryRuntime:
             prompt_language=resolved_prompt_language,
         )
 
-    def flush_pending_memory_inputs(self, timeout: Optional[float] = None) -> bool:
+    def flush_pending_memory_inputs(
+        self,
+        timeout: Optional[float] = None,
+        *,
+        evaluate_episode_summary: bool = True,
+    ) -> bool:
         """Submit runtime-buffered inputs without waiting for manager tasks."""
         if self._interaction_segmenter.has_pending_units():
-            interaction_report = self._flush_pending_interaction_turns()
+            interaction_report = self._flush_pending_interaction_turns(
+                evaluate_episode_summary=evaluate_episode_summary,
+            )
             if not interaction_report.get("queued") and interaction_report.get("reason") not in {"", "no_pending_segments"}:
                 return False
-        transcript_flush_report = self._flush_pending_transcript_segments(reason="explicit_input_boundary")
+        transcript_flush_report = self._flush_pending_transcript_segments(
+            reason="explicit_input_boundary",
+            evaluate_episode_summary=evaluate_episode_summary,
+        )
         return not (
             not transcript_flush_report.get("queued")
             and transcript_flush_report.get("reason") not in {"", "no_pending_segments"}
@@ -782,7 +965,11 @@ class MemoryRuntime:
         """Return whether interaction turns are waiting for storage."""
         return self._interaction_segmenter.has_pending_units()
 
-    def _trigger_memory_store_task_for_pending_interaction(self) -> Dict[str, Any]:
+    def _trigger_memory_store_task_for_pending_interaction(
+        self,
+        *,
+        evaluate_episode_summary: bool = True,
+    ) -> Dict[str, Any]:
         """Read pending turns, then submit their memory-store task."""
         turns = self.get_pending_interaction_turns()
         (
@@ -811,17 +998,39 @@ class MemoryRuntime:
             prompt_language=prompt_language,
         )
         queued = bool(queue_report.get("queued"))
+        episode_summary_report = None
         if queued:
             self._interaction_has_pending_episode_sources = True
             self._interaction_episode_tags = sorted(
                 set(self._interaction_episode_tags).union(tags)
             )
             self._interaction_episode_prompt_language = prompt_language
+            self._record_episode_summary_inputs(
+                self._interaction_episode_source_type,
+                turns,
+            )
+            if (
+                evaluate_episode_summary
+                and turns
+                and self.should_trigger_episode_summary(
+                    turns[-1],
+                    source_type=self._interaction_episode_source_type,
+                )
+            ):
+                episode_summary_report = self.trigger_memory_episode_summary(
+                    reason="episode_limit",
+                    source_type=self._interaction_episode_source_type,
+                )
         return {
-            "queued": queued,
+            "queued": queued or bool((episode_summary_report or {}).get("queued")),
             "reason": (
-                "" if queued else str(queue_report.get("reason") or "queue_rejected")
+                "episode_limit"
+                if (episode_summary_report or {}).get("queued")
+                else ""
+                if queued
+                else str(queue_report.get("reason") or "queue_rejected")
             ),
+            "episode_summary": episode_summary_report,
         }
 
     def _resolve_prompt_language_from_segments(

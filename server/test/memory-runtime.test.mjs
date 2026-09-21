@@ -87,13 +87,17 @@ test('routes semantic query and provider-owned session observation', async () =>
       },
       observe: async (...args) => { calls.push(['observe', ...args]) },
       flush: async (...args) => { calls.push(['flush', ...args]) },
+      finalizeSession: async (...args) => { calls.push(['finalizeSession', ...args]) },
     }),
   })
   assert.equal(runtime.ownsSessionObservation(), true)
   assert.equal((await runtime.query('owner', 'tea')).context, 'related memory')
   assert.equal((await runtime.observe('owner', { messages: [] })).observed, true)
   assert.deepEqual(await runtime.flush('owner'), { flushed: true })
-  assert.deepEqual(calls.map(call => call[0]), ['query', 'observe', 'flush'])
+  await runtime.finalizeSession('owner', { sessionId: 'closed-session' })
+  assert.deepEqual(calls.map(call => call[0]), [
+    'query', 'observe', 'flush', 'finalizeSession',
+  ])
 })
 
 test('routes synchronous audio stream observations without awaiting the provider', () => {

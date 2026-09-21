@@ -138,6 +138,13 @@ export class FrontendMemoryRuntime {
     return { flushed: true }
   }
 
+  async finalizeSession(ownerId, context = {}) {
+    if (typeof this.provider.finalizeSession !== 'function') {
+      return { finalized: false, reason: 'not_supported' }
+    }
+    return this.provider.finalizeSession(ownerId, context)
+  }
+
   health() {
     const health = typeof this.provider.health === 'function'
       ? this.provider.health()

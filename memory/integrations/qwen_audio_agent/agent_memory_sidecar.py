@@ -238,20 +238,59 @@ class AgentMemoryRuntime:
         )
         return result
 
-    def flush(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def finalize(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Flush memory input and optionally close its semantic episode.
+
+        ``checkpoint`` is for a transport-level close: it may flush and
+        reflect, but never treats the reconnect as a conversation boundary.
+        ``session_end`` is reserved for an explicit user-created new session;
+        it submits store, episode summary, and reflection in that FIFO order.
+        """
         owner_id = _clean(params.get("ownerId"), 240)
+        session_id = _clean(params.get("sessionId"), 240)
+        boundary = _clean(params.get("boundary"), 80).lower() or "checkpoint"
+        if boundary not in {"checkpoint", "session_end"}:
+            raise ValueError("boundary must be checkpoint or session_end")
+        if boundary == "session_end" and not session_id:
+            raise ValueError("sessionId must be non-empty for session_end")
         holder = self._owner_runtime(owner_id)
-        submitted = holder.runtime.flush_pending_memory_inputs()
-        reflect = holder.runtime.trigger_memory_reflect() if submitted else None
+        input_flushed = holder.runtime.flush_pending_memory_inputs(
+            evaluate_episode_summary=boundary != "session_end",
+        )
+        episode = None
+        if boundary == "session_end":
+            episode = holder.runtime.trigger_memory_episode_summary(
+                reason=f"qwen_audio_agent_session_closed:{session_id}",
+                source_type="assistant_wakeup",
+                tags=["qwen-audio-agent", "session-close"],
+            )
+        # For an explicit session end this always queues after the summary;
+        # for a checkpoint it preserves the existing best-effort reflect.
+        reflect = (
+            holder.runtime.trigger_memory_reflect()
+            if boundary == "session_end" or input_flushed
+            else None
+        )
         result = {
-            "flushed": bool(submitted),
+            "finalized": boundary == "session_end" and bool((episode or {}).get("queued")),
+            "boundary": boundary,
+            "sessionId": session_id,
+            "episodeSummaryQueued": bool((episode or {}).get("queued")),
+            "inputFlushed": bool(input_flushed),
             "reflectQueued": bool((reflect or {}).get("queued")),
+            "episode": episode,
+            "reflect": reflect,
         }
         self._logger.info(
-            "flush owner=%s flushed=%s reflect_queued=%s",
+            "finalize owner=%s boundary=%s session=%s input_flushed=%s "
+            "episode_summary_queued=%s reflect_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
-            result["flushed"],
+            boundary,
+            session_id[:80],
+            result["inputFlushed"],
+            result["episodeSummaryQueued"],
             result["reflectQueued"],
+            (episode or {}).get("reason") or "",
         )
         return result
 
@@ -332,7 +371,7 @@ def main() -> int:
     logger.info("sidecar started state_dir=%s config=%s log_path=%s", state_dir, args.config, log_path)
     methods = {
         "observe": runtime.observe,
-        "flush": runtime.flush,
+        "finalize": runtime.finalize,
         "recall": runtime.recall,
         "health": runtime.health,
         "close": runtime.close,

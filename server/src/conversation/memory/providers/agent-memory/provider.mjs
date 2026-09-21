@@ -129,6 +129,7 @@ export class AgentMemoryProvider {
     this.stateDirectory = resolve(stateDirectory)
     this.backgroundTimeoutMs = Math.max(timeoutMs, backgroundTimeoutMs)
     this.pendingObservations = new Map()
+    this.pendingObservationsBySession = new Map()
     const sidecarEnvironment = { ...env }
     const configuredSidecar = String(
       sidecarPath || sidecarEnvironment.AGENT_MEMORY_SIDECAR || BUNDLED_AGENT_MEMORY_SIDECAR,
@@ -204,28 +205,52 @@ export class AgentMemoryProvider {
       : []
     if (!messages.length) return { observed: false }
     const owner = ownerKey(ownerId)
+    const sessionId = clean(context.sessionId, 200)
+    const sessionKey = `${owner}\u0000${sessionId}`
     const observationKey = createHash('sha256').update(JSON.stringify({
       ownerId: owner,
-      sessionId: clean(context.sessionId, 200),
+      sessionId,
       messages,
     })).digest('hex')
     const pending = this.pendingObservations.get(observationKey)
     if (pending) return pending
+    const pendingForSession = this.pendingObservationsBySession.get(sessionKey) || new Set()
+    this.pendingObservationsBySession.set(sessionKey, pendingForSession)
     const operation = this.sidecar.request('observe', {
       ownerId: owner,
-      sessionId: clean(context.sessionId, 200),
+      sessionId,
       messages,
     }, { timeoutMs: this.backgroundTimeoutMs }).finally(() => {
       this.pendingObservations.delete(observationKey)
+      pendingForSession.delete(operation)
+      if (pendingForSession.size === 0) {
+        this.pendingObservationsBySession.delete(sessionKey)
+      }
     })
+    pendingForSession.add(operation)
     this.pendingObservations.set(observationKey, operation)
     return operation
   }
 
   async flush(ownerId, context = {}) {
-    return this.sidecar.request('flush', {
+    return this.sidecar.request('finalize', {
       ownerId: ownerKey(ownerId),
       sessionId: clean(context.sessionId, 200),
+      boundary: 'checkpoint',
+    }, { timeoutMs: this.backgroundTimeoutMs })
+  }
+
+  async finalizeSession(ownerId, context = {}) {
+    const owner = ownerKey(ownerId)
+    const sessionId = clean(context.sessionId, 200)
+    if (!sessionId) return { finalized: false, reason: 'missing_session_id' }
+    const sessionKey = `${owner}\u0000${sessionId}`
+    const pending = [...(this.pendingObservationsBySession.get(sessionKey) || [])]
+    if (pending.length) await Promise.allSettled(pending)
+    return this.sidecar.request('finalize', {
+      ownerId: owner,
+      sessionId,
+      boundary: 'session_end',
     }, { timeoutMs: this.backgroundTimeoutMs })
   }
 

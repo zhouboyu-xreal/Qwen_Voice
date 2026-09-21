@@ -149,6 +149,9 @@ memory_runtime:
     min_pending_interaction_turns: 2
     min_pending_interaction_tokens: 200
     max_time_gap_seconds: 30
+    episode_summary_max_duration_seconds: 1800.0
+    episode_summary_max_tokens: 6000
+    episode_summary_min_tokens_for_duration: 1000
 
     threshold: 0.6
     bias: -1.1
@@ -166,7 +169,9 @@ memory_runtime:
     min_pending_transcript_units: 4
     min_pending_transcript_tokens: 200
     max_time_gap_seconds: 60.0
-    episode_summary_trigger_gap_seconds: 600.0
+    episode_summary_max_duration_seconds: 3600.0
+    episode_summary_max_tokens: 8000
+    episode_summary_min_tokens_for_duration: 1500
     
     segment_merge_max_gap_seconds: 1.0
     min_transcript_unit_tokens: 40

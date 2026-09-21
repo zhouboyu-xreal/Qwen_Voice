@@ -383,6 +383,9 @@ def replay_context_into_memory(
             # Facts are filtered by their local DB created_at date. Keep this
             # wall-clock timestamp separate from the benchmark dialogue time.
             reflect_timestamp = datetime.now().astimezone().isoformat()
+            episode_input_flush = runtime.flush_pending_memory_inputs(
+                evaluate_episode_summary=False,
+            )
             episode_summary_submit = runtime.trigger_memory_episode_summary(
                 reason="clongeval_reflect",
                 source_type="assistant_wakeup",
@@ -397,7 +400,7 @@ def replay_context_into_memory(
                 limit=max(1, int(reflect_limit or 100)),
                 reflect_timestamp=reflect_timestamp,
             )
-            if (episode_summary_submit.get("input_flush") or {}).get("queued"):
+            if episode_input_flush:
                 store_batches += 1
             if (reflect_submit.get("pending_interaction_flush") or {}).get("queued"):
                 store_batches += 1

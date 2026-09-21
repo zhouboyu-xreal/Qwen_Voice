@@ -85,11 +85,16 @@ test('forwards completed sessions and semantic recall to the sidecar', async () 
     ],
   }, { sessionId: 'session-1' })
   await provider.flush('owner-a', { sessionId: 'session-1' })
+  await provider.finalizeSession('owner-a', { sessionId: 'session-1' })
 
   const observe = calls.find(call => call.method === 'observe')
   assert.equal(observe.params.messages.length, 2)
   assert.equal(observe.params.sessionId, 'session-1')
-  assert.equal(calls.find(call => call.method === 'flush').options.timeoutMs, 120_000)
+  const checkpoint = calls.find(call => call.method === 'finalize' && call.params.boundary === 'checkpoint')
+  assert.equal(checkpoint.options.timeoutMs, 120_000)
+  const finalize = calls.find(call => call.method === 'finalize' && call.params.boundary === 'session_end')
+  assert.equal(finalize.params.sessionId, 'session-1')
+  assert.equal(finalize.options.timeoutMs, 120_000)
 })
 
 test('does not persist or expose a local document snapshot', () => {

@@ -1076,7 +1076,23 @@ export default function App() {
     .replace(/\s+Realtime\b/gi, '')
     .trim()
 
-  const resetSession = () => {
+  const resetSession = async () => {
+    const closingSessionId = sessionIdRef.current
+    // Wait until the Gateway has handed the old session to Agent Memory.  The
+    // sidecar only queues background work here, so this does not wait for LLM
+    // extraction; it prevents a first turn of the new session entering the
+    // old episode buffer.
+    try {
+      const response = await gatewayFetch('api/memory/session-finalize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: closingSessionId }),
+      })
+      if (!response.ok) throw new Error(`memory session finalize failed (${response.status})`)
+    } catch {
+      // Memory finalization is best-effort and must never prevent the user
+      // from starting a new foreground conversation.
+    }
     taskDismissTimers.current.forEach(timer => clearTimeout(timer))
     taskDismissTimers.current.clear()
     const next = crypto.randomUUID()
