@@ -412,6 +412,46 @@ episode evidence facts：
 """
 
 
+DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型中的直接推导（derived claim）模块。
+
+输入分为两部分：`changed_explicit_claims` 是当前 subject 在本轮新接收事实后发生变化的 explicit claims；`related_active_explicit_claims` 是从数据库读取的、与该 subject 或其直接关联实体相关的历史 active explicit claims。你的任务是仅根据这两部分 claims 的文本和结构，找出能够被直接逻辑推出的新结论。
+
+这里的 derived claim 不是规律归纳、常识补全或可能性猜测。它必须可以写成“因为 premise A（以及 premise B），所以 conclusion C”。例如：
+- “张三 reports_to 李四”可以推出“李四 manages 张三”；
+- “小王 member_of 团队 Alpha”与“团队 Alpha affiliated_with 公司 X”可以谨慎推出“小王 affiliated_with 公司 X”。
+
+硬规则：
+1. 只能基于输入 premise_claim_ids 推导；不得使用外部常识、未给出的背景或自由猜测。
+2. 每个 candidate 的 premise_claim_ids 至少包含一个 `changed_explicit_claims` 中的 claim id，且所有 ID 都必须来自输入。
+3. 只允许 claim_type 为 affiliation、relationship 或 constraint；禁止输出 identity_profile、preference、behavior_pattern、目标、计划、待办、人格或风险判断。
+4. subject_entity_id 和 object_entity_id（0 表示无 object）必须来自输入中出现的实体 ID；不能创建新实体。
+5. predicate 使用简短、稳定的小写英文键；claim_text 必须是完整、自包含、面向阅读者的结论。
+6. 不要重复或改写某个 premise 本身；没有严格成立的新结论时返回空数组。
+7. confidence 表示“在给定 premise 下该结论成立”的把握，不表示 premise 本身的真实性。只返回 JSON。
+
+输出：
+{
+  "claims": [
+    {
+      "subject_entity_id": 0,
+      "claim_type": "affiliation|relationship|constraint",
+      "predicate": "",
+      "object_entity_id": 0,
+      "claim_text": "完整、自包含的推导结论",
+      "premise_claim_ids": [1, 2],
+      "confidence": 0.8
+    }
+  ]
+}
+
+changed explicit claims：
+{changed_claims}
+
+related active explicit claims：
+{related_claims}
+"""
+
+
 ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH = """你是个人世界模型中的 entity claim reconciliation 模块。
 
 输入只包含新旧 entity claim 的文本。你的任务只通过这些文本的自然语言语义，判断每个 candidate 与已有 claim 的关系；不要推断来源可信度、不要考虑 claim_origin、置信度、时间、数据库状态或后续写入策略。

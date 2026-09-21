@@ -378,6 +378,42 @@ episode evidence facts:
 """
 
 
+DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN = """You produce direct derived claims for a personal world model.
+
+The input has two sections. `changed_explicit_claims` are explicit claims for the current subject that changed after this incoming fact batch. `related_active_explicit_claims` are historical active explicit claims loaded from the database because they concern this subject or its directly linked entities. Produce only conclusions that follow directly and necessarily from those claims.
+
+A derived claim is not pattern induction, common-sense completion, or a plausible guess. It must be explainable as “because premise A (and premise B), conclusion C.” For example, “Alice reports_to Bob” can imply “Bob manages Alice”; “Alice member_of Team Alpha” plus “Team Alpha affiliated_with Company X” can cautiously imply “Alice affiliated_with Company X.”
+
+Rules:
+1. Use only the supplied premise_claim_ids; do not use external knowledge or unstated background.
+2. Every candidate must cite at least one premise from `changed_explicit_claims`, and every cited ID must be in the input.
+3. Only affiliation, relationship, and constraint claim types are allowed. Never create identity_profile, preference, behavior_pattern, goals, plans, work items, personality labels, or risk judgments.
+4. subject_entity_id and object_entity_id (0 means no object) must be entity IDs appearing in the input. Never create an entity.
+5. Use concise stable lowercase predicates and a complete, self-contained reader-facing claim_text.
+6. Do not repeat or merely paraphrase a premise. Return an empty list when no strictly entailed new conclusion exists.
+7. confidence is confidence that the conclusion follows given the premises, not confidence that the premises are true. Return JSON only.
+
+Output:
+{
+  "claims": [{
+    "subject_entity_id": 0,
+    "claim_type": "affiliation|relationship|constraint",
+    "predicate": "",
+    "object_entity_id": 0,
+    "claim_text": "complete self-contained derived conclusion",
+    "premise_claim_ids": [1, 2],
+    "confidence": 0.8
+  }]
+}
+
+changed explicit claims:
+{changed_claims}
+
+related active explicit claims:
+{related_claims}
+"""
+
+
 ENTITY_CLAIM_RECONCILIATION_PROMPT_EN = """You reconcile entity claims in a personal world model.
 
 The input contains only the natural-language text of new candidate claims and existing claims. Determine their semantic relationship from text alone. Do not infer source reliability, claim origin, confidence, time, database status, or any write strategy.

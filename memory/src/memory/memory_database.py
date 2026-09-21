@@ -441,6 +441,32 @@ class SessionDB:
                 FOREIGN KEY(claim_id) REFERENCES memory_entity_claims(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS memory_entity_claim_derivations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                claim_id INTEGER NOT NULL,
+                rule_id TEXT NOT NULL,
+                rule_version TEXT NOT NULL DEFAULT '',
+                derivation_key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'active',
+                derived_at TEXT NOT NULL DEFAULT '',
+                invalidated_at TEXT NOT NULL DEFAULT '',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(claim_id) REFERENCES memory_entity_claims(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_entity_claim_premises (
+                derivation_id INTEGER NOT NULL,
+                premise_claim_id INTEGER NOT NULL,
+                premise_role TEXT NOT NULL DEFAULT 'support',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(derivation_id, premise_claim_id, premise_role),
+                FOREIGN KEY(derivation_id) REFERENCES memory_entity_claim_derivations(id) ON DELETE CASCADE,
+                FOREIGN KEY(premise_claim_id) REFERENCES memory_entity_claims(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS memory_entity_claim_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 target_claim_id INTEGER NOT NULL,
@@ -629,6 +655,10 @@ class SessionDB:
             ON memory_entity_claims(subject_entity_id, claim_type, claim_origin, status);
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_evidence_claim
             ON memory_entity_claim_evidence(claim_id, role, evidence_type);
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_derivations_claim
+            ON memory_entity_claim_derivations(claim_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_premises_claim
+            ON memory_entity_claim_premises(premise_claim_id, derivation_id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_entity_claim_signal_group
             ON memory_fact_entity_claim_signal_mapping(
                 subject_entity_id, claim_type_hint, claim_anchor_key, fact_id
@@ -2193,6 +2223,7 @@ class SessionDB:
     def get_entity_claims(
         self,
         *,
+        entity_id: Optional[int] = None,
         subject_entity_id: Optional[int] = None,
         claim_type: Optional[str] = None,
         claim_origin: Optional[str] = None,
@@ -2202,6 +2233,9 @@ class SessionDB:
     ) -> List[Dict[str, Any]]:
         clauses: List[str] = []
         params: List[Any] = []
+        if entity_id is not None:
+            clauses.append("(subject_entity_id = ? OR object_entity_id = ?)")
+            params.extend((int(entity_id), int(entity_id)))
         for column, value in (
             ("subject_entity_id", subject_entity_id),
             ("claim_type", claim_type),
@@ -2652,6 +2686,159 @@ class SessionDB:
              str(consolidation_version or "v1"), now, now),
         )
         self._commit_if_needed()
+
+    def upsert_entity_claim_derivation(
+        self,
+        *,
+        claim_id: int,
+        rule_id: str,
+        rule_version: str,
+        derivation_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Create or reactivate one auditable proof for a derived claim."""
+        now = local_now_text()
+        self._conn.execute(
+            """
+            INSERT INTO memory_entity_claim_derivations (
+                claim_id, rule_id, rule_version, derivation_key, status,
+                derived_at, invalidated_at, metadata, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'active', ?, '', ?, ?, ?)
+            ON CONFLICT(derivation_key) DO UPDATE SET
+                claim_id = excluded.claim_id,
+                rule_id = excluded.rule_id,
+                rule_version = excluded.rule_version,
+                status = 'active',
+                derived_at = excluded.derived_at,
+                invalidated_at = '',
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(claim_id), str(rule_id or ""), str(rule_version or ""),
+                str(derivation_key or ""), now, _json_dumps(metadata or {}),
+                now, now,
+            ),
+        )
+        row = self._conn.execute(
+            "SELECT id FROM memory_entity_claim_derivations WHERE derivation_key = ?",
+            (str(derivation_key or ""),),
+        ).fetchone()
+        derivation_id = int(row["id"]) if row else 0
+        self._commit_if_needed()
+        return derivation_id
+
+    def replace_entity_claim_derivation_premises(
+        self,
+        *,
+        derivation_id: int,
+        premise_claim_ids: Sequence[int],
+        premise_role: str = "support",
+    ) -> int:
+        """Replace one derivation's exact premise set atomically."""
+        normalized = list(dict.fromkeys(
+            int(value)
+            for value in premise_claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if int(derivation_id or 0) <= 0:
+            return 0
+        now = local_now_text()
+        self._conn.execute(
+            "DELETE FROM memory_entity_claim_premises WHERE derivation_id = ?",
+            (int(derivation_id),),
+        )
+        self._conn.executemany(
+            """
+            INSERT INTO memory_entity_claim_premises (
+                derivation_id, premise_claim_id, premise_role, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (int(derivation_id), premise_id, str(premise_role or "support"), now, now)
+                for premise_id in normalized
+            ],
+        )
+        self._commit_if_needed()
+        return len(normalized)
+
+    def invalidate_entity_claim_derivations_for_premises(
+        self,
+        premise_claim_ids: Sequence[int],
+    ) -> List[int]:
+        """Invalidate proofs whose changed premise is no longer active.
+
+        The caller owns the consequential derived-claim status transition, since
+        it needs to preserve the existing claim-event audit trail.
+        """
+        premise_ids = list(dict.fromkeys(
+            int(value)
+            for value in premise_claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not premise_ids:
+            return []
+        placeholders = ",".join("?" for _ in premise_ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT DISTINCT derivation.id, derivation.claim_id
+            FROM memory_entity_claim_derivations AS derivation
+            JOIN memory_entity_claim_premises AS premise
+              ON premise.derivation_id = derivation.id
+            JOIN memory_entity_claims AS premise_claim
+              ON premise_claim.id = premise.premise_claim_id
+            WHERE derivation.status = 'active'
+              AND premise.premise_claim_id IN ({placeholders})
+              AND premise_claim.status != 'active'
+            """,
+            premise_ids,
+        ).fetchall()
+        if not rows:
+            return []
+        now = local_now_text()
+        derivation_ids = [int(row["id"]) for row in rows]
+        derivation_placeholders = ",".join("?" for _ in derivation_ids)
+        self._conn.execute(
+            f"""
+            UPDATE memory_entity_claim_derivations
+            SET status = 'invalidated', invalidated_at = ?, updated_at = ?
+            WHERE id IN ({derivation_placeholders})
+            """,
+            (now, now, *derivation_ids),
+        )
+        self._commit_if_needed()
+        return list(dict.fromkeys(int(row["claim_id"]) for row in rows))
+
+    def get_entity_claim_ids_without_active_derivations(
+        self,
+        claim_ids: Sequence[int],
+    ) -> List[int]:
+        """Return derived-claim IDs for which every stored proof is inactive."""
+        ids = list(dict.fromkeys(
+            int(value)
+            for value in claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._conn.execute(
+            f"""
+            SELECT claim.id
+            FROM memory_entity_claims AS claim
+            WHERE claim.id IN ({placeholders})
+              AND claim.claim_origin = 'derived'
+              AND claim.status = 'active'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM memory_entity_claim_derivations AS derivation
+                  WHERE derivation.claim_id = claim.id
+                    AND derivation.status = 'active'
+              )
+            """,
+            ids,
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
 
     def insert_fact(
         self,

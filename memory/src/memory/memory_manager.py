@@ -38,6 +38,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
 from .prompts_en import (
+    DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
     ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
     EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
     INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
@@ -50,6 +51,7 @@ from .prompts_en import (
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
 )
 from .prompts_zh import (
+    DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
     ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH,
     EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
     INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
@@ -462,6 +464,12 @@ class MemoryNodeManager:
             0.0,
             1.0,
             0.72,
+        )
+        self._entity_claim_derived_min_confidence = self._clamp_float(
+            self._memory_cfg.get("entity_claim_derived_min_confidence"),
+            0.0,
+            1.0,
+            0.75,
         )
         self._entity_claim_induction_min_support_facts = max(
             3,
@@ -2648,6 +2656,7 @@ class MemoryNodeManager:
                 "ok"
                 if (
                     claim_report.get("explicit", {}).get("fact_count", 0)
+                    or claim_report.get("derived", {}).get("updated", 0)
                     or claim_report.get("inductive", {}).get("seed_fact_count", 0)
                 )
                 else "empty"
@@ -2657,6 +2666,9 @@ class MemoryNodeManager:
             ),
             "inductive_claims_updated": int(
                 claim_report.get("inductive", {}).get("updated", 0) or 0
+            ),
+            "derived_claims_updated": int(
+                claim_report.get("derived", {}).get("updated", 0) or 0
             ),
             "facts_marked_processed_for_memory_entity_claim": int(
                 claim_report.get("explicit", {}).get("facts_marked_processed", 0) or 0
@@ -3374,7 +3386,11 @@ class MemoryNodeManager:
             "enabled": 0, "updated": 0, "facts_marked_processed": 0,
         }
         if not self._enable_memory_entity_claim_update:
-            return {"explicit": dict(disabled), "inductive": dict(disabled)}
+            return {
+                "explicit": dict(disabled),
+                "derived": dict(disabled),
+                "inductive": dict(disabled),
+            }
 
         explicit_facts = self._db.get_unprocessed_facts(
             processing_target="entity_claim",
@@ -3382,9 +3398,25 @@ class MemoryNodeManager:
             reference_timestamp=reference_timestamp,
         )
         explicit_report = self._update_explicit_entity_claims_from_facts(explicit_facts)
-        # A valid empty result is a completed projection.  An unavailable or
-        # malformed LLM response is retried on the next reflect task.
-        if explicit_report.pop("completed", False):
+        explicit_completed = bool(explicit_report.pop("completed", False))
+        affected_claim_ids = explicit_report.pop("affected_claim_ids", [])
+        derived_report = self._update_derived_entity_claims_from_explicit_claims(
+            affected_claim_ids=affected_claim_ids,
+        ) if explicit_completed else {
+            "enabled": 1,
+            "seed_claim_count": 0,
+            "candidate_count": 0,
+            "updated": 0,
+            "created": 0,
+            "invalidated": 0,
+            "completed": False,
+            "error": "explicit_claim_update_incomplete",
+        }
+        derived_completed = bool(derived_report.pop("completed", False))
+        # A valid empty result is a completed projection.  If either the
+        # explicit or directly-derived pass fails, leave these facts pending so
+        # the idempotent claim reconciliation can retry the full local chain.
+        if explicit_completed and derived_completed:
             explicit_report["facts_marked_processed"] = self._db.mark_facts_processed(
                 processing_target="entity_claim",
                 fact_ids=[fact.get("id") for fact in explicit_facts],
@@ -3411,9 +3443,14 @@ class MemoryNodeManager:
             inductive_report["facts_marked_processed"] = 0
         self._log_info("memory_reflect", "entity_claim_update_finish", {
             "explicit": explicit_report,
+            "derived": derived_report,
             "inductive": inductive_report,
         })
-        return {"explicit": explicit_report, "inductive": inductive_report}
+        return {
+            "explicit": explicit_report,
+            "derived": derived_report,
+            "inductive": inductive_report,
+        }
 
     def _claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
@@ -3508,7 +3545,7 @@ class MemoryNodeManager:
             key: value
             for key, value in candidate.items()
             if key not in {
-                "evidence_fact_ids", "support_fact_ids",
+                "evidence_fact_ids", "support_fact_ids", "premise_claim_ids",
             }
         }
 
@@ -4029,6 +4066,18 @@ class MemoryNodeManager:
         report["created"] = sum(int(item["created"]) for item in applied)
         report["merged"] = sum(int(item["merged"]) for item in applied)
         report["claim_count"] = len(candidates)
+        report["affected_claim_ids"] = sorted({
+            int(claim_id)
+            for item in applied
+            for claim_id in (
+                item.get("claim_id"),
+                *[
+                    decision.get("existing_claim_id")
+                    for decision in item.get("relations") or []
+                ],
+            )
+            if str(claim_id or "").strip().isdigit() and int(claim_id) > 0
+        })
         return report
 
     def _normalize_explicit_entity_claim(
@@ -4087,6 +4136,421 @@ class MemoryNodeManager:
             "metadata": {"source_fact_count": len(evidence_ids)},
             "evidence_fact_ids": evidence_ids,
         }
+
+    def _update_derived_entity_claims_from_explicit_claims(
+        self,
+        *,
+        affected_claim_ids: Sequence[int],
+    ) -> Dict[str, Any]:
+        """Derive local conclusions from this batch's explicit-claim changes.
+
+        The LLM proposes only premise-linked conclusions.  Entity IDs,
+        premise activity, fact traceability, lifecycle transitions, and writes
+        remain deterministic program responsibilities.
+        """
+        affected_ids = list(dict.fromkeys(
+            int(value)
+            for value in affected_claim_ids or []
+            if str(value).strip().isdigit() and int(value) > 0
+        ))
+        report: Dict[str, Any] = {
+            "enabled": 1,
+            "affected_claim_count": len(affected_ids),
+            "seed_claim_count": 0,
+            "entity_group_count": 0,
+            "input_claim_count": 0,
+            "candidate_count": 0,
+            "updated": 0,
+            "created": 0,
+            "invalidated": 0,
+            "suppressed": 0,
+            "completed": True,
+        }
+        if not affected_ids:
+            return report
+
+        # A premise may have been superseded during explicit reconciliation.
+        # Invalidate its old proof before optionally creating a new proof from
+        # the replacement explicit claim in this same pass.
+        report["invalidated"] = self._invalidate_derived_claims_for_inactive_premises(
+            affected_ids
+        )
+        seed_claims = [
+            claim
+            for claim in self._db.get_entity_claims_by_ids(affected_ids)
+            if claim.get("claim_origin") == "explicit"
+            and claim.get("status") == "active"
+        ]
+        report["seed_claim_count"] = len(seed_claims)
+        if not seed_claims:
+            return report
+
+        changed_by_entity: Dict[int, List[Dict[str, Any]]] = {}
+        for claim in seed_claims:
+            endpoint_entity_ids = {
+                int(entity_id)
+                for entity_id in (
+                    claim.get("subject_entity_id"),
+                    claim.get("object_entity_id"),
+                )
+                if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
+            }
+            for entity_id in endpoint_entity_ids:
+                changed_by_entity.setdefault(entity_id, []).append(claim)
+        report["entity_group_count"] = len(changed_by_entity)
+        for entity_id, changed_claims in changed_by_entity.items():
+            related_claims = self._retrieve_related_derived_explicit_claims(
+                entity_id=entity_id,
+                changed_claims=changed_claims,
+            )
+            report["input_claim_count"] += len(changed_claims) + len(related_claims)
+            outcome = self._extract_derived_entity_claims(
+                changed_claims=changed_claims,
+                related_claims=related_claims,
+            )
+            if outcome is None:
+                report["completed"] = False
+                report["error"] = "invalid_llm_derived_claim_response"
+                report["failed_entity_id"] = entity_id
+                return report
+            report["candidate_count"] += len(outcome)
+            if not outcome:
+                continue
+            group_report = self._apply_derived_entity_claim_candidates(
+                raw_candidates=outcome,
+                changed_claims=changed_claims,
+                related_claims=related_claims,
+            )
+            for key in ("updated", "created", "suppressed"):
+                report[key] += int(group_report[key])
+        return report
+
+    def _invalidate_derived_claims_for_inactive_premises(
+        self,
+        premise_claim_ids: Sequence[int],
+    ) -> int:
+        """Propagate an explicit-premise lifecycle change to derived claims."""
+        affected_derived_ids = self._db.invalidate_entity_claim_derivations_for_premises(
+            premise_claim_ids
+        )
+        invalidated_claim_ids = self._db.get_entity_claim_ids_without_active_derivations(
+            affected_derived_ids
+        )
+        changed_ids: List[int] = []
+        for claim in self._db.get_entity_claims_by_ids(invalidated_claim_ids):
+            if self._db.transition_entity_claim_status(
+                target_claim_id=int(claim["id"]),
+                new_status="invalidated",
+                semantic_relation="premise_invalidated",
+                decision_source="derived_claim_premise_lifecycle_v1",
+                policy_reason="all_derivation_premises_inactive",
+            ):
+                changed_ids.append(int(claim["id"]))
+        if changed_ids:
+            self._sync_entity_claim_recall_documents(changed_ids)
+        return len(changed_ids)
+
+    def _retrieve_related_derived_explicit_claims(
+        self,
+        *,
+        entity_id: int,
+        changed_claims: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Load historical active explicit claims touching the anchor entity."""
+        changed_claim_ids = {
+            int(claim["id"])
+            for claim in changed_claims
+            if str(claim.get("id") or "").strip().isdigit()
+        }
+        claims_by_id: Dict[int, Dict[str, Any]] = {}
+        for claim in self._db.get_entity_claims(
+            entity_id=entity_id,
+            claim_origin="explicit",
+            statuses=["active"],
+            limit=32,
+        ):
+            claim_id = int(claim["id"])
+            if claim_id not in changed_claim_ids:
+                claims_by_id[claim_id] = claim
+        return sorted(
+            claims_by_id.values(),
+            key=lambda claim: -int(claim.get("id") or 0),
+        )[:32]
+
+    def _apply_derived_entity_claim_candidates(
+        self,
+        *,
+        raw_candidates: Sequence[Dict[str, Any]],
+        changed_claims: Sequence[Dict[str, Any]],
+        related_claims: Sequence[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        """Validate, reconcile, and record one subject's LLM conclusions."""
+        report = {"updated": 0, "created": 0, "suppressed": 0}
+        input_claims = [*changed_claims, *related_claims]
+        input_by_id = {int(claim["id"]): claim for claim in input_claims}
+        changed_claim_ids = {int(claim["id"]) for claim in changed_claims}
+        entity_ids = {
+            int(entity_id)
+            for claim in input_claims
+            for entity_id in (
+                claim.get("subject_entity_id"), claim.get("object_entity_id"),
+            )
+            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
+        }
+        entity_names = self._db.get_entity_names_by_ids(sorted(entity_ids))
+        candidates = [
+            candidate
+            for raw_claim in raw_candidates
+            if (candidate := self._normalize_derived_entity_claim(
+                raw_claim,
+                input_claims_by_id=input_by_id,
+                new_claim_ids=changed_claim_ids,
+                entity_ids=entity_ids,
+                entity_names=entity_names,
+            )) is not None
+        ]
+        if not candidates:
+            return report
+        evidence_fact_ids = sorted({
+            fact_id
+            for candidate in candidates
+            for fact_id in candidate["support_fact_ids"]
+        })
+        facts_by_id = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids(evidence_fact_ids)
+            if str(fact.get("id") or "").strip().isdigit()
+        }
+        applied = self._reconcile_entity_claims(candidates, facts_by_id=facts_by_id)
+        persisted_claims = {
+            int(claim["id"]): claim
+            for item in applied
+            for claim in self._db.get_entity_claims_by_ids([item["claim_id"]])
+            if str(claim.get("id") or "").strip().isdigit()
+        }
+        persisted_derived_ids: List[int] = []
+        for item in applied:
+            claim_id = int(item.get("claim_id") or 0)
+            stored_claim = persisted_claims.get(claim_id)
+            if not stored_claim or stored_claim.get("claim_origin") != "derived":
+                report["suppressed"] += 1
+                continue
+            candidate = item["claim"]
+            premise_ids = list(candidate["premise_claim_ids"])
+            derivation_id = self._db.upsert_entity_claim_derivation(
+                claim_id=claim_id,
+                rule_id="llm_direct_entailment",
+                rule_version="v1",
+                derivation_key=(
+                    f"llm_direct_entailment:v1:{claim_id}:"
+                    + ",".join(str(value) for value in premise_ids)
+                ),
+                metadata={
+                    "prompt_version": "v1",
+                    "premise_claim_ids": premise_ids,
+                    "generator": "derived_entity_claim_extraction",
+                },
+            )
+            self._db.replace_entity_claim_derivation_premises(
+                derivation_id=derivation_id,
+                premise_claim_ids=premise_ids,
+            )
+            persisted_derived_ids.append(claim_id)
+            report["created"] += int(item.get("created") or 0)
+            report["updated"] += 1
+        if persisted_derived_ids:
+            self._sync_entity_claim_recall_documents(
+                sorted(set(persisted_derived_ids))
+            )
+        return report
+
+    def _derived_claim_prompt_view(
+        self,
+        claim: Dict[str, Any],
+        *,
+        entity_names: Dict[int, str],
+    ) -> Dict[str, Any]:
+        subject_id = int(claim.get("subject_entity_id") or 0)
+        object_id = int(claim.get("object_entity_id") or 0)
+        return {
+            "id": int(claim["id"]),
+            "subject_entity_id": subject_id,
+            "subject_entity": entity_names.get(subject_id, ""),
+            "predicate": claim.get("predicate") or "",
+            "object_entity_id": object_id,
+            "object_entity": entity_names.get(object_id, ""),
+            "claim_type": claim.get("claim_type") or "",
+            "claim_text": claim.get("claim_text") or "",
+            "valid_from": claim.get("valid_from") or "",
+            "valid_to": claim.get("valid_to") or "",
+            "confidence": float(claim.get("confidence") or 0.0),
+        }
+
+    def _extract_derived_entity_claims(
+        self,
+        *,
+        changed_claims: Sequence[Dict[str, Any]],
+        related_claims: Sequence[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        input_claims = [*changed_claims, *related_claims]
+        entity_ids = {
+            int(entity_id)
+            for claim in input_claims
+            for entity_id in (
+                claim.get("subject_entity_id"), claim.get("object_entity_id"),
+            )
+            if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
+        }
+        entity_names = self._db.get_entity_names_by_ids(sorted(entity_ids))
+        language = self._resolve_prompt_language_from_text(
+            "\n".join(str(claim.get("claim_text") or "") for claim in input_claims)
+        )
+        prompt_template = (
+            DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
+            if language == "en" else DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+        )
+        raw = self._call_llm(prompt_template.replace(
+            "{changed_claims}",
+            json.dumps([
+                self._derived_claim_prompt_view(
+                    claim,
+                    entity_names=entity_names,
+                )
+                for claim in changed_claims
+            ], ensure_ascii=False, indent=2),
+        ).replace(
+            "{related_claims}",
+            json.dumps([
+                self._derived_claim_prompt_view(
+                    claim,
+                    entity_names=entity_names,
+                )
+                for claim in related_claims
+            ], ensure_ascii=False, indent=2),
+        ))
+        parsed = self._parse_json_object_from_llm_text(raw or "")
+        if parsed is None or not isinstance(parsed.get("claims"), list):
+            return None
+        return [item for item in parsed["claims"][:16] if isinstance(item, dict)]
+
+    def _normalize_derived_entity_claim(
+        self,
+        raw: Dict[str, Any],
+        *,
+        input_claims_by_id: Dict[int, Dict[str, Any]],
+        new_claim_ids: set[int],
+        entity_ids: set[int],
+        entity_names: Dict[int, str],
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            subject_entity_id = int(raw.get("subject_entity_id") or 0)
+            object_entity_id = int(raw.get("object_entity_id") or 0)
+        except (TypeError, ValueError):
+            return None
+        if subject_entity_id not in entity_ids or (
+            object_entity_id and object_entity_id not in entity_ids
+        ):
+            return None
+        claim_type = str(raw.get("claim_type") or "").strip().lower()
+        if claim_type not in {"affiliation", "relationship", "constraint"}:
+            return None
+        predicate = re.sub(
+            r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower(),
+        ).strip("_")
+        if not predicate:
+            return None
+        premise_ids = list(dict.fromkeys(
+            int(value)
+            for value in (raw.get("premise_claim_ids") or [])
+            if str(value).strip().isdigit() and int(value) in input_claims_by_id
+        ))[:8]
+        if not premise_ids or not any(value in new_claim_ids for value in premise_ids):
+            return None
+        premises = [input_claims_by_id[value] for value in premise_ids]
+        if not all(
+            claim.get("claim_origin") == "explicit" and claim.get("status") == "active"
+            for claim in premises
+        ):
+            return None
+        conclusion_tuple = (
+            subject_entity_id, predicate, object_entity_id, claim_type,
+        )
+        if any(
+            conclusion_tuple == (
+                int(claim.get("subject_entity_id") or 0),
+                str(claim.get("predicate") or ""),
+                int(claim.get("object_entity_id") or 0),
+                str(claim.get("claim_type") or ""),
+            )
+            for claim in premises
+        ):
+            return None
+        premise_confidence = min(
+            float(claim.get("confidence") or 0.0) for claim in premises
+        )
+        confidence = min(
+            self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
+            premise_confidence,
+        )
+        if confidence < self._entity_claim_derived_min_confidence:
+            return None
+        valid_from, valid_to = self._derived_claim_validity_bounds(premises)
+        if valid_from and valid_to and valid_from > valid_to:
+            return None
+        support_fact_ids = sorted({
+            fact_id
+            for premise_id in premise_ids
+            for fact_id in self._db.get_entity_claim_evidence_fact_ids([premise_id]).get(
+                premise_id, []
+            )
+        })
+        if not support_fact_ids:
+            return None
+        claim_text = self._normalize_entity_claim_text(
+            raw.get("claim_text") or "",
+            subject=entity_names.get(subject_entity_id, ""),
+            predicate=predicate,
+            object_name=entity_names.get(object_entity_id, ""),
+        )
+        if not claim_text:
+            return None
+        return {
+            "subject_entity_id": subject_entity_id,
+            "predicate": predicate,
+            "object_entity_id": object_entity_id or None,
+            "claim_text": claim_text,
+            "claim_type": claim_type,
+            "claim_origin": "derived",
+            "status": "active",
+            "confidence": confidence,
+            "valid_from": valid_from,
+            "valid_to": valid_to,
+            "extractor_version": "entity_claim_derived_v1",
+            "prompt_version": "v1",
+            "metadata": {
+                "derivation_type": "llm_direct_entailment",
+                "premise_claim_ids": premise_ids,
+            },
+            "premise_claim_ids": premise_ids,
+            "support_fact_ids": support_fact_ids,
+        }
+
+    @staticmethod
+    def _derived_claim_validity_bounds(
+        premises: Sequence[Dict[str, Any]],
+    ) -> Tuple[str, str]:
+        """Use the intersection of premise validity without inventing time."""
+        starts = sorted({
+            _compact_whitespace(claim.get("valid_from") or "")
+            for claim in premises
+            if _compact_whitespace(claim.get("valid_from") or "")
+        })
+        ends = sorted({
+            _compact_whitespace(claim.get("valid_to") or "")
+            for claim in premises
+            if _compact_whitespace(claim.get("valid_to") or "")
+        })
+        return (starts[-1] if starts else "", ends[0] if ends else "")
 
     def _update_inductive_entity_claims_from_facts(
         self,
