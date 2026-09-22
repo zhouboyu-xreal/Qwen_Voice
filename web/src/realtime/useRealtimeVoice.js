@@ -208,6 +208,8 @@ export default function useRealtimeVoice({
   onInputError,
   onClientAction,
   onWakeWordAudio,
+  ambientRecording = false,
+  onAmbientRecordingAudio,
 }) {
   const [clientState, dispatchClientState] = useReducer(
     reduceGatewayClientState,
@@ -229,6 +231,9 @@ export default function useRealtimeVoice({
   const inputErrorRef = useRef(onInputError)
   const clientActionRef = useRef(onClientAction)
   const wakeWordAudioRef = useRef(onWakeWordAudio)
+  const ambientRecordingAudioRef = useRef(onAmbientRecordingAudio)
+  const ambientRecordingRef = useRef(ambientRecording)
+  const flushAmbientAudioRef = useRef(() => {})
   const wakeWordEnabledRef = useRef(wakeWordEnabled)
   const wakeWordOnlyRef = useRef(wakeWordOnly)
   const socketRef = useRef(null)
@@ -268,6 +273,8 @@ export default function useRealtimeVoice({
   inputErrorRef.current = onInputError
   clientActionRef.current = onClientAction
   wakeWordAudioRef.current = onWakeWordAudio
+  ambientRecordingAudioRef.current = onAmbientRecordingAudio
+  ambientRecordingRef.current = ambientRecording
   wakeWordEnabledRef.current = wakeWordEnabled
   wakeWordOnlyRef.current = wakeWordOnly
   enabledRef.current = enabled
@@ -816,8 +823,11 @@ export default function useRealtimeVoice({
     pendingManualInputsRef.current = []
   }, [sessionId])
 
+  const captureEnabled = enabled || ambientRecording
+  const captureSuspended = suspended && !ambientRecording
+
   useEffect(() => {
-    if (!enabled || suspended) {
+    if (!captureEnabled || captureSuspended) {
       inputReadyRef.current = false
       setInputReady(false)
       sendSocketEvent(microphoneControlEvent({
@@ -835,7 +845,7 @@ export default function useRealtimeVoice({
       const changed = inputReadyRef.current !== ready
       inputReadyRef.current = ready
       setInputReady(ready)
-      if (!changed) return
+      if (!changed || !enabledRef.current) return
       sendSocketEvent(microphoneControlEvent({
         enabled: ready,
         inputOnlyMute,
@@ -878,15 +888,40 @@ export default function useRealtimeVoice({
         })
         const wakeWordResampler = createStreamingResampler()
         const inputResampler = createStreamingResampler()
+        let ambientParts = []
+        let ambientSampleCount = 0
         let inputResamplerSocket = null
         let source
         let processor
         try {
           source = context.createMediaStreamSource(media)
           processor = context.createScriptProcessor(2048, 1, 1)
+          const flushAmbientAudio = () => {
+            if (!ambientSampleCount) return
+            const merged = new Float32Array(ambientSampleCount)
+            let offset = 0
+            for (const part of ambientParts) {
+              merged.set(part, offset)
+              offset += part.length
+            }
+            ambientParts = []
+            ambientSampleCount = 0
+            ambientRecordingAudioRef.current?.(pcmBase64(merged), context.sampleRate)
+          }
+          flushAmbientAudioRef.current = flushAmbientAudio
           processor.onaudioprocess = event => {
+            const rawSamples = event.inputBuffer.getChannelData(0)
+            if (ambientRecordingRef.current) {
+              // Persist the browser-processed capture stream at its native
+              // sample rate. The recording sidecar writes this PCM directly
+              // into WAV; only offline ASR normalizes a sealed file to 16 kHz.
+              const ambientAudio = new Float32Array(rawSamples)
+              ambientParts.push(ambientAudio)
+              ambientSampleCount += ambientAudio.length
+              if (ambientSampleCount >= context.sampleRate) flushAmbientAudio()
+            }
             const samples = microphoneSamplesDuringManualInput(
-              event.inputBuffer.getChannelData(0),
+              rawSamples,
               manualInputPendingRef.current,
             )
             if (wakeWordOnlyRef.current) {
@@ -897,6 +932,11 @@ export default function useRealtimeVoice({
               return
             }
             wakeWordResampler.reset()
+            if (!enabledRef.current) {
+              inputResampler.reset()
+              inputResamplerSocket = null
+              return
+            }
             const socket = socketRef.current
             if (socket?.readyState !== WebSocket.OPEN) {
               inputResampler.reset()
@@ -925,6 +965,8 @@ export default function useRealtimeVoice({
             media,
             track: media.getAudioTracks()[0],
             close() {
+              flushAmbientAudio()
+              flushAmbientAudioRef.current = () => {}
               media.getTracks().forEach(track => track.stop())
               wakeWordResampler.reset()
               inputResampler.reset()
@@ -935,6 +977,7 @@ export default function useRealtimeVoice({
           }
         } catch (error) {
           media.getTracks().forEach(track => track.stop())
+          flushAmbientAudioRef.current = () => {}
           processor?.disconnect()
           source?.disconnect()
           throw error
@@ -974,11 +1017,11 @@ export default function useRealtimeVoice({
     }
   }, [
     activateAudio,
-    enabled,
+    captureEnabled,
+    captureSuspended,
     inputOnlyMute,
     sendSocketEvent,
     sessionId,
-    suspended,
   ])
 
   useEffect(() => {
@@ -991,11 +1034,11 @@ export default function useRealtimeVoice({
   }, [enabled, inputOnlyMute, sendSocketEvent, suspended, wakeWordOnly])
 
   useEffect(() => {
-    if (!suspended) return
+    if (!suspended || ambientRecording) return
     const audio = audioRef.current
     audioRef.current = null
     audio?.close()
-  }, [suspended])
+  }, [ambientRecording, suspended])
 
   useEffect(() => () => {
     audioRef.current?.close()
@@ -1121,6 +1164,7 @@ export default function useRealtimeVoice({
     interrupt,
     wake,
     publishClientEvent,
+    flushAmbientRecordingAudio: () => flushAmbientAudioRef.current(),
     sendInput,
     sendImageFrame,
     clearImageBuffer,

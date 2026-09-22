@@ -18,7 +18,9 @@ import json
 import logging
 import os
 import re
+import socket
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -137,6 +139,24 @@ class AgentMemoryRuntime:
         self._manager_config = dict(memory_manager_config)
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
+        self._operation_lock = threading.RLock()
+
+    def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Serialize stdio and local-IPC mutations through one runtime."""
+        handlers = {
+            "observe": self.observe,
+            "observe_transcript_segments": self.observe_transcript_segments,
+            "finalize_transcript_recording": self.finalize_transcript_recording,
+            "finalize": self.finalize,
+            "recall": self.recall,
+            "health": self.health,
+            "close": self.close,
+        }
+        handler = handlers.get(method)
+        if handler is None:
+            raise ValueError(f"unsupported method: {method}")
+        with self._operation_lock:
+            return handler(params)
 
     def _owner_runtime(self, owner_id: str) -> OwnerRuntime:
         owner = _clean(owner_id, 240)
@@ -238,6 +258,117 @@ class AgentMemoryRuntime:
         )
         return result
 
+    def observe_transcript_segments(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Queue one durable ambient-ASR batch through the sole DB writer.
+
+        The ambient audio sidecar owns WAV files and ASR only.  Keeping this
+        write path in the primary sidecar prevents two ``MemoryRuntime``
+        instances from concurrently mutating one owner's SQLite database.
+        """
+        owner_id = _clean(params.get("ownerId"), 240)
+        recording_id = _clean(params.get("recordingId"), 160)
+        batch_id = _clean(params.get("batchId"), 240)
+        if not recording_id or not batch_id:
+            raise ValueError("recordingId and batchId must be non-empty")
+        holder = self._owner_runtime(owner_id)
+        owner_key = _owner_key(owner_id)
+        dedupe_key = hashlib.sha256(
+            f"ambient\0{owner_id}\0{recording_id}\0{batch_id}".encode("utf-8")
+        ).hexdigest()
+        if dedupe_key in holder.seen:
+            return {
+                "observed": False,
+                "duplicate": True,
+                "recordingId": recording_id,
+                "batchId": batch_id,
+                "segments": 0,
+            }
+        tags = [
+            _clean(tag, 120)
+            for tag in params.get("tags") or []
+            if _clean(tag, 120)
+        ]
+        tags = list(dict.fromkeys([
+            *tags,
+            "qwen-audio-agent",
+            "ambient-recording",
+            recording_id,
+        ]))
+        accepted = 0
+        for source in params.get("segments") or []:
+            if not isinstance(source, dict):
+                continue
+            text = _clean(source.get("text"), 8_000)
+            if not text:
+                continue
+            segment = dict(source)
+            segment["text"] = text
+            segment["tags"] = list(dict.fromkeys([
+                *tags,
+                *[
+                    _clean(tag, 120)
+                    for tag in source.get("tags") or []
+                    if _clean(tag, 120)
+                ],
+            ]))
+            report = holder.runtime.accept_single_transcript_segment(
+                segment,
+                source_type="allday_recording",
+                tags=segment["tags"],
+            )
+            if report.get("reason") == "memory_disabled":
+                raise RuntimeError("agent_memory is disabled")
+            accepted += 1
+        holder.remember([dedupe_key])
+        result = {
+            "observed": True,
+            "recordingId": recording_id,
+            "batchId": batch_id,
+            "segments": accepted,
+        }
+        self._logger.info(
+            "observe_transcript_segments owner=%s recording=%s batch=%s accepted_segments=%s",
+            owner_key[:12],
+            recording_id[:80],
+            batch_id[:120],
+            accepted,
+        )
+        return result
+
+    def finalize_transcript_recording(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Close an ambient recording after its final ASR batch is ingested."""
+        owner_id = _clean(params.get("ownerId"), 240)
+        recording_id = _clean(params.get("recordingId"), 160)
+        if not recording_id:
+            raise ValueError("recordingId must be non-empty")
+        holder = self._owner_runtime(owner_id)
+        input_flushed = holder.runtime.flush_pending_memory_inputs(
+            evaluate_episode_summary=False,
+        )
+        episode = holder.runtime.trigger_memory_episode_summary(
+            reason=f"ambient_recording_finished:{recording_id}",
+            source_type="allday_recording",
+            tags=["qwen-audio-agent", "ambient-recording", recording_id],
+        )
+        reflect = holder.runtime.trigger_memory_reflect()
+        result = {
+            "finalized": bool((episode or {}).get("queued")),
+            "recordingId": recording_id,
+            "inputFlushed": bool(input_flushed),
+            "episodeSummaryQueued": bool((episode or {}).get("queued")),
+            "reflectQueued": bool((reflect or {}).get("queued")),
+        }
+        self._logger.info(
+            "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
+            "episode_summary_queued=%s reflect_queued=%s",
+            _owner_key(owner_id)[:12],
+            recording_id[:80],
+            result["inputFlushed"],
+            result["episodeSummaryQueued"],
+            result["reflectQueued"],
+        )
+        return result
+
     def finalize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Flush memory input and optionally close its semantic episode.
 
@@ -332,6 +463,119 @@ class AgentMemoryRuntime:
         return result
 
 
+class _LocalTranscriptIpcServer:
+    """Private local transport for ambient-ASR transcript batches.
+
+    The socket is permissioned to the current OS user and is intentionally not
+    a network listener.  It lets the audio sidecar submit a completed batch to
+    the sole ``MemoryRuntime`` process without traversing the Gateway.
+    """
+
+    _ALLOWED_METHODS = {
+        "observe_transcript_segments",
+        "finalize_transcript_recording",
+    }
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        runtime: AgentMemoryRuntime,
+        logger: logging.Logger,
+    ) -> None:
+        self._path = path.expanduser().resolve()
+        self._runtime = runtime
+        self._logger = logger
+        self._socket: Optional[socket.socket] = None
+        self._closed = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._socket is not None:
+            return
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if self._path.exists() or self._path.is_socket():
+            if self._path.is_socket():
+                self._path.unlink()
+            else:
+                raise RuntimeError(f"IPC socket path is not a socket: {self._path}")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self._path))
+        os.chmod(self._path, 0o600)
+        listener.listen(8)
+        listener.settimeout(0.5)
+        self._socket = listener
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="agent-memory-local-ipc",
+            daemon=True,
+        )
+        self._thread.start()
+        self._logger.info("local transcript IPC listening path=%s", self._path)
+
+    def close(self) -> None:
+        self._closed.set()
+        listener = self._socket
+        self._socket = None
+        try:
+            listener.close() if listener is not None else None
+        except OSError:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        if self._path.is_socket():
+            self._path.unlink(missing_ok=True)
+
+    def _serve(self) -> None:
+        while not self._closed.is_set():
+            listener = self._socket
+            if listener is None:
+                return
+            try:
+                connection, _address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(
+                target=self._handle_connection,
+                args=(connection,),
+                daemon=True,
+            ).start()
+
+    def _handle_connection(self, connection: socket.socket) -> None:
+        with connection:
+            connection.settimeout(30.0)
+            try:
+                payload = b""
+                while b"\n" not in payload and len(payload) <= 2_000_000:
+                    chunk = connection.recv(65_536)
+                    if not chunk:
+                        break
+                    payload += chunk
+                if len(payload) > 2_000_000:
+                    raise ValueError("local IPC request exceeds the size limit")
+                request = json.loads(payload.split(b"\n", 1)[0].decode("utf-8"))
+                if not isinstance(request, dict):
+                    raise ValueError("local IPC request must be an object")
+                method = _clean(request.get("method"), 80)
+                if method not in self._ALLOWED_METHODS:
+                    raise ValueError(f"local IPC method is not allowed: {method}")
+                params = request.get("params")
+                result = self._runtime.dispatch(
+                    method,
+                    params if isinstance(params, dict) else {},
+                )
+                response = {"ok": True, "result": result}
+            except Exception as exc:
+                self._logger.exception("local transcript IPC request failed")
+                response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            connection.sendall(
+                (json.dumps(response, ensure_ascii=False, default=str) + "\n").encode("utf-8")
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state-dir", required=True, type=Path)
@@ -340,6 +584,11 @@ def main() -> int:
         "--log-path",
         type=Path,
         help="Defaults to <state-dir>/agent-memory-sidecar.log.",
+    )
+    parser.add_argument(
+        "--ipc-socket",
+        type=Path,
+        help="Defaults to <state-dir>/agent-memory-transcript.sock.",
     )
     args = parser.parse_args()
     state_dir = args.state_dir.expanduser().resolve()
@@ -368,14 +617,13 @@ def main() -> int:
         memory_manager_config=manager_config,
         logger=logger,
     )
+    ipc_server = _LocalTranscriptIpcServer(
+        path=(args.ipc_socket or state_dir / "agent-memory-transcript.sock"),
+        runtime=runtime,
+        logger=logger,
+    )
+    ipc_server.start()
     logger.info("sidecar started state_dir=%s config=%s log_path=%s", state_dir, args.config, log_path)
-    methods = {
-        "observe": runtime.observe,
-        "finalize": runtime.finalize,
-        "recall": runtime.recall,
-        "health": runtime.health,
-        "close": runtime.close,
-    }
     for line in sys.stdin:
         request: Optional[Dict[str, Any]] = None
         try:
@@ -384,9 +632,10 @@ def main() -> int:
                 raise ValueError("request must be a JSON object")
             request = parsed
             method = _clean(request.get("method"), 80)
-            if method not in methods:
-                raise ValueError(f"unsupported method: {method}")
-            response = {"id": request.get("id"), "result": methods[method](request.get("params") or {})}
+            response = {
+                "id": request.get("id"),
+                "result": runtime.dispatch(method, request.get("params") or {}),
+            }
         except Exception as exc:
             logger.exception(
                 "request failed method=%s",
@@ -399,6 +648,7 @@ def main() -> int:
         print(json.dumps(response, ensure_ascii=False, default=str), flush=True)
         if request and request.get("method") == "close":
             break
+    ipc_server.close()
     return 0
 
 

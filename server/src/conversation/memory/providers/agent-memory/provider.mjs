@@ -5,6 +5,9 @@ import { dirname, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import {
+  resolveAgentMemoryTranscriptIpcSocketPath,
+} from '../../../../../../shared/voice/agent-memory-ipc-path.mjs'
+import {
   MEMORY_PROVIDER_PROTOCOL_VERSION,
 } from '../../provider.mjs'
 
@@ -127,6 +130,10 @@ export class AgentMemoryProvider {
     sidecar = null,
   } = {}) {
     this.stateDirectory = resolve(stateDirectory)
+    this.transcriptIpcSocketPath = resolveAgentMemoryTranscriptIpcSocketPath({
+      stateDirectory: this.stateDirectory,
+      configuredPath: env.AGENT_MEMORY_IPC_SOCKET,
+    })
     this.backgroundTimeoutMs = Math.max(timeoutMs, backgroundTimeoutMs)
     this.pendingObservations = new Map()
     this.pendingObservationsBySession = new Map()
@@ -146,12 +153,17 @@ export class AgentMemoryProvider {
       args: [
         resolvedSidecar,
         '--state-dir', this.stateDirectory,
+        '--ipc-socket', this.transcriptIpcSocketPath,
         ...(configuredConfig ? ['--config', resolve(configuredConfig)] : []),
       ],
       cwd: dirname(resolvedSidecar),
       env: sidecarEnvironment,
       timeoutMs,
     })
+    // The local transcript socket must exist before Desktop starts an ambient
+    // recording.  This only initializes the memory runtime; it does not call
+    // a model or perform extraction until an input is submitted.
+    this.sidecar.start?.()
   }
 
   describe() {

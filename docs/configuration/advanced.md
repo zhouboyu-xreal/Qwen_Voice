@@ -185,6 +185,11 @@ them to the configuration file:
 | `QWEN_AUDIO_AGENT_TUI_AUDIO_MODE` | `half` |
 | `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED` | `false`; enables local “你好千问” wake-word detection in TUI |
 | `AGENT_MEMORY_PREWAKE_CONTEXT_ENABLED` | `false`; with local wake-word mode in TUI or Desktop, sends the local Agent Memory pre-wake ASR snapshot to the next Realtime turn only |
+| `AGENT_MEMORY_AMBIENT_RECORDING_ENABLED` | `true`; enables the Desktop orb's ambient recorder. WAV is saved locally and offline-ASR text is written directly to Agent Memory through its local sidecar, without traversing the Gateway |
+| `AGENT_MEMORY_AMBIENT_RECORDING_CHUNK_SECONDS` | `600`; maximum duration in seconds of each offline-ASR WAV batch |
+| `AGENT_MEMORY_AMBIENT_RECORDING_SIDECAR` | Empty; absolute path to the ambient-recording sidecar. Defaults to the script beside the Agent Memory sidecar |
+| `AGENT_MEMORY_IPC_SOCKET` | Empty; local Unix socket used by the ambient sidecar to reach Agent Memory. Defaults below `AGENT_MEMORY_STATE_DIR` |
+| `AGENT_MEMORY_LOCAL_OWNER_ID` | Empty; only for a non-`personal` identity mode, set this to its Agent Memory owner hash. It is derived automatically for `personal` mode |
 | `QWEN_AUDIO_AGENT_WAKE_WORD_IDLE_SECONDS` | `15`; seconds before TUI or Desktop returns to local wake-word listening after an interaction; `0` disables it |
 | `QWEN_AUDIO_AGENT_WAKE_WORD_WAKE_GRACE_SECONDS` | `10`; grace period after a wake word with no effective interaction in TUI or Desktop |
 | `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_IDLE_SECONDS` | Legacy fallback when the unified idle setting is absent |

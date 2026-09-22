@@ -164,6 +164,11 @@ QWEN_AUDIO_AGENT_OPENCODE_ISOLATE_USER_CONFIG=true
 | `QWEN_AUDIO_AGENT_TUI_AUDIO_MODE` | `half` |
 | `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_ENABLED` | `false`；TUI 本地“你好千问”关键词唤醒 |
 | `AGENT_MEMORY_PREWAKE_CONTEXT_ENABLED` | `false`；与 TUI 或 Desktop 的本地唤醒词配合，将本地 Agent Memory 的唤醒前 ASR 快照只注入下一轮 Realtime，不写入长期记忆 |
+| `AGENT_MEMORY_AMBIENT_RECORDING_ENABLED` | `true`；Desktop 悬浮球的环境录音开关。录音保存为本地 WAV，离线 ASR 文本经本地 Agent Memory sidecar 直接写入记忆，不经过 Gateway |
+| `AGENT_MEMORY_AMBIENT_RECORDING_CHUNK_SECONDS` | `600`；环境录音每个离线 ASR WAV 批次的最长时长（秒） |
+| `AGENT_MEMORY_AMBIENT_RECORDING_SIDECAR` | 空；环境录音 sidecar 的绝对路径，默认使用 Agent Memory sidecar 同目录的脚本 |
+| `AGENT_MEMORY_IPC_SOCKET` | 空；环境录音 sidecar 连接 Agent Memory 的本地 Unix socket，默认位于 `AGENT_MEMORY_STATE_DIR` |
+| `AGENT_MEMORY_LOCAL_OWNER_ID` | 空；仅当使用非 `personal` 身份模式时设置为对应 Agent Memory owner 的哈希标识；`personal` 模式自动对齐 |
 | `QWEN_AUDIO_AGENT_WAKE_WORD_IDLE_SECONDS` | `15`；TUI 与 Desktop 在有效交互结束后回到本地唤醒监听的秒数，`0` 表示关闭 |
 | `QWEN_AUDIO_AGENT_WAKE_WORD_WAKE_GRACE_SECONDS` | `10`；TUI 与 Desktop 仅唤醒、尚未有效交互时的等待秒数 |
 | `QWEN_AUDIO_AGENT_TUI_WAKE_WORD_IDLE_SECONDS` | 兼容旧配置；未设置统一变量时作为其回退值 |

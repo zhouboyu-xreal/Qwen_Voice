@@ -51,6 +51,25 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
     'qwen-audio-agent:wake-word-audio',
     { audio, sampleRate },
   ),
+  startAmbientRecording: () => ipcRenderer.invoke(
+    'qwen-audio-agent:ambient-recording-start',
+  ),
+  appendAmbientRecordingAudio: (audio, sampleRate) => ipcRenderer.send(
+    'qwen-audio-agent:ambient-recording-audio',
+    { audio, sampleRate },
+  ),
+  stopAmbientRecording: () => ipcRenderer.invoke(
+    'qwen-audio-agent:ambient-recording-stop',
+  ),
+  onAmbientRecordingState: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const listener = (_event, state) => callback(state || {})
+    ipcRenderer.on('qwen-audio-agent:ambient-recording-state', listener)
+    return () => ipcRenderer.removeListener(
+      'qwen-audio-agent:ambient-recording-state',
+      listener,
+    )
+  },
   lifecycleReady: () => ipcRenderer.send('qwen-audio-agent:lifecycle-ready'),
   loadLifecycle: () => ipcRenderer.invoke('qwen-audio-agent:lifecycle-load'),
   pauseWakeShortcut: () => ipcRenderer.invoke(

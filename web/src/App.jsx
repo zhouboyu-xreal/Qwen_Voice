@@ -175,6 +175,11 @@ function OrbControlIcon({ type, muted = false, collapsed = false }) {
       <path d={collapsed ? 'm7 9 5 5 5-5' : 'm7 14 5-5 5 5'} />
     </svg>
   }
+  if (type === 'recording') {
+    return <svg viewBox="0 0 24 24" aria-hidden="true">
+      <circle cx="12" cy="12" r="5.5" />
+    </svg>
+  }
   return <svg viewBox="0 0 24 24" aria-hidden="true">
     <path d="m7 7 10 10M17 7 7 17" />
   </svg>
@@ -207,6 +212,7 @@ export default function App() {
     clientType: activeClientType,
   }))
   const [waitingForVoice, setWaitingForVoice] = useState(false)
+  const [ambientRecordingState, setAmbientRecordingState] = useState('inactive')
   const [messages, setMessages] = useState([])
   const [activity, setActivity] = useState(t('正在检查后台 Agent'))
   const [frontend, setFrontend] = useState({ label: 'Realtime Agent' })
@@ -249,6 +255,7 @@ export default function App() {
   const workSettledAtRef = useRef(Date.now())
   const autoHideStateRef = useRef(null)
   const autoHideRequestedDeadlineRef = useRef(0)
+  const ambientRecordingToggleInFlightRef = useRef(false)
   const lastWakeAtRef = useRef(0)
   const previousDesktopLifecycle = useRef('active')
   const desktopWakeReasonRef = useRef('')
@@ -842,8 +849,24 @@ export default function App() {
     onWakeWordAudio: (audio, sampleRate) => {
       window.qwenAudioAgentDesktop?.acceptWakeWordAudio(audio, sampleRate)
     },
+    ambientRecording: desktopOrbMode && ambientRecordingState === 'recording',
+    onAmbientRecordingAudio: (audio, sampleRate) => {
+      window.qwenAudioAgentDesktop?.appendAmbientRecordingAudio(audio, sampleRate)
+    },
   })
   gatewayCommandsRef.current = voice
+  useEffect(() => {
+    if (!desktopOrbMode) return undefined
+    return window.qwenAudioAgentDesktop?.onAmbientRecordingState?.(state => {
+      const next = ['starting', 'recording', 'finalizing', 'error'].includes(state?.state)
+        ? state.state
+        : 'inactive'
+      setAmbientRecordingState(next)
+      if (next === 'starting') setActivity(t('正在启动环境录音'))
+      if (next === 'recording') setActivity(t('正在录制环境音频'))
+      if (next === 'error' && state?.message) setActivity(state.message)
+    })
+  }, [])
   const lifecycleTransition = (
     desktopOrbMode && desktopLifecycle !== 'active'
   )
@@ -1124,6 +1147,47 @@ export default function App() {
     setActivity(t('待命'))
   }
 
+  const toggleAmbientRecording = async () => {
+    const desktop = window.qwenAudioAgentDesktop
+    if (!desktop) return
+    if (ambientRecordingState === 'recording') {
+      // Send the renderer's sub-second PCM tail before the main process seals
+      // its final WAV batch.  The subsequent invoke is ordered after this IPC.
+      voice.flushAmbientRecordingAudio()
+      setAmbientRecordingState('finalizing')
+      try {
+        await desktop.stopAmbientRecording()
+      } catch (error) {
+        setAmbientRecordingState('error')
+        setActivity(error?.message || t('环境录音停止失败'))
+      }
+      return
+    }
+    if (!['inactive', 'error'].includes(ambientRecordingState)) return
+    // Ambient capture is a Desktop-local feature.  Do not make its start
+    // request contingent on the realtime playback context: a suspended or
+    // unavailable output context must not turn this button into a silent
+    // no-op.  The capture lifecycle will report a concrete microphone error
+    // if input cannot be acquired.
+    voice.activateAudio()
+    setAmbientRecordingState('starting')
+    setActivity(t('正在启动环境录音'))
+    try {
+      await desktop.startAmbientRecording()
+    } catch (error) {
+      setAmbientRecordingState('error')
+      setActivity(error?.message || t('环境录音启动失败'))
+    }
+  }
+
+  const requestAmbientRecordingToggle = () => {
+    if (ambientRecordingToggleInFlightRef.current) return
+    ambientRecordingToggleInFlightRef.current = true
+    void toggleAmbientRecording().finally(() => {
+      ambientRecordingToggleInFlightRef.current = false
+    })
+  }
+
   const sendComposerInput = parts => {
     // Sending is a browser user gesture, so it is also the earliest reliable
     // point to unlock audio playback while the microphone remains muted.
@@ -1252,6 +1316,36 @@ export default function App() {
             }
           >
             <OrbControlIcon type="microphone" muted={!voiceEnabled} />
+          </button>
+          <button
+            className={['starting', 'recording'].includes(ambientRecordingState)
+              ? 'active recording' : ''}
+            onPointerDown={event => {
+              // The orb itself is draggable. Start at pointer-down so a
+              // platform that suppresses the synthetic click during a drag
+              // gesture cannot turn this dedicated control into a no-op.
+              event.stopPropagation()
+              requestAmbientRecordingToggle()
+            }}
+            onClick={event => {
+              event.stopPropagation()
+              requestAmbientRecordingToggle()
+            }}
+            aria-label={ambientRecordingState === 'recording'
+              ? t('停止环境录音')
+              : ambientRecordingState === 'starting'
+                ? t('正在启动环境录音')
+              : ambientRecordingState === 'finalizing'
+                ? t('正在处理环境录音') : t('开始环境录音')}
+            title={ambientRecordingState === 'recording'
+              ? t('停止环境录音')
+              : ambientRecordingState === 'starting'
+                ? t('正在启动环境录音')
+              : ambientRecordingState === 'finalizing'
+                ? t('正在处理环境录音') : t('开始环境录音')}
+            disabled={ambientRecordingState === 'starting' || ambientRecordingState === 'finalizing'}
+          >
+            <OrbControlIcon type="recording" />
           </button>
           <button
             onClick={event => {

@@ -970,7 +970,7 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   left: 50%;
   top: 132px;
   display: flex;
-  gap: 4px;
+  gap: 2px;
   padding: 3px;
   border: 1px solid #ffffff12;
   border-radius: 13px;
@@ -989,7 +989,7 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   transform: translate(-50%, 0) scale(1);
 }
 .desktop-orb-controls button {
-  width: 26px;
+  width: 23px;
   height: 26px;
   padding: 0;
   display: grid;
@@ -1011,6 +1011,11 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   color: #cbb98f;
   background: #cbb98f14;
 }
+.desktop-orb-controls button.recording.active {
+  color: #f07d86;
+  background: #f07d8624;
+  animation: desktop-recording-pulse 1.35s ease-in-out infinite;
+}
 .desktop-orb-controls button.danger:hover,
 .desktop-orb-controls button.danger:focus-visible {
   color: #d99aa4;
@@ -1024,6 +1029,10 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   stroke-width: 1.8;
   stroke-linecap: round;
   stroke-linejoin: round;
+}
+
+@keyframes desktop-recording-pulse {
+  50% { box-shadow: 0 0 0 3px #f07d8620; }
 }
 
 .messages {

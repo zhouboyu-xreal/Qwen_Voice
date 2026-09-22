@@ -61,40 +61,119 @@ class VoiceRuntime:
         *,
         session_start: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Convert one audio file into timestamped transcript segments."""
-        path = Path(audio_path).expanduser().resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"Audio file not found: {path}")
+        """Read one audio file, then convert it into transcript segments.
+
+        This remains the file-oriented compatibility entry point.  Callers
+        which already own decoded PCM should use :meth:`process_audio` so
+        audio-file I/O is not coupled to VAD, speaker identification, or ASR.
+        """
+        path = self._resolve_audio_file_path(audio_path)
         started_at = time.monotonic()
         self.logger.info(
             "process_audio_file start path=%s session_start=%s",
             path,
             session_start or "<now>",
         )
+        audio, sample_rate = self.read_audio_file(path)
+        report = self.process_audio(
+            audio,
+            sample_rate,
+            session_start=session_start,
+            audio_path=path,
+        )
+        self.logger.info(
+            "process_audio_file finish path=%s speech_segments=%s transcript_segments=%s elapsed_ms=%.2f",
+            path,
+            report["speech_segment_count"],
+            report["transcript_segment_count"],
+            (time.monotonic() - started_at) * 1000.0,
+        )
+        return report
 
-        from .audio import load_audio_mono, slice_audio
+    def read_audio_file(self, audio_path: Path | str) -> Tuple[np.ndarray, int]:
+        """Decode an audio file into normalized mono PCM at the runtime rate.
+
+        This method only handles the file boundary: path validation, decoding,
+        channel normalization, and resampling supplied by ``load_audio_mono``.
+        It intentionally does not apply runtime processing policies such as
+        ``max_duration_s``; those belong to :meth:`process_audio` and therefore
+        apply equally to in-memory audio.
+        """
+        path = self._resolve_audio_file_path(audio_path)
+        from .audio import load_audio_mono
 
         audio, sample_rate = load_audio_mono(path, self._sample_rate())
-        limit = self.runtime_config.get("max_duration_s")
-        if limit is not None:
-            audio = audio[: max(0, int(float(limit) * sample_rate))]
         self.logger.info(
-            "process_audio_file audio_loaded path=%s sample_rate=%s duration_s=%.3f max_duration_s=%s",
+            "read_audio_file finish path=%s sample_rate=%s duration_s=%.3f",
             path,
             sample_rate,
             len(audio) / sample_rate if sample_rate else 0.0,
+        )
+        return audio, sample_rate
+
+    def process_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        *,
+        session_start: Optional[str] = None,
+        audio_path: Optional[Path | str] = None,
+    ) -> Dict[str, Any]:
+        """Process decoded mono PCM into timestamped transcript segments.
+
+        ``audio`` must be a finite, one-dimensional mono signal at this
+        runtime's configured sample rate.  ``audio_path`` is optional metadata
+        for diagnostics and reports; no file is opened by this method.
+        """
+        normalized_audio = np.asarray(audio, dtype=np.float32)
+        if normalized_audio.ndim != 1:
+            raise ValueError("audio must be a one-dimensional mono PCM array")
+        if not np.isfinite(normalized_audio).all():
+            raise ValueError("audio contains non-finite samples")
+        normalized_sample_rate = int(sample_rate)
+        if normalized_sample_rate <= 0:
+            raise ValueError("sample_rate must be positive")
+        expected_sample_rate = self._sample_rate()
+        if normalized_sample_rate != expected_sample_rate:
+            raise ValueError(
+                "audio sample_rate does not match VoiceRuntime configuration: "
+                f"got={normalized_sample_rate} expected={expected_sample_rate}"
+            )
+
+        path = Path(audio_path).expanduser().resolve() if audio_path else None
+        source = str(path) if path is not None else "<in-memory>"
+        started_at = time.monotonic()
+        self.logger.info(
+            "process_audio start source=%s session_start=%s",
+            source,
+            session_start or "<now>",
+        )
+
+        from .audio import slice_audio
+
+        limit = self.runtime_config.get("max_duration_s")
+        if limit is not None:
+            normalized_audio = normalized_audio[
+                : max(0, int(float(limit) * normalized_sample_rate))
+            ]
+        self.logger.info(
+            "process_audio input_ready source=%s sample_rate=%s duration_s=%.3f max_duration_s=%s",
+            source,
+            normalized_sample_rate,
+            len(normalized_audio) / normalized_sample_rate,
             limit if limit is not None else "<none>",
         )
 
         recording_start = self._parse_session_start(session_start)
-        spans = self._detect_speech_spans(audio, sample_rate)
+        spans = self._detect_speech_spans(normalized_audio, normalized_sample_rate)
         self.logger.info(
-            "process_audio_file speech_detected path=%s speech_segments=%s",
-            path,
+            "process_audio speech_detected source=%s speech_segments=%s",
+            source,
             len(spans),
         )
         raw_chunks = [
-            slice_audio(audio, sample_rate, start, end) for start, end in spans
+            slice_audio(normalized_audio, normalized_sample_rate, start, end)
+            for start, end in spans
         ]
         raw_assignments = self._identify_speakers(raw_chunks)
         spans, assignments, source_span_indexes = self._merge_speech_spans_by_speaker(
@@ -102,15 +181,16 @@ class VoiceRuntime:
             raw_assignments,
         )
         chunks = [
-            slice_audio(audio, sample_rate, start, end) for start, end in spans
+            slice_audio(normalized_audio, normalized_sample_rate, start, end)
+            for start, end in spans
         ]
         merged_span_count = sum(
             1 for source_indexes in source_span_indexes if len(source_indexes) > 1
         )
         self.logger.info(
-            "process_audio_file speech_span_merge path=%s input_spans=%s output_spans=%s "
+            "process_audio speech_span_merge source=%s input_spans=%s output_spans=%s "
             "merged_groups=%s enabled=%s max_gap_s=%.3f max_duration_s=%.3f",
-            path,
+            source,
             len(raw_chunks),
             len(chunks),
             merged_span_count,
@@ -120,7 +200,7 @@ class VoiceRuntime:
         )
         segments: List[Dict[str, Any]] = []
         asr_texts = [""] * len(chunks)
-        asr_batches = self._build_asr_batches(chunks, sample_rate)
+        asr_batches = self._build_asr_batches(chunks, normalized_sample_rate)
         for batch_index, batch_indexes in enumerate(asr_batches, 1):
             batch_chunks = [chunks[index] for index in batch_indexes]
             batch_texts = self.asr.transcribe_batch_segments(batch_chunks)
@@ -133,13 +213,13 @@ class VoiceRuntime:
             for chunk_index, transcript_text in zip(batch_indexes, batch_texts):
                 asr_texts[chunk_index] = transcript_text
             batch_durations = [
-                len(chunks[index]) / sample_rate
+                len(chunks[index]) / normalized_sample_rate
                 for index in batch_indexes
             ]
             self.logger.info(
-                "process_audio_file asr_batch path=%s batch=%s segment_indexes=%s "
+                "process_audio asr_batch source=%s batch=%s segment_indexes=%s "
                 "batch_size=%s duration_min_s=%.3f duration_max_s=%.3f returned=%s",
-                path,
+                source,
                 batch_index,
                 [index + 1 for index in batch_indexes],
                 len(batch_chunks),
@@ -162,8 +242,8 @@ class VoiceRuntime:
             )
             if not text:
                 self.logger.info(
-                    "process_audio_file asr_empty path=%s segment=%s start=%.3f end=%.3f",
-                    path,
+                    "process_audio asr_empty source=%s segment=%s start=%.3f end=%.3f",
+                    source,
                     index,
                     start,
                     end,
@@ -171,8 +251,8 @@ class VoiceRuntime:
                 continue
             speaker, speaker_metadata = self._speaker_label(assignment)
             self.logger.info(
-                "process_audio_file asr_segment path=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
-                path,
+                "process_audio asr_segment source=%s segment=%s start=%.3f end=%.3f speaker=%s text=%s",
+                source,
                 index,
                 start,
                 end,
@@ -193,7 +273,7 @@ class VoiceRuntime:
                         "merged_vad_span_count": len(
                             source_span_indexes[chunk_index]
                         ),
-                        "sample_rate": sample_rate,
+                        "sample_rate": normalized_sample_rate,
                         **speaker_metadata,
                     },
                 }
@@ -201,9 +281,12 @@ class VoiceRuntime:
 
         report = {
             "status": "ok",
-            "audio_path": str(path),
-            "sample_rate": sample_rate,
-            "audio_duration_s": round(len(audio) / sample_rate, 3),
+            "audio_path": str(path) if path is not None else None,
+            "sample_rate": normalized_sample_rate,
+            "audio_duration_s": round(
+                len(normalized_audio) / normalized_sample_rate,
+                3,
+            ),
             "speech_segment_count": len(raw_chunks),
             "merged_speech_segment_count": len(spans),
             "speech_span_merge_group_count": merged_span_count,
@@ -212,8 +295,8 @@ class VoiceRuntime:
             "segments": segments,
         }
         self.logger.info(
-            "process_audio_file finish path=%s speech_segments=%s transcript_segments=%s elapsed_ms=%.2f",
-            path,
+            "process_audio finish source=%s speech_segments=%s transcript_segments=%s elapsed_ms=%.2f",
+            source,
             len(raw_chunks),
             len(segments),
             (time.monotonic() - started_at) * 1000.0,
@@ -225,6 +308,13 @@ class VoiceRuntime:
         reset = getattr(self.vad, "reset_stream_state", None)
         if callable(reset):
             reset()
+
+    @staticmethod
+    def _resolve_audio_file_path(audio_path: Path | str) -> Path:
+        path = Path(audio_path).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Audio file not found: {path}")
+        return path
 
     def _section(self, name: str) -> Dict[str, Any]:
         value = self.config.get(name)

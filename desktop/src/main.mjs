@@ -16,6 +16,7 @@ import {
   existsSync,
   readFileSync,
 } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { parseEnv } from 'node:util'
@@ -97,6 +98,11 @@ import {
   preWakeContextEnabled,
   resolvePreWakeContextSidecarOptions,
 } from '../../shared/voice/prewake-context-runtime.mjs'
+import {
+  AmbientAudioRecordingRuntime,
+  ambientAudioRecordingEnabled,
+  resolveAmbientAudioRecordingSidecarOptions,
+} from '../../shared/voice/ambient-audio-recording-runtime.mjs'
 
 // Gateway paths belong to the Gateway; Electron's userData holds only client
 // preferences, credentials, presentation assets and local caches.
@@ -206,6 +212,10 @@ let pendingGatewayPairingCode = null
 let desktopPreWakeContextRuntime = null
 let desktopPendingPreWakeContext = ''
 let desktopPreWakeContextCapturing = false
+let desktopAmbientRecordingRuntime = null
+let desktopAmbientRecordingId = ''
+let desktopAmbientRecordingStopping = false
+let desktopAmbientRecordingDrainTimer = null
 
 const desktopPresence = new DesktopPresence({
   getWindow: () => mainWindow,
@@ -316,6 +326,190 @@ ipcMain.handle('qwen-audio-agent:consume-prewake-context', event => {
   desktopPendingPreWakeContext = ''
   if (!text) desktopPreWakeContextRuntime?.clear()
   return { text }
+})
+
+function publishAmbientRecordingState(state, details = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('qwen-audio-agent:ambient-recording-state', {
+    state,
+    recordingId: desktopAmbientRecordingId,
+    ...details,
+  })
+}
+
+function ambientRecordingDirectory(environment) {
+  const memoryStateDirectory = String(
+    environment.AGENT_MEMORY_STATE_DIR || '',
+  ).trim()
+  if (memoryStateDirectory) {
+    return resolve(memoryStateDirectory, 'ambient-recordings')
+  }
+  const gatewayStateDirectory = String(environment.QWAUDIO_STATE_DIR || '').trim()
+  if (!gatewayStateDirectory) {
+    throw new Error('无法确定 Agent Memory 的本地状态目录')
+  }
+  return resolve(gatewayStateDirectory, 'memory/agent-memory/ambient-recordings')
+}
+
+async function ensureDesktopAmbientRecordingRuntime() {
+  if (desktopAmbientRecordingRuntime) return desktopAmbientRecordingRuntime
+  const environment = configuredGatewayEnvironment()
+  if (!ambientAudioRecordingEnabled(environment)) {
+    throw new Error('环境音频录制已在配置中关闭')
+  }
+  const runtime = new AmbientAudioRecordingRuntime(
+    resolveAmbientAudioRecordingSidecarOptions(environment, {
+      recordingsDirectory: ambientRecordingDirectory(environment),
+    }),
+  )
+  desktopAmbientRecordingRuntime = runtime
+  return runtime
+}
+
+function stopAmbientRecordingDrainTimer() {
+  if (desktopAmbientRecordingDrainTimer !== null) {
+    clearInterval(desktopAmbientRecordingDrainTimer)
+    desktopAmbientRecordingDrainTimer = null
+  }
+}
+
+async function drainDesktopAmbientRecording() {
+  if (!desktopAmbientRecordingRuntime || !desktopAmbientRecordingId) return null
+  return desktopAmbientRecordingRuntime.drain(desktopAmbientRecordingId)
+}
+
+function startAmbientRecordingDrainTimer() {
+  stopAmbientRecordingDrainTimer()
+  desktopAmbientRecordingDrainTimer = setInterval(() => {
+    void drainDesktopAmbientRecording().catch(error => {
+      logger.warn('desktop.ambient_recording.drain_failed', { error })
+    })
+  }, 2_000)
+}
+
+async function finalizeDesktopAmbientRecording() {
+  const runtime = desktopAmbientRecordingRuntime
+  const recordingId = desktopAmbientRecordingId
+  if (!runtime || !recordingId) return
+  try {
+    while (true) {
+      const result = await drainDesktopAmbientRecording()
+      if (!result?.pendingBatches) break
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 1_000))
+    }
+    logger.info('desktop.ambient_recording.finalized', { recordingId })
+    publishAmbientRecordingState('inactive')
+  } catch (error) {
+    logger.error('desktop.ambient_recording.finalize_failed', { recordingId, error })
+    publishAmbientRecordingState('error', {
+      message: '环境录音已保存，但离线转写或记忆写入尚未完成。',
+    })
+  } finally {
+    stopAmbientRecordingDrainTimer()
+    desktopAmbientRecordingId = ''
+    desktopAmbientRecordingStopping = false
+    await runtime.close()
+    if (desktopAmbientRecordingRuntime === runtime) {
+      desktopAmbientRecordingRuntime = null
+    }
+  }
+}
+
+async function startDesktopAmbientRecording() {
+  if (desktopAmbientRecordingId) {
+    return { state: desktopAmbientRecordingStopping ? 'finalizing' : 'recording' }
+  }
+  let runtime = null
+  let recordingId = ''
+  try {
+    // Runtime option resolution is part of startup too.  Keep it inside the
+    // error boundary: otherwise a missing state/config path fails before any
+    // recording diagnostic is emitted.
+    runtime = await ensureDesktopAmbientRecordingRuntime()
+    recordingId = randomUUID()
+    desktopAmbientRecordingId = recordingId
+    desktopAmbientRecordingStopping = false
+    logger.info('desktop.ambient_recording.start_requested', { recordingId })
+    publishAmbientRecordingState('starting')
+    const result = await runtime.startRecording({
+      recordingId,
+      startedAt: new Date().toISOString(),
+    })
+    startAmbientRecordingDrainTimer()
+    logger.info('desktop.ambient_recording.started', { recordingId })
+    publishAmbientRecordingState('recording')
+    return { state: 'recording', recordingId, ...result }
+  } catch (error) {
+    logger.error('desktop.ambient_recording.start_failed', { recordingId, error })
+    desktopAmbientRecordingId = ''
+    publishAmbientRecordingState('error', {
+      message: '环境录音启动失败，请检查桌面日志。',
+    })
+    await runtime?.close()
+    if (runtime && desktopAmbientRecordingRuntime === runtime) {
+      desktopAmbientRecordingRuntime = null
+    }
+    throw error
+  }
+}
+
+async function stopDesktopAmbientRecording() {
+  const runtime = desktopAmbientRecordingRuntime
+  const recordingId = desktopAmbientRecordingId
+  if (!runtime || !recordingId) return { state: 'inactive' }
+  if (desktopAmbientRecordingStopping) return { state: 'finalizing', recordingId }
+  desktopAmbientRecordingStopping = true
+  const result = await runtime.stopRecording(recordingId)
+  stopAmbientRecordingDrainTimer()
+  publishAmbientRecordingState('finalizing')
+  void finalizeDesktopAmbientRecording()
+  return { state: 'finalizing', recordingId, ...result }
+}
+
+ipcMain.handle('qwen-audio-agent:ambient-recording-start', async event => {
+  logger.info('desktop.ambient_recording.start_ipc_received', {
+    hasWindow: Boolean(mainWindow && !mainWindow.isDestroyed()),
+    senderMatches: Boolean(mainWindow && event.sender === mainWindow.webContents),
+  })
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('ambient recording request was not sent by the Desktop window')
+  }
+  return startDesktopAmbientRecording()
+})
+
+ipcMain.on('qwen-audio-agent:ambient-recording-audio', (event, payload) => {
+  if (
+    !mainWindow
+    || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+    || !desktopAmbientRecordingRuntime
+    || !desktopAmbientRecordingId
+    || desktopAmbientRecordingStopping
+  ) return
+  const audio = typeof payload?.audio === 'string' ? payload.audio : ''
+  const sampleRate = Number(payload?.sampleRate)
+  if (
+    !audio
+    || audio.length > 256 * 1024
+    || !Number.isInteger(sampleRate)
+    || sampleRate < 8_000
+    || sampleRate > 192_000
+  ) return
+  const operation = desktopAmbientRecordingRuntime.appendPcm16(
+    Buffer.from(audio, 'base64'),
+    sampleRate,
+    desktopAmbientRecordingId,
+  )
+  operation?.catch(error => {
+    logger.warn('desktop.ambient_recording.append_failed', { error })
+  })
+})
+
+ipcMain.handle('qwen-audio-agent:ambient-recording-stop', async event => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('ambient recording request was not sent by the Desktop window')
+  }
+  return stopDesktopAmbientRecording()
 })
 
 const MAX_GATEWAY_CRASH_RESTARTS = 3
@@ -1468,6 +1662,22 @@ if (!app.requestSingleInstanceLock()) {
       logger.info('desktop.stopping')
       desktopPresence.destroy()
       desktopWakeWord.stop()
+      stopAmbientRecordingDrainTimer()
+      const ambientRecordingRuntime = desktopAmbientRecordingRuntime
+      const ambientRecordingId = desktopAmbientRecordingId
+      desktopAmbientRecordingRuntime = null
+      desktopAmbientRecordingId = ''
+      desktopAmbientRecordingStopping = false
+      // Seal the active WAV before Electron exits.  Long offline ASR work is
+      // intentionally not awaited during shutdown: the durable WAV remains
+      // available for recovery instead of blocking application exit.
+      if (ambientRecordingRuntime && ambientRecordingId) {
+        try {
+          await ambientRecordingRuntime.stopRecording(ambientRecordingId)
+        } catch (error) {
+          logger.warn('desktop.ambient_recording.stop_on_shutdown_failed', { error })
+        }
+      }
       const preWakeContextRuntime = desktopPreWakeContextRuntime
       desktopPreWakeContextRuntime = null
       tray?.destroy()
@@ -1477,6 +1687,7 @@ if (!app.requestSingleInstanceLock()) {
       const gateway = embeddedGateway
       embeddedGateway = null
       await Promise.allSettled([
+        ambientRecordingRuntime?.close(),
         preWakeContextRuntime?.close(),
         server?.close(),
         gateway?.stop(),
