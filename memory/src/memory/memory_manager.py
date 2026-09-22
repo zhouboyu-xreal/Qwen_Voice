@@ -1914,11 +1914,8 @@ class MemoryNodeManager:
             "responsibility": ["work_item"],
             "lifecycle_update": ["plan", "work_item"],
         }
-        allowed_operations = {
-            "create", "confirm", "update", "complete", "cancel", "reschedule", "block",
-        }
         normalized: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str, str, str]] = set()
+        seen: set[Tuple[str, str, str]] = set()
         for raw in value:
             if not isinstance(raw, dict):
                 continue
@@ -1943,9 +1940,6 @@ class MemoryNodeManager:
                 for item in raw_object_types
                 if str(item).strip().lower() in {"goal", "plan", "work_item"}
             )) or list(default_object_types[evidence_kind])
-            operation_hint = str(raw.get("operation_hint") or "create").strip().lower()
-            if operation_hint not in allowed_operations:
-                continue
             user_role = str(raw.get("user_role") or "").strip().lower()
             if user_role not in {"owner", "participant", "responsible"}:
                 continue
@@ -1979,7 +1973,6 @@ class MemoryNodeManager:
                 subject_name.lower(),
                 evidence_kind,
                 self._generate_topic_name_key(prospective_anchor),
-                operation_hint,
             )
             if key in seen:
                 continue
@@ -1988,7 +1981,6 @@ class MemoryNodeManager:
                 "subject_entity": subject_name,
                 "evidence_kind": evidence_kind,
                 "candidate_object_types": candidate_object_types,
-                "operation_hint": operation_hint,
                 "user_role": user_role,
                 "prospective_anchor": prospective_anchor,
                 "assertion_source": assertion_source,
@@ -2761,7 +2753,16 @@ class MemoryNodeManager:
                 ))
             )
             parsed = self._parse_json_object_from_llm_text(raw or "")
-            if parsed is None or not isinstance(parsed.get("candidates"), list):
+            candidate_list_fields = (
+                "goal_candidates",
+                "plan_candidates",
+                "work_item_candidates",
+            )
+            if (
+                parsed is None
+                or not isinstance(parsed, dict)
+                or any(not isinstance(parsed.get(field), list) for field in candidate_list_fields)
+            ):
                 report["failed_group_count"] += 1
                 failed_group_fact_ids.update(group_fact_ids)
                 self._log_info("memory_prospective_update", "group_error", {
@@ -2785,15 +2786,12 @@ class MemoryNodeManager:
                 ],
             )
             entity_ids[self._world_owner_entity_name] = world_owner_id
-            candidates = [
-                candidate for raw_candidate in parsed["candidates"][:24]
-                if (candidate := self._normalize_intent_candidate(
-                    raw_candidate,
-                    facts_by_id=group_facts_by_id,
-                    entity_ids=entity_ids,
-                    world_owner_id=world_owner_id,
-                )) is not None
-            ]
+            candidates = self._normalize_intent_candidates(
+                parsed,
+                facts_by_id=group_facts_by_id,
+                entity_ids=entity_ids,
+                world_owner_id=world_owner_id,
+            )
             report["candidate_count"] += len(candidates)
             decisions = self._reconcile_intent_candidates(
                 candidates,
@@ -2850,9 +2848,12 @@ class MemoryNodeManager:
             if fact_id not in facts_by_id:
                 continue
             object_key = ",".join(signal["candidate_object_types"])
+            # A group is a bounded extraction batch, not an assertion that its
+            # signals describe the same prospective object.  Anchors remain in
+            # the prompt view as semantic evidence, but must not fragment the
+            # batch merely because the fact extractor phrased them differently.
             base_key = "|".join((
                 str(signal["subject_entity"]).lower(),
-                str(signal["prospective_anchor_key"]),
                 object_key,
             ))
             groups = groups_by_key.setdefault(base_key, [])
@@ -2892,8 +2893,8 @@ class MemoryNodeManager:
                 {
                     key: signal[key]
                     for key in (
-                        "evidence_kind", "candidate_object_types", "operation_hint",
-                        "subject_entity", "user_role", "prospective_anchor",
+                        "evidence_kind", "candidate_object_types", "subject_entity",
+                        "user_role", "prospective_anchor",
                         "assertion_source", "explicitness",
                     )
                 }
@@ -2908,17 +2909,17 @@ class MemoryNodeManager:
         *,
         world_owner_id: int,
     ) -> Dict[str, List[Dict[str, Any]]]:
-        """Bound reconciliation to objects plausibly related to this group."""
+        """Retrieve candidate-ranked existing objects for reconciliation.
+
+        ``canonical_key`` is deliberately only one high-precision feature. It
+        cannot be a retrieval gate because separately extracted descriptions
+        of the same future-facing object rarely use identical keys.
+        """
         active_statuses = {
             "goal": ["active"],
             "plan": ["planned", "rescheduled"],
             "work_item": ["open", "in_progress", "blocked"],
         }
-        keys_by_type: Dict[str, set[str]] = {key: set() for key in active_statuses}
-        for candidate in candidates:
-            keys_by_type[candidate["object_type"]].add(
-                str(candidate.get("canonical_key") or "")
-            )
         related_by_type: Dict[str, List[Dict[str, Any]]] = {}
         for object_type, statuses in active_statuses.items():
             existing = self._db.get_intent_objects(
@@ -2927,19 +2928,128 @@ class MemoryNodeManager:
                 statuses=statuses,
                 limit=64,
             )
-            candidate_keys = {key for key in keys_by_type[object_type] if key}
-            related = []
-            for item in existing:
-                existing_key = str(item.get("canonical_key") or "")
-                if existing_key and any(
-                    key == existing_key
-                    or key in existing_key
-                    or existing_key in key
-                    for key in candidate_keys
+            candidates_of_type = [
+                candidate
+                for candidate in candidates
+                if candidate.get("object_type") == object_type
+            ]
+            selected_by_id: Dict[int, Dict[str, Any]] = {}
+            for candidate in candidates_of_type:
+                ranked = sorted(
+                    (
+                        (
+                            self._score_intent_candidate_against_existing_object(
+                                candidate,
+                                item,
+                            ),
+                            item,
+                        )
+                        for item in existing
+                    ),
+                    key=lambda pair: pair[0],
+                    reverse=True,
+                )
+                strong_matches = [
+                    item for score, item in ranked
+                    if score >= 0.35
+                ][:4]
+                # Lifecycle updates are especially important not to lose. If
+                # lexical/structured evidence is sparse, expose only the two
+                # best candidate-ranked objects rather than an arbitrary
+                # recency slice of the entire active set.
+                if (
+                    not strong_matches
+                    and candidate.get("lifecycle_evidence") != "none"
                 ):
-                    related.append(item)
-            related_by_type[object_type] = (related or existing[:8])[:16]
+                    strong_matches = [item for _score, item in ranked[:2]]
+                for item in strong_matches:
+                    object_id = int(item.get("id") or 0)
+                    if object_id > 0:
+                        selected_by_id[object_id] = item
+            related_by_type[object_type] = list(selected_by_id.values())[:16]
         return related_by_type
+
+    def _build_intent_object_match_profile(
+        self,
+        object_type: str,
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Expose only type-specific identity evidence for intent matching."""
+        normalized_type = str(object_type or "").strip().lower()
+        if normalized_type == "goal":
+            text_values = [
+                item.get("desired_outcome"),
+                item.get("summary"),
+                item.get("success_criteria"),
+            ]
+            entity_id = int(item.get("owner_entity_id") or 0)
+            time_value = item.get("target_at") or ""
+        elif normalized_type == "plan":
+            text_values = [
+                item.get("event_or_activity"),
+                item.get("summary"),
+                item.get("location_text"),
+            ]
+            entity_id = int(item.get("actor_entity_id") or 0)
+            time_value = item.get("start_at") or ""
+        elif normalized_type == "work_item":
+            text_values = [
+                item.get("action_text"),
+                item.get("deliverable"),
+                item.get("summary"),
+            ]
+            entity_id = int(item.get("responsible_entity_id") or 0)
+            time_value = item.get("due_at") or item.get("start_at") or ""
+        else:
+            return {"text_values": [], "entity_id": 0, "time_value": "", "canonical_key": ""}
+        canonical_value = _compact_whitespace(item.get("canonical_key") or "")
+        return {
+            "text_values": self._normalize_unique_labels(text_values, limit=6),
+            "entity_id": entity_id,
+            "time_value": _compact_whitespace(time_value),
+            "canonical_key": (
+                self._generate_topic_name_key(canonical_value)
+                if canonical_value else ""
+            ),
+        }
+
+    def _score_intent_candidate_against_existing_object(
+        self,
+        candidate: Dict[str, Any],
+        existing: Dict[str, Any],
+    ) -> float:
+        """Rank a same-type existing object without requiring key equality."""
+        object_type = str(candidate.get("object_type") or "").strip().lower()
+        candidate_profile = self._build_intent_object_match_profile(object_type, candidate)
+        existing_profile = self._build_intent_object_match_profile(object_type, existing)
+        text_score = self._topic_name_best_pair_similarity(
+            candidate_profile["text_values"],
+            existing_profile["text_values"],
+        )
+        canonical_score = self._topic_name_best_pair_similarity(
+            [candidate_profile["canonical_key"]],
+            [existing_profile["canonical_key"]],
+        )
+        candidate_entity_id = int(candidate_profile["entity_id"] or 0)
+        existing_entity_id = int(existing_profile["entity_id"] or 0)
+        entity_score = (
+            1.0
+            if candidate_entity_id and candidate_entity_id == existing_entity_id
+            else 0.0
+        )
+        candidate_day = str(candidate_profile["time_value"] or "")[:10]
+        existing_day = str(existing_profile["time_value"] or "")[:10]
+        time_score = 1.0 if candidate_day and candidate_day == existing_day else 0.0
+        return round(
+            min(
+                1.0,
+                text_score * 0.6
+                + canonical_score * 0.25
+                + entity_score * 0.1
+                + time_score * 0.05,
+            ),
+            6,
+        )
 
     def _intent_world_owner_entity_id(self) -> int:
         mapping = self._db.add_entity_names([self._world_owner_entity_name])
@@ -2949,7 +3059,6 @@ class MemoryNodeManager:
         return {
             "id": fact.get("id"), "summary": fact.get("summary") or "",
             "source_type": fact.get("source_type") or "",
-            "episode_id": fact.get("episode_id") or 0,
             "fact_type": fact.get("fact_type") or "",
             "entities": fact.get("entities") or [],
             "primary_entity": fact.get("primary_entity") or {},
@@ -2975,17 +3084,49 @@ class MemoryNodeManager:
         mapping = self._db.add_entity_names([name for name in names if name])
         return {str(name): int(entity_id) for name, entity_id in mapping.items()}
 
+    def _normalize_intent_candidates(
+        self,
+        payload: Dict[str, Any],
+        *,
+        facts_by_id: Dict[int, Dict[str, Any]],
+        entity_ids: Dict[str, int],
+        world_owner_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Normalize type-specific prompt lists into one internal sequence."""
+        normalized: List[Dict[str, Any]] = []
+        for field_name, object_type in (
+            ("goal_candidates", "goal"),
+            ("plan_candidates", "plan"),
+            ("work_item_candidates", "work_item"),
+        ):
+            raw_candidates = payload.get(field_name)
+            if not isinstance(raw_candidates, list):
+                continue
+            for raw_candidate in raw_candidates:
+                candidate = self._normalize_intent_candidate(
+                    raw_candidate,
+                    object_type=object_type,
+                    facts_by_id=facts_by_id,
+                    entity_ids=entity_ids,
+                    world_owner_id=world_owner_id,
+                )
+                if candidate is not None:
+                    normalized.append(candidate)
+                if len(normalized) >= 24:
+                    return normalized
+        return normalized
+
     def _normalize_intent_candidate(
         self,
         raw: Any,
         *,
+        object_type: str,
         facts_by_id: Dict[int, Dict[str, Any]],
         entity_ids: Dict[str, int],
         world_owner_id: int,
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
             return None
-        object_type = str(raw.get("object_type") or "").strip().lower()
         if object_type not in {"goal", "plan", "work_item"}:
             return None
         evidence_ids = list(dict.fromkeys(
@@ -2995,18 +3136,22 @@ class MemoryNodeManager:
         summary = _compact_whitespace(raw.get("summary") or "")[:480]
         if not summary or not evidence_ids:
             return None
-        operation = str(raw.get("operation") or "create").strip().lower()
-        if operation not in {"create", "confirm", "update", "complete", "cancel", "reschedule", "block"}:
-            operation = "create"
         canonical_key = self._generate_topic_name_key(raw.get("canonical_key") or summary)
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
+        lifecycle_evidence = str(raw.get("lifecycle_evidence") or "none").strip().lower()
+        allowed_lifecycle_evidence = {
+            "goal": {"none", "confirmed", "completed", "cancelled", "blocked"},
+            "plan": {"none", "confirmed", "occurred", "cancelled", "rescheduled", "blocked"},
+            "work_item": {"none", "confirmed", "completed", "cancelled", "blocked"},
+        }
+        if lifecycle_evidence not in allowed_lifecycle_evidence[object_type]:
+            lifecycle_evidence = "none"
         candidate: Dict[str, Any] = {
-            "object_type": object_type, "operation": operation, "summary": summary,
+            "object_type": object_type, "summary": summary,
             "canonical_key": canonical_key, "confidence": confidence,
             "evidence_fact_ids": evidence_ids,
             "world_owner_entity_id": world_owner_id,
-            "related_goal_key": self._generate_topic_name_key(raw.get("related_goal_key") or ""),
-            "related_plan_key": self._generate_topic_name_key(raw.get("related_plan_key") or ""),
+            "lifecycle_evidence": lifecycle_evidence,
         }
         def entity_id(value: Any, *, fallback: int = 0) -> int:
             name = _compact_whitespace(value or "")
@@ -3018,7 +3163,7 @@ class MemoryNodeManager:
             if owner_name.lower() in {"我", "本人", "用户", "user", "the user"}:
                 owner_name = self._world_owner_entity_name
             owner_id = entity_id(owner_name, fallback=world_owner_id)
-            desired_outcome = _compact_whitespace(raw.get("desired_outcome") or summary)[:480]
+            desired_outcome = _compact_whitespace(raw.get("desired_outcome") or "")[:480]
             if not owner_id or not desired_outcome:
                 return None
             candidate.update(owner_entity_id=owner_id, owner_name=owner_name, desired_outcome=desired_outcome,
@@ -3036,8 +3181,8 @@ class MemoryNodeManager:
             if location and location not in entity_ids:
                 entity_ids.update(self._db.add_entity_names([location]))
             candidate.update(actor_entity_id=actor_id, actor_name=actor_name, event_or_activity=event,
-                start_at=_compact_whitespace(raw.get("start_at") or "")[:80],
-                end_at=_compact_whitespace(raw.get("end_at") or "")[:80],
+                start_at=_compact_whitespace(raw.get("scheduled_start_at") or "")[:80],
+                end_at=_compact_whitespace(raw.get("scheduled_end_at") or "")[:80],
                 time_precision=(
                     str(raw.get("time_precision") or "unknown").lower()
                     if str(raw.get("time_precision") or "unknown").lower()
@@ -3058,10 +3203,17 @@ class MemoryNodeManager:
                 "personal_action", "commitment", "assigned", "external_commitment",
             }:
                 return None
+            due_at = _compact_whitespace(raw.get("due_at") or "")[:80]
+            available_from = _compact_whitespace(raw.get("available_from") or "")[:80]
+            has_completion_anchor = bool(deliverable or due_at) or responsibility_type in {
+                "commitment", "assigned", "external_commitment",
+            }
+            if not has_completion_anchor:
+                return None
             candidate.update(responsible_entity_id=responsible_id, responsible_name=responsible_name, action_text=action_text,
                 deliverable=deliverable, responsibility_type=responsibility_type,
-                due_at=_compact_whitespace(raw.get("due_at") or "")[:80],
-                start_at=_compact_whitespace(raw.get("start_at") or "")[:80],
+                due_at=due_at,
+                start_at=available_from,
                 priority=_compact_whitespace(raw.get("priority") or "")[:80],
                 beneficiary_names=self._normalize_string_list(raw.get("beneficiary_entities"), limit=8),
                 delegator_names=self._normalize_string_list(raw.get("delegator_entities"), limit=8),
@@ -3092,7 +3244,10 @@ class MemoryNodeManager:
                 if str(item.get("canonical_key") or "") == candidate["canonical_key"]
             ), None)
             decisions[index] = {
-                "operation": candidate["operation"] if direct else "create",
+                "operation": (
+                    self._intent_operation_from_lifecycle_evidence(candidate)
+                    if direct else "create"
+                ),
                 "target_object_type": candidate["object_type"] if direct else "",
                 "target_object_id": int(direct["id"]) if direct else 0,
                 "reason": "deterministic_canonical_key_match" if direct else "no_direct_match",
@@ -3143,6 +3298,19 @@ class MemoryNodeManager:
                 "reason": _compact_whitespace(raw_decision.get("reason") or "llm_reconciliation")[:240],
             }
         return decisions
+
+    @staticmethod
+    def _intent_operation_from_lifecycle_evidence(candidate: Dict[str, Any]) -> str:
+        """Map fact-level lifecycle evidence to an update for a matched object."""
+        lifecycle_evidence = str(candidate.get("lifecycle_evidence") or "none").lower()
+        return {
+            "confirmed": "confirm",
+            "completed": "complete",
+            "occurred": "complete",
+            "cancelled": "cancel",
+            "rescheduled": "reschedule",
+            "blocked": "block",
+        }.get(lifecycle_evidence, "update")
 
     @staticmethod
     def _intent_object_prompt_view(object_type: str, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -3296,7 +3464,6 @@ class MemoryNodeManager:
                 decision_source=str(decision.get("reason") or "intent_reconciliation"),
             )
             self._write_intent_entity_links(object_type, object_id, candidate)
-            self._write_intent_object_relations(object_type, object_id, candidate)
             applied.append({"object_type": object_type, "object_id": object_id, "created": created})
         return applied
 
@@ -3321,8 +3488,6 @@ class MemoryNodeManager:
         }}
         payload.update(status=status, confidence=candidate["confidence"], metadata={
             "source_fact_ids": candidate["evidence_fact_ids"],
-            "related_goal_key": candidate.get("related_goal_key") or "",
-            "related_plan_key": candidate.get("related_plan_key") or "",
         })
         if candidate["object_type"] == "work_item":
             payload.update(
@@ -3356,17 +3521,6 @@ class MemoryNodeManager:
                 if name in mapping
             ],
         )
-
-    def _write_intent_object_relations(self, object_type: str, object_id: int, candidate: Dict[str, Any]) -> None:
-        if object_type != "work_item":
-            return
-        owner_id = int(candidate["world_owner_entity_id"])
-        for goal in self._db.get_intent_objects(object_type="goal", world_owner_entity_id=owner_id, limit=80):
-            if candidate.get("related_goal_key") and goal.get("canonical_key") == candidate["related_goal_key"]:
-                self._db.upsert_goal_work_item_mapping(goal_id=int(goal["id"]), work_item_id=object_id, relation="advances")
-        for plan in self._db.get_intent_objects(object_type="plan", world_owner_entity_id=owner_id, limit=80):
-            if candidate.get("related_plan_key") and plan.get("canonical_key") == candidate["related_plan_key"]:
-                self._db.upsert_plan_work_item_mapping(plan_id=int(plan["id"]), work_item_id=object_id, relation="prepares")
 
     @staticmethod
     def _entity_claim_types() -> set[str]:
@@ -4717,12 +4871,11 @@ class MemoryNodeManager:
                 "fact_id": int(fact_id),
                 "signal_key": (
                     f"{int(entity_mapping[subject_name])}|{signal['evidence_kind']}|"
-                    f"{prospective_anchor_key}|{signal['operation_hint']}"
+                    f"{prospective_anchor_key}"
                 ),
                 "subject_entity_id": int(entity_mapping[subject_name]),
                 "evidence_kind": signal["evidence_kind"],
                 "candidate_object_types": signal["candidate_object_types"],
-                "operation_hint": signal["operation_hint"],
                 "user_role": signal["user_role"],
                 "prospective_anchor": prospective_anchor,
                 "prospective_anchor_key": prospective_anchor_key,

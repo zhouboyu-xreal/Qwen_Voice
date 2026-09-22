@@ -235,10 +235,10 @@ INTENT_EXTRACTION_PROMPT_EN = """Extract Intent & Execution objects from stored,
 
 Only output:
 - goal: an explicit, durable desired outcome that spans more than one action;
-- plan: an explicit future arrangement, event, activity, trip, meeting, or appointment;
-- work_item: a responsibility with a clear responsible party plus an action, deliverable, or checkable completion condition.
+- plan: an explicit future arrangement, event, activity, trip, meeting, or appointment with a time/window or explicit arranged, agreed, or registered evidence;
+- work_item: a bounded responsibility with a clear responsible party, action, and at least one completion anchor: a deliverable, deadline, explicit commitment, or explicit assignment.
 
-Use only direct fact evidence. Do not store assistant suggestions, speculation, behavior patterns, or predictions. Do not create an object for weak hypotheticals such as maybe, if, should we, or consider. A goal or plan never automatically creates a work item. Use `occurred` only for a plan whose event happened, and `completed` only for a completed work item.
+Use only direct fact evidence. Do not store assistant suggestions, speculation, behavior patterns, or predictions. Do not create an object for weak hypotheticals such as maybe, if, should we, or consider. A goal or plan never automatically creates a work item. Use `occurred` only for a plan whose event happened, and `completed` only for a completed work item. Keep each candidate in its matching list; do not fan out one fact into multiple object types without independent evidence. `lifecycle_evidence` describes only an observed fact-level change, never a database operation; reconciliation decides create, update, or completion against existing objects.
 
 World owner: {world_owner_name}
 Reference time: {reference_timestamp}
@@ -247,23 +247,39 @@ Facts:
 
 Return JSON only:
 {
-  "candidates": [
+  "goal_candidates": [
     {
-      "object_type": "goal|plan|work_item",
-      "operation": "create|confirm|update|complete|cancel|reschedule|block",
-      "summary": "complete display text",
-      "canonical_key": "short stable identity key",
+      "summary": "complete durable outcome description",
+      "canonical_key": "short stable goal identity key",
       "owner_entity": "goal owner",
-      "desired_outcome": "goal only",
-      "success_criteria": "goal only",
+      "desired_outcome": "outcome after achievement",
+      "success_criteria": "checkable success condition or empty",
       "target_at": "goal target time",
+      "lifecycle_evidence": "none|confirmed|completed|cancelled|blocked",
+      "confidence": 0.0,
+      "evidence_fact_ids": [1]
+    }
+  ],
+  "plan_candidates": [
+    {
+      "summary": "complete future arrangement description",
+      "canonical_key": "short stable plan identity key",
       "actor_entity": "plan actor",
-      "event_or_activity": "plan event",
-      "start_at": "plan start time",
-      "end_at": "plan end time",
+      "event_or_activity": "future event or activity",
+      "scheduled_start_at": "plan start time",
+      "scheduled_end_at": "plan end time",
       "time_precision": "exact|day|week|relative|unknown",
       "location": "plan location",
       "participants": ["other plan participants"],
+      "lifecycle_evidence": "none|confirmed|occurred|cancelled|rescheduled|blocked",
+      "confidence": 0.0,
+      "evidence_fact_ids": [1]
+    }
+  ],
+  "work_item_candidates": [
+    {
+      "summary": "complete responsibility description",
+      "canonical_key": "short stable work item identity key",
       "responsible_entity": "work item responsible party",
       "beneficiary_entities": ["beneficiaries"],
       "delegator_entities": ["delegators"],
@@ -272,15 +288,15 @@ Return JSON only:
       "action_text": "work item action",
       "deliverable": "work item deliverable",
       "due_at": "work item due time",
+      "available_from": "earliest execution time or empty",
       "priority": "only when explicit",
-      "related_goal_key": "only when explicit",
-      "related_plan_key": "only when explicit",
+      "lifecycle_evidence": "none|confirmed|completed|cancelled|blocked",
       "confidence": 0.0,
       "evidence_fact_ids": [1]
     }
   ]
 }
-Every candidate needs at least one input fact id. Return {"candidates": []} when none qualify."""
+Every candidate needs at least one input fact id. All three candidate lists must be present; use an empty list when none qualify."""
 
 
 INTENT_RECONCILIATION_PROMPT_EN = """Decide only the relationship between new Intent & Execution candidates and existing objects. Do not invent facts or modify object fields.

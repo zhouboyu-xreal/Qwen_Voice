@@ -1684,7 +1684,6 @@ class SessionDB:
             except (KeyError, TypeError, ValueError):
                 subject_entity_id = 0
             evidence_kind = str(mapping.get("evidence_kind") or "").strip().lower()
-            operation_hint = str(mapping.get("operation_hint") or "").strip().lower()
             user_role = str(mapping.get("user_role") or "").strip().lower()
             prospective_anchor = str(mapping.get("prospective_anchor") or "").strip()
             prospective_anchor_key = str(mapping.get("prospective_anchor_key") or "").strip()
@@ -1699,7 +1698,7 @@ class SessionDB:
                 continue
             if is_sentinel:
                 subject_entity_id = 0
-                evidence_kind = operation_hint = user_role = ""
+                evidence_kind = user_role = ""
                 prospective_anchor = prospective_anchor_key = ""
                 assertion_source = explicitness = ""
                 candidate_object_types = []
@@ -1716,7 +1715,6 @@ class SessionDB:
             elif (
                 subject_entity_id <= 0
                 or evidence_kind not in {"goal", "plan", "responsibility", "lifecycle_update"}
-                or operation_hint not in {"create", "confirm", "update", "complete", "cancel", "reschedule", "block"}
                 or user_role not in {"owner", "participant", "responsible"}
                 or not prospective_anchor
                 or not prospective_anchor_key
@@ -1726,8 +1724,7 @@ class SessionDB:
                 continue
             if not signal_key:
                 signal_key = (
-                    f"{subject_entity_id}|{evidence_kind}|{prospective_anchor_key}|"
-                    f"{operation_hint}"
+                    f"{subject_entity_id}|{evidence_kind}|{prospective_anchor_key}"
                 )
             if not is_sentinel:
                 self._conn.execute(
@@ -1759,7 +1756,7 @@ class SessionDB:
                 """,
                 (
                     fact_id, signal_key, subject_entity_id or None, evidence_kind,
-                    _json_dumps(candidate_object_types), operation_hint, user_role,
+                    _json_dumps(candidate_object_types), "", user_role,
                     prospective_anchor, prospective_anchor_key,
                     assertion_source, explicitness,
                     str(mapping.get("evidence_basis") or "").strip(),
@@ -1784,7 +1781,7 @@ class SessionDB:
             LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
               AND signal.signal_key != '__fact__'
-            ORDER BY signal.evidence_kind, signal.prospective_anchor_key, signal.operation_hint
+            ORDER BY signal.evidence_kind, signal.prospective_anchor_key
             """,
             (int(fact_id),),
         ).fetchall()

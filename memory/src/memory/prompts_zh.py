@@ -194,8 +194,7 @@ prospective_signals 输出规则：
 - `user_role` 只能是 owner、participant、responsible，表示用户分别是目标拥有者、安排参与者或责任承担者。用户只是被顺带提及时不得输出 signal。
 - `assertion_source` 只能是 self_statement、third_party_report、observed_event；`explicitness` 只能是 direct、reported、tentative。助手建议、助手复述、开放假设、条件讨论和推测不得输出 signal。
 - `prospective_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
-- `operation_hint` 只能是 create、confirm、update、complete、cancel、reschedule、block。只有当前 fact 明确表达状态变化时才使用非 create 值。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、operation_hint、user_role、prospective_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact 中可直接定位的内容。
+- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、prospective_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact 中可直接定位的内容。
 
 输出格式：
 {
@@ -227,7 +226,6 @@ prospective_signals 输出规则：
           "subject_entity": "与用户未来相关的主体实体；用户本人填写用户",
           "evidence_kind": "goal|plan|responsibility|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
-          "operation_hint": "create|confirm|update|complete|cancel|reschedule|block",
           "user_role": "owner|participant|responsible",
           "prospective_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
           "assertion_source": "self_statement|third_party_report|observed_event",
@@ -251,15 +249,16 @@ INTENT_EXTRACTION_PROMPT_ZH = """你负责从已落库、可追溯的 narrative 
 
 只允许输出三类对象：
 - goal：主体明确、跨越多个动作的持续性期望结果；一次性愿望或单次动作不是 goal。
-- plan：明确的未来安排、行程、会议、活动或事件；它不是待办。
-- work_item：责任人明确，且有具体动作、交付物或可判定完成条件的事项。它可以是 personal_action、commitment、assigned 或 external_commitment。
+- plan：明确的未来安排、行程、会议、活动或事件；必须有时间/时间窗口，或“已约定、已报名、已安排”等安排性证据；它不是待办。
+- work_item：责任人明确的有界事项；除具体动作外，必须有交付物、截止时间、明确承诺或明确分配中的至少一项完成锚点。它可以是 personal_action、commitment、assigned 或 external_commitment。
 
 严格限制：
 - 只能使用输入 facts 的直接证据。assistant 的建议、推测、行为规律和 prediction 不得自动落库。
 - “也许”“如果”“要不要”“考虑一下”等弱假设默认不输出对象。
 - goal 或 plan 不得自动拆出 work_item；只有文本明确表达下一步、交付、承诺或分配时才输出 work_item。
 - 计划发生是 `occurred`，事项完成是 `completed`，二者不能混淆。
-- 不要为同一证据创建重复对象；当事实明显表示完成、取消、改期、阻塞或确认时，输出相应 operation。
+- 每个列表只输出其定义对应的对象；同一 fact 不得自动拆成多类对象，除非 fact 明确提供每一类对象的独立证据。
+- `lifecycle_evidence` 只描述当前 fact 可直接观察到的生命周期证据，不是数据库操作；最终 create、update、complete 等操作由后续 reconciliation 结合已有对象决定。
 
 world owner：{world_owner_name}
 当前时间：{reference_timestamp}
@@ -268,49 +267,90 @@ world owner：{world_owner_name}
 
 输出 JSON：
 {
-  "candidates": [
+  "goal_candidates": [
     {
-      "object_type": "goal|plan|work_item",
-      "operation": "create|confirm|update|complete|cancel|reschedule|block",
-      "summary": "完整、可展示的对象描述",
-      "canonical_key": "用于同义对象匹配的简短稳定名称",
-      "owner_entity": "goal 的归属实体；没有明确证据时填 world owner",
-      "desired_outcome": "goal 才填写",
-      "success_criteria": "goal 才填写，证据不足时为空",
-      "target_at": "goal 的目标时间，证据不足为空",
+      "summary": "完整、可展示的持续性目标描述",
+      "canonical_key": "用于同义目标匹配的简短稳定名称",
+      "owner_entity": "goal 归属实体；没有明确证据时填 world owner",
+      "desired_outcome": "目标达成后的结果",
+      "success_criteria": "可判定的达成条件；证据不足为空",
+      "target_at": "目标时间；证据不足为空",
+      "lifecycle_evidence": "none|confirmed|completed|cancelled|blocked",
+      "confidence": 0.0,
+      "evidence_fact_ids": [1]
+    }
+  ],
+  "plan_candidates": [
+    {
+      "summary": "完整、可展示的未来安排描述",
+      "canonical_key": "用于同义安排匹配的简短稳定名称",
       "actor_entity": "plan 的行动/参与主体",
-      "event_or_activity": "plan 的未来事件或活动",
-      "start_at": "plan 开始时间，保留已解析时间或原始明确时间",
-      "end_at": "plan 结束时间",
+      "event_or_activity": "未来事件或活动",
+      "scheduled_start_at": "计划开始时间，保留已解析时间或原始明确时间",
+      "scheduled_end_at": "计划结束时间",
       "time_precision": "exact|day|week|relative|unknown",
-      "location": "plan 地点",
-      "participants": ["plan 其他参与者"],
+      "location": "计划地点",
+      "participants": ["其他参与者"],
+      "lifecycle_evidence": "none|confirmed|occurred|cancelled|rescheduled|blocked",
+      "confidence": 0.0,
+      "evidence_fact_ids": [1]
+    }
+  ],
+  "work_item_candidates": [
+    {
+      "summary": "完整、可展示的责任事项描述",
+      "canonical_key": "用于同义事项匹配的简短稳定名称",
       "responsible_entity": "work_item 负责人",
       "beneficiary_entities": ["交付/受益对象"],
       "delegator_entities": ["分配或委托对象"],
       "collaborator_entities": ["协作者"],
       "responsibility_type": "personal_action|commitment|assigned|external_commitment",
-      "action_text": "work_item 具体动作",
-      "deliverable": "work_item 交付物或完成结果",
-      "due_at": "work_item 截止时间",
-      "start_at": "work_item 可填写开始时间；plan 时表示事件开始时间",
+      "action_text": "具体动作",
+      "deliverable": "交付物或完成结果",
+      "due_at": "截止时间",
+      "available_from": "可开始执行的时间；证据不足为空",
       "priority": "仅文本明确表达时填写",
-      "related_goal_key": "只有当前证据明确说明该事项推进某 goal 时填写",
-      "related_plan_key": "只有当前证据明确说明该事项服务于某 plan 时填写",
+      "lifecycle_evidence": "none|confirmed|completed|cancelled|blocked",
       "confidence": 0.0,
       "evidence_fact_ids": [1]
     }
   ]
 }
 
-每个 candidate 必须至少引用一个输入 fact id。没有合格对象时返回 {"candidates": []}。只返回 JSON。"""
+每个 candidate 必须至少引用一个输入 fact id。三个候选列表都必须存在；没有合格对象时对应输出空数组。只返回 JSON。"""
 
 
-INTENT_RECONCILIATION_PROMPT_ZH = """你只判断新的 Intent & Execution candidate 与已有对象之间的关系，不生成新事实，不修改字段。
+INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 Intent & Execution reconciliation 模块。你只判断新的 candidate 与已有对象是否为同一个现实中的 goal、plan 或 work_item，并在确认同一对象后给出其生命周期更新操作。
 
-对于每个 candidate，若它与某个同类 existing object 是同一目标、同一计划或同一事项，请选择最合适的目标对象，并输出 operation：confirm、update、complete、cancel、reschedule、block 或 create。没有可靠对应关系时使用 create。Plan 的 occurred 表示活动已发生；Work item 的 completed 表示责任已完成。
+输入含有：
+- `candidates`：由新 facts 提炼出的候选对象。`lifecycle_evidence` 仅表示新 fact 直接观察到的状态证据，不是数据库操作，也不保证已经能定位到已有对象。
+- `existing_objects`：同一 world owner 下、当前仍可更新的已有对象。候选与目标对象必须是同一种 `object_type`。
 
-不要因为主题相近就合并；主体、核心活动/交付物与时间关系必须相容。只返回 JSON：
+你的工作顺序必须是：
+1. 先判断 candidate 是否与某个同类 existing object 是同一个对象；
+2. 只有确认同一对象后，才根据 candidate 的内容和 `lifecycle_evidence` 决定 operation；
+3. 没有可靠目标对象时输出 `create`，且 `target_object_type` 置为空字符串、`target_object_id` 置为 0。
+
+同一对象的判断规则：
+- 不要因为主题、地点、人物或关键词相近就合并。`canonical_key` 只能作为辅助线索，不能单独决定同一性。
+- goal：owner 必须相容，且 desired_outcome 指向同一持续性结果。目标时间、成功条件的补充或调整通常是 update，不代表新 goal。
+- plan：actor 与核心 event_or_activity 必须相容。相同活动的时间变化是 reschedule；仅地点、参与者或细节补充通常是 update。不同日期的相似活动不自动等同，除非新证据明确说明它是原安排的改期。
+- work_item：responsible_entity 与核心 action_text / deliverable 必须相容。截止时间、协作者或交付细节变化通常是 update；不同交付物或不同责任通常是新事项。
+- 不得跨类型关联：goal 不能匹配 plan 或 work_item，plan 不能匹配 work_item。
+
+operation 选择规则：
+- `create`：没有可靠的同一 existing object。
+- `confirm`：同一对象得到再次明确确认，但核心字段和生命周期没有实质变化。
+- `update`：同一对象的描述、参与者、地点、目标时间、截止时间、交付物或其他非终态细节得到补充或改变。
+- `complete`：仅当新证据明确表示 goal 已实现、plan 已发生（`lifecycle_evidence=occurred`）或 work_item 已完成（`lifecycle_evidence=completed`）时使用。
+- `cancel`：仅当新证据明确表示对象被取消、放弃或不再执行时使用。
+- `reschedule`：仅用于同一 plan 的明确改期；work_item 截止时间变化使用 update。
+- `block`：仅当新证据明确表示该对象当前受阻、无法推进时使用。
+- 当 `lifecycle_evidence=none` 时，不要凭空输出 complete、cancel、reschedule 或 block。
+
+每个 candidate_index 必须恰好输出一条 decision，按输入 candidates 的索引编号。reason 用一句简短、可追溯的中文说明同一性或 create 的依据；不要生成输入中不存在的新事实、对象或字段。
+
+只返回 JSON：
 {
   "decisions": [
     {
