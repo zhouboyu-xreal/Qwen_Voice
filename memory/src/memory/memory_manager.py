@@ -4,8 +4,7 @@
 The public surface mirrors the current project's `MemoryNodeManager`, but the
 internal model is deliberately unified:
 
-1. assistant_wakeup turns and future allday transcript episodes both become
-   `memory_episodes`.
+1. Submitted source segments are organized into `memory_episodes`.
 2. Extracted evidence becomes narrative `memory_facts`.
 3. Traceable explicit and inductive propositions live in entity claims.
 4. The legacy actionable-item projection is temporarily disabled while the
@@ -547,18 +546,6 @@ class MemoryNodeManager:
             False,
         )
         self._recall_budget = str(recall_value("recall_budget", "mid") or "mid")
-        configured_source_override = recall_value("retrieval_source_override")
-        if isinstance(configured_source_override, str):
-            configured_source_override = [
-                item.strip()
-                for item in configured_source_override.split(",")
-                if item.strip()
-            ]
-        self._retrieval_source_override = (
-            self._normalize_source_override(configured_source_override)
-            if isinstance(configured_source_override, (list, tuple, set))
-            else None
-        )
         self._recall_mode = str(
             recall_value("recall_mode", "normal") or "normal"
         ).strip().lower()
@@ -820,15 +807,6 @@ class MemoryNodeManager:
             return "https://api.deepseek.com/v1"
         return text or DEFAULT_LLM_BASE_URL
 
-    @staticmethod
-    def _episode_type_for_source_type(source_type: str) -> str:
-        normalized = str(source_type or "").strip().lower()
-        if normalized == "assistant_wakeup":
-            return "interaction"
-        if normalized == "allday_recording":
-            return "ambient_transcript"
-        return normalized or "memory"
-
     # ── Runtime helpers used by benchmark scripts ───────────────────────
 
     def _ensure_embedding_client(self) -> bool:
@@ -1013,7 +991,6 @@ class MemoryNodeManager:
         self,
         *,
         raw_segments: List[Dict[str, Any]],
-        source_type: str,
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
@@ -1030,7 +1007,6 @@ class MemoryNodeManager:
             task_kind="memory_store",
             payload={
                 "raw_segments": raw_segments,
-                "source_type": source_type,
                 "tags": tags,
                 "prompt_language": prompt_language,
             },
@@ -1039,7 +1015,6 @@ class MemoryNodeManager:
     def submit_memory_episode_summary_task(
         self,
         *,
-        source_type: str,
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
@@ -1052,7 +1027,6 @@ class MemoryNodeManager:
         return self._submit_memory_task(
             task_kind="memory_episode_summary",
             payload={
-                "source_type": source_type,
                 "tags": list(tags or []),
                 "prompt_language": prompt_language,
             },
@@ -1061,12 +1035,10 @@ class MemoryNodeManager:
     def _process_memory_episode_summary_task(
         self,
         *,
-        source_type: str,
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
         source_segments = self._db.get_unassigned_memory_source_segments(
-            source_type=source_type,
             limit=240,
         )
         if not source_segments:
@@ -1086,7 +1058,6 @@ class MemoryNodeManager:
             or source_started_at
         )
         facts = self._db.get_unassigned_memory_facts_in_time_window(
-            source_type=source_type,
             started_at=source_started_at,
             ended_at=source_ended_at,
             limit=80,
@@ -1100,8 +1071,7 @@ class MemoryNodeManager:
             return episode_info
         with self._db.transaction():
             episode_id = self._db.insert_episode(
-                source_type=source_type,
-                episode_type=self._episode_type_for_source_type(source_type),
+                episode_type="memory",
                 title=episode_info["title"],
                 summary=episode_info["summary"],
                 participants=episode_info.get("participants") or [],
@@ -1119,7 +1089,6 @@ class MemoryNodeManager:
             )
             self._upsert_episode_recall_document(
                 episode_id=episode_id,
-                source_type=source_type,
                 title=episode_info["title"],
                 summary=episode_info["summary"],
                 participants=episode_info.get("participants") or [],
@@ -1162,7 +1131,6 @@ class MemoryNodeManager:
             "fact_count": attached,
             "source_segment_count": len(source_segments),
             "source_segment_row_count": attached_source_segment_rows,
-            "source_type": source_type,
             "title": episode_info.get("title") or "",
             "topic_items_created": episode_info.get("topic_items_created", 0),
             "topic_items_updated": episode_info.get("topic_items_updated", 0),
@@ -1173,13 +1141,11 @@ class MemoryNodeManager:
         self,
         *,
         raw_segments: List[Dict[str, Any]],
-        source_type: str,
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
         self._log_info("memory_store", "start", {
-            "source_type": source_type,
             "source_segment_count": len(raw_segments),
             "raw_segments": self._build_memory_segments_for_prompt(
                 raw_segments,
@@ -1202,7 +1168,6 @@ class MemoryNodeManager:
             }
         with self._db.transaction():
             source_segment_ids = self._db.insert_memory_source_segments(
-                source_type=source_type,
                 segments=raw_segments,
             )
         extracted_info = self._extract_memory_fact_from_raw_segments(
@@ -1220,7 +1185,6 @@ class MemoryNodeManager:
                 episode_id=None,
                 facts=facts,
                 tags=tags,
-                source_type=source_type,
                 episode_context_topics=None,
                 entity_info=save_entity_info,
             )
@@ -1239,10 +1203,7 @@ class MemoryNodeManager:
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
-        self._log_info("memory_store", "finish", {
-            **report,
-            "source_type": source_type,
-        })
+        self._log_info("memory_store", "finish", report)
         return report
 
     def _store_extracted_memory_entities_into_db(
@@ -1269,7 +1230,6 @@ class MemoryNodeManager:
         object_type: str,
         object_id: int,
         identity_lines: Sequence[str],
-        source_type: str = "",
         title: str = "",
         summary: str = "",
         entity_ids: Optional[Sequence[int]] = None,
@@ -1296,7 +1256,6 @@ class MemoryNodeManager:
             object_id=object_id,
             identity_text=identity_text,
             identity_text_embedding=self._generate_embedding_vector(identity_text),
-            source_type=source_type,
             title=title,
             summary=summary,
             entity_ids=entity_ids,
@@ -1313,7 +1272,6 @@ class MemoryNodeManager:
         self,
         *,
         fact_id: int,
-        source_type: str,
         summary: str,
         keywords: Sequence[str],
         entities: Sequence[str],
@@ -1330,7 +1288,6 @@ class MemoryNodeManager:
         return self._upsert_memory_recall_document(
             object_type="fact",
             object_id=fact_id,
-            source_type=source_type,
             title=_compact_whitespace(summary)[:120],
             summary=summary,
             identity_lines=[
@@ -1353,7 +1310,6 @@ class MemoryNodeManager:
         self,
         *,
         episode_id: int,
-        source_type: str,
         title: str,
         summary: str,
         participants: Sequence[str],
@@ -1366,7 +1322,6 @@ class MemoryNodeManager:
         return self._upsert_memory_recall_document(
             object_type="episode",
             object_id=episode_id,
-            source_type=source_type,
             title=title,
             summary=summary,
             identity_lines=[
@@ -2491,7 +2446,6 @@ class MemoryNodeManager:
         episode_id: Optional[int],
         facts: List[Dict[str, Any]],
         tags: List[str],
-        source_type: str,
         episode_context_topics: Optional[Sequence[str]] = None,
         entity_info: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
@@ -2540,7 +2494,6 @@ class MemoryNodeManager:
             }
             fact_id = self._db.insert_fact(
                 episode_id=episode_id,
-                source_type=source_type,
                 fact_type=fact["fact_type"],
                 summary=fact["summary"],
                 keywords=keywords,
@@ -2556,7 +2509,6 @@ class MemoryNodeManager:
             )
             self._upsert_fact_recall_document(
                 fact_id=fact_id,
-                source_type=source_type,
                 summary=fact["summary"],
                 keywords=keywords,
                 entities=entities,
@@ -3058,7 +3010,6 @@ class MemoryNodeManager:
     def _intent_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": fact.get("id"), "summary": fact.get("summary") or "",
-            "source_type": fact.get("source_type") or "",
             "fact_type": fact.get("fact_type") or "",
             "entities": fact.get("entities") or [],
             "primary_entity": fact.get("primary_entity") or {},
@@ -3385,7 +3336,6 @@ class MemoryNodeManager:
         self._upsert_memory_recall_document(
             object_type=normalized_type,
             object_id=object_id,
-            source_type="prospective",
             title=_compact_whitespace(item.get("summary") or "")[:120],
             summary=_compact_whitespace(item.get("summary") or ""),
             identity_lines=identity_lines,
@@ -3655,7 +3605,6 @@ class MemoryNodeManager:
             self._upsert_memory_recall_document(
                 object_type="entity_claim",
                 object_id=int(claim["id"]),
-                source_type="entity_claim",
                 title=_compact_whitespace(claim.get("claim_text") or "")[:120],
                 summary=_compact_whitespace(claim.get("claim_text") or ""),
                 identity_lines=[
@@ -5065,14 +5014,10 @@ class MemoryNodeManager:
         reference_timestamp: Any,
     ) -> None:
         """Log the independent fact batch consumed by one reflect projection."""
-        source_counts = Counter(
-            str(fact.get("source_type")) for fact in facts
-        )
         self._log_info("memory_reflect", "facts_loaded", {
             "processing_target": processing_target,
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
-            "source_counts": dict(source_counts),
             "limit": limit,
             "reference_timestamp": reference_timestamp,
             "time_start": facts[0].get("dialogue_time_key") if facts else "",
@@ -5644,7 +5589,6 @@ class MemoryNodeManager:
             row: Dict[str, Any] = {
                 "target": f"{item.get('target_table')}#{item.get('target_id')}",
                 "level": item.get("index_level") or item.get("_recall_type"),
-                "source_type": item.get("source_type"),
                 "score": item.get("_recall_score"),
                 "rank": item.get("_recall_rank"),
                 "embedding_similarity": item.get("embedding_similarity"),
@@ -6027,7 +5971,6 @@ class MemoryNodeManager:
                 query=query,
                 tags=tags,
                 time_end=time_end,
-                memory_source_override=self._retrieval_source_override,
                 recall_mode=self._recall_mode,
                 prompt_language=prompt_language,
                 database=reader_db,
@@ -6038,7 +5981,6 @@ class MemoryNodeManager:
         query: str,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        memory_source_override: Optional[Sequence[str]] = None,
         recall_mode: str = "normal",
         prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
@@ -6072,7 +6014,6 @@ class MemoryNodeManager:
                 "tags": tags or [],
                 "requested_time_end": time_end,
                 "time_end": reference_time,
-                "memory_source_override": list(memory_source_override or []),
                 "recall_mode": normalized_recall_mode,
                 "prompt_language": prompt_language,
             })
@@ -6107,7 +6048,6 @@ class MemoryNodeManager:
                     time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
                     reference_time=reference_time,
-                    memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     prompt_language=prompt_language,
                     database=database,
@@ -6117,7 +6057,6 @@ class MemoryNodeManager:
                     time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
                     reference_time=reference_time,
-                    memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     stage1_report=stage1_report,
                     prompt_language=prompt_language,
@@ -6129,7 +6068,6 @@ class MemoryNodeManager:
                     time_stripped_query=time_stripped_query,
                     temporal_bounds=temporal_bounds,
                     reference_time=reference_time,
-                    memory_source_override=memory_source_override,
                     temporal_mode=temporal_mode,
                     prompt_language=prompt_language,
                     database=database,
@@ -6144,7 +6082,6 @@ class MemoryNodeManager:
                         time_stripped_query=time_stripped_query,
                         temporal_bounds=temporal_bounds,
                         reference_time=reference_time,
-                        memory_source_override=memory_source_override,
                         temporal_mode=temporal_mode,
                         stage1_report=stage1_report,
                         prompt_language=prompt_language,
@@ -6190,7 +6127,6 @@ class MemoryNodeManager:
         query_entity_names: Sequence[str],
         direct_object_types: Sequence[str],
         prospective_query_profile: Dict[str, Any],
-        source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         candidate_limits: Dict[str, int],
@@ -6210,7 +6146,6 @@ class MemoryNodeManager:
             terms=seed_search_terms,
             direct_object_types=direct_object_types,
             prospective_query_profile=prospective_query_profile,
-            source_types=source_types,
             temporal_bounds=temporal_bounds,
             temporal_mode=temporal_mode,
             candidate_limits=candidate_limits,
@@ -6223,7 +6158,6 @@ class MemoryNodeManager:
         *,
         terms: Sequence[str],
         direct_object_types: Sequence[str],
-        source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         candidate_limits: Dict[str, int],
@@ -6287,7 +6221,6 @@ class MemoryNodeManager:
                 object_type=object_type,
                 terms=object_terms,
                 statuses=self._recall_stage1_direct_document_statuses(object_type),
-                source_types=source_types if object_type == "fact" else None,
                 time_start=document_time_start,
                 time_end=document_time_end,
                 limit=retrieval_limit,
@@ -6298,7 +6231,6 @@ class MemoryNodeManager:
                 candidate_source=object_candidate_source,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                source_types=source_types,
                 per_type_limit=candidate_limit,
                 database=db,
             ))
@@ -6566,7 +6498,6 @@ class MemoryNodeManager:
         time_stripped_query: str,
         temporal_bounds: RecallTimeBounds,
         reference_time: str,
-        memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
         prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
@@ -6579,7 +6510,6 @@ class MemoryNodeManager:
         to Stage 2 semantic retrieval.
         """
         started_at = time.monotonic()
-        source_types = self._normalize_source_override(memory_source_override)
         terms = self._build_recall_search_terms(
             time_stripped_query,
             keywords=[],
@@ -6623,7 +6553,6 @@ class MemoryNodeManager:
             "time_start": (temporal_bounds or (None, None))[0],
             "time_end": (temporal_bounds or (None, None))[1],
             "temporal_mode": temporal_mode,
-            "memory_source_override": list(memory_source_override or []),
             "candidate_limits": candidate_limits,
             "query_entity_names": query_entity_names,
             "query_modes": query_modes,
@@ -6636,7 +6565,6 @@ class MemoryNodeManager:
             query_entity_names=query_entity_names,
             direct_object_types=direct_object_types,
             prospective_query_profile=prospective_query_profile,
-            source_types=source_types,
             temporal_bounds=temporal_bounds,
             temporal_mode=temporal_mode,
             candidate_limits=seed_candidate_limits,
@@ -6662,7 +6590,6 @@ class MemoryNodeManager:
         association_candidates = (
             self._retrieve_association_candidates_using_seed_candidates(
                 seed_candidates=direct_candidates,
-                source_types=source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
                 limit=association_per_relation_limit,
@@ -6937,7 +6864,6 @@ class MemoryNodeManager:
         self,
         *,
         seed_candidates: Sequence[Dict[str, Any]],
-        source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         limit: int,
@@ -6956,7 +6882,6 @@ class MemoryNodeManager:
         document_evidence_candidates = (
             self._retrieve_evidence_fact_association_candidates(
                 direct_candidates=seed_candidates,
-                source_types=source_types,
                 candidate_source_prefix=candidate_source_prefix,
                 database=db,
             )
@@ -6964,7 +6889,6 @@ class MemoryNodeManager:
         same_episode_candidates = (
             self._retrieve_same_episode_fact_association_candidates(
                 seed_candidates=seed_candidates,
-                source_types=source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
                 limit=limit,
@@ -6978,7 +6902,6 @@ class MemoryNodeManager:
         self,
         *,
         seed_candidates: Sequence[Dict[str, Any]],
-        source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         limit: int,
@@ -7025,14 +6948,11 @@ class MemoryNodeManager:
         if not related_scores:
             return []
 
-        allowed_sources = set(source_types or [])
         expanded: List[Dict[str, Any]] = []
         for fact in database.get_memory_facts_by_ids(list(related_scores)):
             fact_id = int(fact.get("id") or 0)
             relation_info = related_scores.get(fact_id)
             if not relation_info:
-                continue
-            if allowed_sources and fact.get("source_type") not in allowed_sources:
                 continue
             relation, propagated_score = relation_info
             candidate = self._make_recall_document_candidate(
@@ -7077,7 +6997,6 @@ class MemoryNodeManager:
         self,
         *,
         direct_candidates: Sequence[Dict[str, Any]],
-        source_types: Optional[Sequence[str]],
         candidate_source_prefix: str,
         database: SessionDB,
     ) -> List[Dict[str, Any]]:
@@ -7140,14 +7059,11 @@ class MemoryNodeManager:
         if not evidence_by_fact_id:
             return []
 
-        allowed_sources = set(source_types or [])
         candidates: List[Dict[str, Any]] = []
         for fact in database.get_memory_facts_by_ids(list(evidence_by_fact_id)):
             fact_id = int(fact.get("id") or 0)
             relation_info = evidence_by_fact_id.get(fact_id)
             if not relation_info:
-                continue
-            if allowed_sources and fact.get("source_type") not in allowed_sources:
                 continue
             relation, propagated_score = relation_info
             candidate = self._make_recall_document_candidate(
@@ -8390,7 +8306,6 @@ class MemoryNodeManager:
         prospective_query_profile: Dict[str, Any],
         search_terms: Sequence[str],
         query_embedding: Optional[np.ndarray],
-        source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         seed_channel_limits: Dict[str, Dict[str, int]],
@@ -8415,7 +8330,6 @@ class MemoryNodeManager:
             self._retrieve_recall_document_lexical_seed_candidates(
                 terms=list(search_terms),
                 direct_object_types=direct_object_types,
-                source_types=source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
                 candidate_limits=lexical_candidate_limits,
@@ -8431,7 +8345,6 @@ class MemoryNodeManager:
         embedding_candidates = self._retrieve_recall_document_embedding_seed_candidates(
             query_embedding=query_embedding,
             direct_object_types=direct_object_types,
-            source_types=source_types,
             temporal_bounds=temporal_bounds,
             temporal_mode=temporal_mode,
             candidate_limits=embedding_candidate_limits,
@@ -8450,7 +8363,6 @@ class MemoryNodeManager:
         *,
         query_embedding: Optional[np.ndarray],
         direct_object_types: Sequence[str],
-        source_types: Optional[Sequence[str]],
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         candidate_limits: Dict[str, int],
@@ -8482,7 +8394,6 @@ class MemoryNodeManager:
             rows = db.memory_recall_documents_with_identity_embeddings(
                 object_type=object_type,
                 statuses=self._recall_stage1_direct_document_statuses(object_type),
-                source_types=source_types if object_type == "fact" else None,
             )
             ranked_rows: List[Tuple[float, Dict[str, Any]]] = []
             for row in rows:
@@ -8521,7 +8432,6 @@ class MemoryNodeManager:
                 candidate_source=candidate_source,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                source_types=source_types,
                 per_type_limit=candidate_limit,
                 database=db,
             )
@@ -8587,7 +8497,6 @@ class MemoryNodeManager:
         time_stripped_query: str,
         temporal_bounds: RecallTimeBounds,
         reference_time: str,
-        memory_source_override: Optional[Sequence[str]] = None,
         temporal_mode: str = "dialogue_time",
         stage1_report: Optional[Dict[str, Any]] = None,
         prompt_language: str = "zh",
@@ -8619,7 +8528,6 @@ class MemoryNodeManager:
             "fallback_temporal_mode": fallback_temporal_mode,
             "reference_time": analysis_reference_time,
             "prompt_language": prompt_language,
-            "memory_source_override": list(memory_source_override or []),
         })
         query_analysis_info = self._analyze_recall_query(
             original_query,
@@ -8635,10 +8543,6 @@ class MemoryNodeManager:
         )
         temporal_bounds = temporal_resolution["effective_temporal_bounds"]
         temporal_mode = temporal_resolution["effective_temporal_mode"]
-        forced_source_types = self._normalize_source_override(memory_source_override)
-        preferred_source_types = forced_source_types or self._normalize_source_override(
-            query_analysis_info.get("source_types") or []
-        )
         llm_keywords = self._normalize_string_list(
             query_analysis_info.get("keywords"),
             limit=12,
@@ -8716,8 +8620,6 @@ class MemoryNodeManager:
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "query_analysis_info": query_analysis_info,
             "temporal_resolution": temporal_resolution,
-            "forced_source_types": forced_source_types or [],
-            "preferred_source_types": preferred_source_types or [],
             "keywords": llm_keywords,
             "entities": llm_entities,
             "direct_object_types": direct_object_types,
@@ -8747,7 +8649,6 @@ class MemoryNodeManager:
             prospective_query_profile=prospective_query_profile,
             search_terms=search_terms,
             query_embedding=query_identity_embedding,
-            source_types=preferred_source_types,
             temporal_bounds=temporal_bounds,
             temporal_mode=temporal_mode,
             seed_channel_limits=seed_channel_limits,
@@ -8773,7 +8674,6 @@ class MemoryNodeManager:
         association_candidates = (
             self._retrieve_association_candidates_using_seed_candidates(
                 seed_candidates=direct_candidates,
-                source_types=preferred_source_types,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
                 limit=association_per_relation_limit,
@@ -8819,7 +8719,6 @@ class MemoryNodeManager:
         candidate_source: str,
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
-        source_types: Optional[Sequence[str]],
         per_type_limit: int,
         database: SessionDB,
     ) -> List[Dict[str, Any]]:
@@ -8835,7 +8734,6 @@ class MemoryNodeManager:
                 candidate_source=candidate_source,
                 temporal_bounds=temporal_bounds,
                 temporal_mode=temporal_mode,
-                source_types=source_types,
                 database=database,
             )
             if candidate:
@@ -8852,7 +8750,6 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str = "dialogue_time",
         entity_names_by_id: Optional[Dict[int, str]] = None,
-        source_types: Optional[Sequence[str]] = None,
         database: Optional[SessionDB] = None,
     ) -> Optional[Dict[str, Any]]:
         """Convert a hydrated recall object into the shared candidate shape."""
@@ -8876,9 +8773,6 @@ class MemoryNodeManager:
                 fact_row = dict(fact_rows[0])
                 fact_row["_bm25_score"] = row.get("_bm25_score")
                 row = fact_row
-            allowed_sources = set(source_types or [])
-            if allowed_sources and row.get("source_type") not in allowed_sources:
-                return None
             try:
                 target_id = int(row.get("id"))
             except (TypeError, ValueError):
@@ -8897,7 +8791,6 @@ class MemoryNodeManager:
                 return None
             if query_end and time_start and time_start > str(query_end):
                 return None
-            source_type = row.get("source_type")
             hydrated = dict(row)
             hydrated.pop("episode_id", None)
             hydrated.pop("embedding", None)
@@ -8906,11 +8799,10 @@ class MemoryNodeManager:
             metadata = dict(row.get("metadata") or {})
             metadata["_matched_via"] = [candidate_source]
             return {
-                "source_type": source_type,
                 "target_table": "memory_facts",
                 "target_id": target_id,
                 "index_level": "fact",
-                "memory_path": f"{source_type}/fact",
+                "memory_path": "fact",
                 "title": _compact_whitespace(row.get("summary") or "")[:120],
                 "summary_for_retrieval": _compact_whitespace(
                     row.get("summary") or ""
@@ -8974,11 +8866,10 @@ class MemoryNodeManager:
         if temporal_match:
             metadata["_recall_temporal_match"] = temporal_match
         candidate = {
-            "source_type": str(row.get("source_type") or object_type),
             "target_table": target_table,
             "target_id": target_id,
             "index_level": object_type,
-            "memory_path": f"{row.get('source_type') or object_type}/{object_type}",
+            "memory_path": object_type,
             "title": _compact_whitespace(row.get("title") or row.get("summary") or "")[:120],
             "summary_for_retrieval": _compact_whitespace(row.get("summary") or ""),
             "identity_text": _compact_whitespace(row.get("identity_text") or ""),
@@ -9447,25 +9338,6 @@ class MemoryNodeManager:
                 for index in range(len(token) - 1):
                     add(token[index : index + 2])
         return values
-
-    def _normalize_source_override(self, value: Optional[Sequence[str]]) -> Optional[List[str]]:
-        if not value:
-            return None
-        aliases = {
-            "assistant": "assistant_wakeup",
-            "interaction": "assistant_wakeup",
-            "assistant_wakeup": "assistant_wakeup",
-            "allday": "allday_recording",
-            "all_day": "allday_recording",
-            "transcript": "allday_recording",
-            "allday_recording": "allday_recording",
-        }
-        out: List[str] = []
-        for item in value:
-            normalized = aliases.get(str(item or "").strip().lower())
-            if normalized and normalized not in out:
-                out.append(normalized)
-        return out or None
 
     def _recall_context_char_budget(self, budget: str) -> int:
         return int(

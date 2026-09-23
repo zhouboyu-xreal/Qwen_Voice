@@ -476,7 +476,6 @@ Memory structure:
 4. `episode`: a continuous-experience summary used only as an association boundary between facts. It must never be a direct recall object.
 
 Guidance:
-- Use `source_types` only when the query clearly points to assistant_wakeup interactions or allday_recording transcripts. Otherwise use both.
 - `recall_object_types` lists object types eligible for direct retrieval. It must always include `fact`; add `entity_claim` only for explicit stable-entity-knowledge questions; add the relevant `goal`, `plan`, or `work_item` only for future goals, arrangements, responsibilities, deadlines, unfinished work, or their lifecycle. Never output `episode`.
 - Prefer `fact` for what happened, dates, places, people, exact evidence, event order, and traceable details.
 - For stable preferences, durable constraints, routines, relationships, or profiles, add `entity_claim` alongside the supporting facts.
@@ -490,7 +489,6 @@ Guidance:
 
 Return JSON only:
 {
-  "source_types": ["assistant_wakeup", "allday_recording"],
   "recall_object_types": ["fact"],
   "needs_broad_evidence": false,
   "query_rewrite": "retrieval-focused rewrite over the unified memory projection",

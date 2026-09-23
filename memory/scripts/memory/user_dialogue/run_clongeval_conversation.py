@@ -344,16 +344,9 @@ def replay_context_into_memory(
     reflect_runs = 0
     reflect_reports: List[Dict[str, Any]] = []
     last_reflected_day = 0
+    last_turn_timestamp: Optional[datetime] = None
+    ambient_watermark_updates = 0
     every_days = max(1, int(reflect_every_days or 1))
-
-    def flush_pending_store_turns() -> bool:
-        nonlocal store_batches
-        pending_before_flush = len(runtime.get_pending_interaction_turns())
-        stored = bool(pending_before_flush and runtime.flush_pending_memory_inputs())
-        if stored and not runtime.has_pending_interaction_turns():
-            store_batches += 1
-            return True
-        return False
 
     for day_index, day in enumerate(days, 1):
         for pair_index, (user, assistant) in enumerate(day["pairs"]):
@@ -362,17 +355,24 @@ def replay_context_into_memory(
                 day["date"] + timedelta(seconds=pair_index),
                 seen_timestamps,
             )
-            store_report = runtime.accept_single_interaction_turn(
-                user,
-                assistant,
+            store_report = runtime.accept_memory_input(
+                interaction_turn={
+                    "user_message": user,
+                    "assistant_response": assistant,
+                    "turn_timestamp": turn_timestamp,
+                },
                 tags=[
                     "clongeval_conversation",
                     f"context_group:{group_id}",
                     f"date:{day['date_text']}",
                     f"day_index:{day_index}",
                 ],
-                turn_timestamp=turn_timestamp,
+                # Exercise the delayed-ASR path: each interaction stays in
+                # the context manager's awaiting buffer until this benchmark
+                # advances the simulated ambient-ASR watermark.
+                ambient_recording_enabled=True,
             )
+            last_turn_timestamp = turn_timestamp
             if store_report.get("queued"):
                 store_batches += 1
 
@@ -380,6 +380,16 @@ def replay_context_into_memory(
             day_index % every_days == 0 or day_index == len(days)
         )
         if should_reflect:
+            # Reflection creates an explicit partial boundary.  Advance
+            # coverage through the final turn of this day before flushing, so
+            # the flush does not need to force-release delayed input.
+            watermark_report = runtime.update_ambient_asr_watermark(
+                last_turn_timestamp,
+                evaluate_episode_summary=False,
+            )
+            ambient_watermark_updates += 1
+            if watermark_report.get("queued"):
+                store_batches += 1
             # Facts are filtered by their local DB created_at date. Keep this
             # wall-clock timestamp separate from the benchmark dialogue time.
             reflect_timestamp = datetime.now().astimezone().isoformat()
@@ -388,7 +398,6 @@ def replay_context_into_memory(
             )
             episode_summary_submit = runtime.trigger_memory_episode_summary(
                 reason="clongeval_reflect",
-                source_type="assistant_wakeup",
                 tags=[
                     "clongeval_conversation",
                     f"context_group:{group_id}",
@@ -402,7 +411,7 @@ def replay_context_into_memory(
             )
             if episode_input_flush:
                 store_batches += 1
-            if (reflect_submit.get("pending_interaction_flush") or {}).get("queued"):
+            if (reflect_submit.get("pending_memory_input_flush") or {}).get("queued"):
                 store_batches += 1
             if (
                 episode_summary_submit.get("queued") or reflect_submit.get("queued")
@@ -413,18 +422,29 @@ def replay_context_into_memory(
             reflect_reports.append({
                 "day_index": day_index,
                 "date": day["date_text"],
+                "ambient_watermark": watermark_report,
                 "episode_summary": episode_summary_submit,
                 "report": reflect_submit,
             })
 
-    if runtime.has_pending_interaction_turns():
-        flush_pending_store_turns()
+    # The normal benchmark path reaches this point only after every
+    # interaction has entered the runtime.  One final watermark advance
+    # releases all remaining delayed input through the same append path.
+    if last_turn_timestamp is not None:
+        watermark_report = runtime.update_ambient_asr_watermark(
+            last_turn_timestamp,
+        )
+        ambient_watermark_updates += 1
+        if watermark_report.get("queued"):
+            store_batches += 1
+    runtime.flush_pending_memory_inputs()
 
     return {
         "parsed_days": len(days),
         "turn_pairs": pair_count,
         "store_batches": store_batches,
         "reflect_runs": reflect_runs,
+        "ambient_watermark_updates": ambient_watermark_updates,
         "last_reflected_day": last_reflected_day,
         "reflect_reports": reflect_reports,
         "db_counts": db_counts(db),
@@ -495,14 +515,15 @@ def prepare_runtime(
     args.recall_mode = str(
         memory_manager_config.get("recall_mode", "normal") or "normal"
     ).strip().lower()
-    segmentation_config = memory_runtime_config.setdefault(
-        "assistant_wakeup_segmentation",
+    memory_input_config = memory_runtime_config.setdefault(
+        "memory_context_manager",
         {},
     )
+    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
     if args.max_pending_interaction_turns is not None:
-        segmentation_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
+        segmentation_config["max_pending_units"] = args.max_pending_interaction_turns
     if args.max_pending_interaction_tokens is not None:
-        segmentation_config["max_pending_interaction_tokens"] = args.max_pending_interaction_tokens
+        segmentation_config["max_pending_tokens"] = args.max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")

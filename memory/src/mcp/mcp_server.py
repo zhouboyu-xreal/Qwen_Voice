@@ -151,12 +151,12 @@ class MemoryMCPService:
         segments = list(voice_report.get("segments") or [])
         asr_result_path = self._save_asr_result(voice_report)
         store_reports: List[Dict[str, Any]] = []
-        for segment in segments:
+        if segments:
             store_reports.append(
-                self.memory_runtime.accept_single_transcript_segment(
-                    segment,
-                    source_type=source,
+                self.memory_runtime.accept_memory_input(
+                    transcript_segments=segments,
                     tags=tags,
+                    ambient_recording_enabled=(source == "allday_recording"),
                 )
             )
 

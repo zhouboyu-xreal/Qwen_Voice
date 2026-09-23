@@ -29,7 +29,7 @@ Sidecar 默认追加运行日志到
 当前版本实现 qwen-audio-agent `MemoryProvider` v2 的 session-observation 路径：
 
 1. Gateway 断开会话时，把已确认的 user/assistant 对话交给 sidecar；
-2. Sidecar 调用 `MemoryRuntime.accept_single_interaction_turn()`；
+2. Sidecar 调用统一的 `MemoryRuntime.accept_memory_input()`；
 3. `flush()` 提交缓冲内容并在同一串行队列中安排 reflect；
 4. `query()` 直接调用 `MemoryRuntime.trigger_memory_recall()`，读取最新已提交快照。
 

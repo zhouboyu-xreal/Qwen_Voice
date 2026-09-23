@@ -34,8 +34,8 @@ from memory.config import split_memory_config
 from memory.embedding_client import EmbeddingClient
 from memory.memory_runtime import (
     OnlineSegmentExchange,
-    OnlineSegmentationConfig,
-    OnlineSemanticSegmenter,
+    MemoryContextMangerConfig,
+    MemoryContextManager,
     SegmentDecision as MemorySegmentDecision,
 )
 
@@ -322,9 +322,12 @@ def round_float(value: Optional[float], digits: int = 6) -> Optional[float]:
     return round(float(value), digits)
 
 
-def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationConfig:
+def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerConfig:
     runtime_config, _manager_config = split_memory_config(load_project_config(args.config))
-    segmentation_config = runtime_config.get("assistant_wakeup_segmentation")
+    memory_input_config = runtime_config.get("memory_context_manager")
+    if not isinstance(memory_input_config, dict):
+        memory_input_config = {}
+    segmentation_config = memory_input_config.get("fact_extraction")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
     values = dict(segmentation_config)
@@ -338,10 +341,10 @@ def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationCon
         "cohesion_drop_weight": args.cohesion_drop_weight,
         "length_weight": args.length_weight,
         "turn_count_weight": args.turn_count_weight,
-        "max_pending_interaction_turns": args.max_pending_turns,
-        "max_pending_interaction_tokens": args.max_pending_tokens,
-        "min_pending_interaction_tokens": args.min_pending_tokens,
-        "min_pending_interaction_turns": args.min_pending_turns,
+        "max_pending_units": args.max_pending_turns,
+        "max_pending_tokens": args.max_pending_tokens,
+        "min_pending_tokens": args.min_pending_tokens,
+        "min_pending_units": args.min_pending_turns,
         "min_segment_override_probability": args.min_segment_override_probability,
         "max_time_gap_seconds": args.max_time_gap_seconds,
     }
@@ -351,7 +354,7 @@ def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationCon
         value = values.get(key)
         return default if value in (None, "") else value
 
-    return OnlineSegmentationConfig(
+    return MemoryContextMangerConfig(
         threshold=float(number("threshold", 0.60)),
         bias=float(number("bias", -1.10)),
         surprise_history_window=max(1, int(number("surprise_history_window", 64))),
@@ -361,14 +364,27 @@ def build_segmentation_config(args: argparse.Namespace) -> OnlineSegmentationCon
         cohesion_drop_weight=float(number("cohesion_drop_weight", 0.8)),
         length_weight=float(number("length_weight", 0.40)),
         turn_count_weight=float(number("turn_count_weight", 0.40)),
-        max_pending_turns=max(1, int(number("max_pending_interaction_turns", 5))),
-        max_pending_tokens=max(1, int(number("max_pending_interaction_tokens", 500))),
-        min_pending_tokens=max(1, int(number("min_pending_interaction_tokens", 100))),
-        min_pending_turns=max(1, int(number("min_pending_interaction_turns", 2))),
+        max_pending_turns=max(1, int(number("max_pending_units", 40))),
+        max_pending_tokens=max(1, int(number("max_pending_tokens", 1000))),
+        max_pending_chars=max(0, int(number("max_pending_chars", 0))),
+        min_pending_tokens=max(1, int(number("min_pending_tokens", 200))),
+        min_pending_turns=max(1, int(number("min_pending_units", 4))),
         min_segment_override_probability=float(
             number("min_segment_override_probability", 0.90)
         ),
         max_time_gap_seconds=float(number("max_time_gap_seconds", -1.0)),
+        enforce_min_pending_tokens=bool(
+            values.get("enforce_min_pending_tokens", True)
+        ),
+        rolling_window_enabled=bool(values.get("rolling_window_enabled", False)),
+        rolling_window_tail_units=max(
+            0,
+            int(number("rolling_window_tail_units", 0)),
+        ),
+        min_boundary_scoring_incoming_tokens=max(
+            0,
+            int(number("min_boundary_scoring_incoming_tokens", 0)),
+        ),
     )
 
 
@@ -482,13 +498,13 @@ def segment_context_group(
     context: str,
     records: Sequence[Dict[str, Any]],
     embedding_client: EmbeddingClient,
-    segmentation_config: OnlineSegmentationConfig,
+    segmentation_config: MemoryContextMangerConfig,
     include_text: bool,
 ) -> Dict[str, Any]:
     group_id = context_group_id(context, group_index)
     days = parse_context_days(context)
     exchanges = build_exchanges(days)
-    segmenter = OnlineSemanticSegmenter(embedding_client, segmentation_config)
+    segmenter = MemoryContextManager(embedding_client, segmentation_config)
     exchange_by_index = {exchange.index: exchange for exchange in exchanges}
     segments: List[FinalizedSegment] = []
     last_scoring_decision: Optional[MemorySegmentDecision] = None

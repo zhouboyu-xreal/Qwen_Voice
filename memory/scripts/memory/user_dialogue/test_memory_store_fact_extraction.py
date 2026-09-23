@@ -415,7 +415,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help=(
             "Extract facts once per N completed turns. Defaults to "
-            "memory_runtime.max_pending_interaction_turns from config.yaml."
+            "memory_runtime.memory_context_manager.fact_extraction."
+            "max_pending_units from "
+            "config.yaml."
         ),
     )
     parser.add_argument(
@@ -423,7 +425,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help=(
             "Extract facts early when pending dialogue exceeds this many "
-            "tokens. Defaults to memory_runtime.assistant_wakeup_segmentation."
+            "tokens. Defaults to memory_runtime.memory_context_manager."
+            "fact_extraction."
         ),
     )
     parser.add_argument(
@@ -488,7 +491,10 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     _runtime_config, _manager_config = split_memory_config(config)
     llm_config = _manager_config["llm"]
-    segmentation_config = _runtime_config.get("assistant_wakeup_segmentation")
+    memory_input_config = _runtime_config.get("memory_context_manager")
+    if not isinstance(memory_input_config, dict):
+        memory_input_config = {}
+    segmentation_config = memory_input_config.get("fact_extraction")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
     args.llm_model = (
@@ -516,7 +522,7 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         1,
         int(
             args.max_pending_interaction_turns
-            or segmentation_config.get("max_pending_interaction_turns", 1)
+            or segmentation_config.get("max_pending_units", 1)
             or 1
         ),
     )
@@ -524,7 +530,7 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
         1,
         int(
             args.max_pending_interaction_tokens
-            or segmentation_config.get("max_pending_interaction_tokens", 500)
+            or segmentation_config.get("max_pending_tokens", 500)
             or 500
         ),
     )
@@ -670,12 +676,13 @@ def main() -> int:
     ) = split_memory_config(config)
     llm_config = memory_manager_config["llm"]
     embedding_config = memory_manager_config["embedding"]
-    segmentation_config = memory_runtime_config.setdefault(
-        "assistant_wakeup_segmentation",
+    memory_input_config = memory_runtime_config.setdefault(
+        "memory_context_manager",
         {},
     )
-    segmentation_config["max_pending_interaction_turns"] = args.max_pending_interaction_turns
-    segmentation_config["max_pending_interaction_tokens"] = args.max_pending_interaction_tokens
+    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
+    segmentation_config["max_pending_units"] = args.max_pending_interaction_turns
+    segmentation_config["max_pending_tokens"] = args.max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")

@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Read Eval_Ali TextGrid intervals in time order and store them as "
-            "ambient transcript memory episodes."
+            "ambient transcript memory inputs."
         )
     )
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
@@ -63,11 +63,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--db-name", default="memory.db")
     parser.add_argument("--session-start", default="", help="ISO timestamp used as audio time zero.")
-    parser.add_argument("--source-type", default="allday_recording")
-    parser.add_argument("--max-pending-transcript-units", type=int, default=0)
-    parser.add_argument("--max-pending-transcript-tokens", type=int, default=0)
-    parser.add_argument("--min-pending-transcript-units", type=int, default=0)
-    parser.add_argument("--min-pending-transcript-tokens", type=int, default=0)
+    parser.add_argument("--max-pending-memory-input-units", type=int, default=0)
+    parser.add_argument("--max-pending-memory-input-tokens", type=int, default=0)
+    parser.add_argument("--min-pending-memory-input-units", type=int, default=0)
+    parser.add_argument("--min-pending-memory-input-tokens", type=int, default=0)
     parser.add_argument("--max-gap-seconds", type=float, default=-1.0)
     parser.add_argument("--enable-reflect", action="store_true", help="Run memory reflection after storing episodes.")
     parser.add_argument("--disable-llm", action="store_true", help="Use heuristic fallback extraction only.")
@@ -89,32 +88,41 @@ def main() -> None:
     embedding_config = memory_manager_config["embedding"]
     if args.disable_llm:
         llm_config["llm_api_key"] = ""
-    transcript_segmentation_config = memory_runtime_config.setdefault(
-        "allday_recording_segmentation",
+    memory_input_config = memory_runtime_config.setdefault(
+        "memory_context_manager",
         {},
     )
-    if not isinstance(transcript_segmentation_config, dict):
+    if not isinstance(memory_input_config, dict):
         raise ValueError(
-            "memory_runtime.allday_recording_segmentation must be a mapping",
+            "memory_runtime.memory_context_manager must be a mapping",
         )
-    if args.max_pending_transcript_units:
-        transcript_segmentation_config["max_pending_transcript_units"] = (
-            args.max_pending_transcript_units
+    memory_context_manager_config = memory_input_config.setdefault(
+        "fact_extraction",
+        {},
+    )
+    if not isinstance(memory_context_manager_config, dict):
+        raise ValueError(
+            "memory_runtime.memory_context_manager.fact_extraction "
+            "must be a mapping",
         )
-    if args.max_pending_transcript_tokens:
-        transcript_segmentation_config["max_pending_transcript_tokens"] = (
-            args.max_pending_transcript_tokens
+    if args.max_pending_memory_input_units:
+        memory_context_manager_config["max_pending_units"] = (
+            args.max_pending_memory_input_units
         )
-    if args.min_pending_transcript_units:
-        transcript_segmentation_config["min_pending_transcript_units"] = (
-            args.min_pending_transcript_units
+    if args.max_pending_memory_input_tokens:
+        memory_context_manager_config["max_pending_tokens"] = (
+            args.max_pending_memory_input_tokens
         )
-    if args.min_pending_transcript_tokens:
-        transcript_segmentation_config["min_pending_transcript_tokens"] = (
-            args.min_pending_transcript_tokens
+    if args.min_pending_memory_input_units:
+        memory_context_manager_config["min_pending_units"] = (
+            args.min_pending_memory_input_units
+        )
+    if args.min_pending_memory_input_tokens:
+        memory_context_manager_config["min_pending_tokens"] = (
+            args.min_pending_memory_input_tokens
         )
     if args.max_gap_seconds >= 0:
-        transcript_segmentation_config["max_time_gap_seconds"] = args.max_gap_seconds
+        memory_context_manager_config["max_time_gap_seconds"] = args.max_gap_seconds
 
     textgrid_path = args.textgrid.expanduser().resolve()
     if not textgrid_path.exists():
@@ -156,22 +164,32 @@ def main() -> None:
         logger=memory_logger,
     )
 
-    queued_episode_count = 0
+    queued_memory_store_count = 0
     for segment_index, segment in enumerate(memory_segments, 1):
-        ok = runtime.accept_single_transcript_segment(
-            segment,
-            source_type=args.source_type,
+        input_report = runtime.accept_memory_input(
+            transcript_segments=[segment],
             tags=["Eval_Ali", textgrid_path.stem],
+            ambient_recording_enabled=True,
         )
-        queued_episode_count += int(bool(ok.get("queued")))
-        if ok.get("queued"):
+        queued_memory_store_count += int(bool(input_report.get("queued")))
+        if input_report.get("queued"):
             logging.info(
-                "Queued transcript episode while processing segment %s/%s",
+                "Queued memory input batch while processing transcript segment %s/%s",
                 segment_index,
                 len(memory_segments),
             )
 
+    final_input_flush = runtime.flush_pending_memory_inputs(
+        evaluate_episode_summary=False,
+    )
+    queued_memory_store_count += int(final_input_flush)
+    episode_summary_result = runtime.trigger_memory_episode_summary(
+        reason="ali_eval_complete",
+        tags=["Eval_Ali", textgrid_path.stem],
+    )
+
     reflect_result: Dict[str, Any] = {}
+    reflect_submit: Dict[str, Any] = {}
     if args.enable_reflect:
         reflect_timestamp = (
             memory_segments[-1].get("ended_at")
@@ -181,30 +199,27 @@ def main() -> None:
         reflect_submit = runtime.trigger_memory_reflect(
             reflect_timestamp=reflect_timestamp,
         )
-        if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining queued memory reflect")
+        queued_memory_store_count += int(
+            bool((reflect_submit.get("pending_memory_input_flush") or {}).get("queued"))
+        )
+
+    if (
+        queued_memory_store_count
+        or episode_summary_result.get("queued")
+        or reflect_submit.get("queued")
+    ) and not runtime.wait_for_memory_tasks():
+        raise RuntimeError("Timed out while draining queued memory tasks")
+
+    if args.enable_reflect:
         reflect_result = operation_reporter.latest_report("memory_reflect") or reflect_submit
-        queued_episode_count += int(
-            bool((reflect_submit.get("pending_transcript_flush") or {}).get("queued"))
-        )
         logging.info("Reflect result: %s", reflect_result)
-    else:
-        pending_transcript_count = (
-            len(runtime._transcript_segmenter.pending_unit_snapshot())
-            + int(runtime._transcript_utterance_assembler.has_pending_segments())
-        )
-        runtime.flush_pending_memory_inputs()
-        queued_episode_count += int(
-            pending_transcript_count > 0
-            and not runtime._transcript_segmenter.has_pending_units()
-            and not runtime._transcript_utterance_assembler.has_pending_segments()
-        )
     store_operation_report = operation_reporter.operation_report("memory_store")
     logging.info(
-        "Transcript input complete segments=%s pending=%s queued_episodes=%s stored_episodes=%s",
+        "Transcript input complete segments=%s pending=%s queued_memory_stores=%s "
+        "stored_memory_stores=%s",
         len(memory_segments),
-        len(runtime._transcript_segmenter.pending_unit_snapshot()),
-        queued_episode_count,
+        len(runtime._memory_input_segmenter.pending_unit_snapshot()),
+        queued_memory_store_count,
         store_operation_report["succeeded"],
     )
 
@@ -214,12 +229,13 @@ def main() -> None:
         "transcript_path": str(transcript_path),
         "memory_log_path": str(memory_log_path),
         "segment_count": len(memory_segments),
-        "queued_episode_count": queued_episode_count,
-        "stored_episode_count": store_operation_report["succeeded"],
+        "queued_memory_store_count": queued_memory_store_count,
+        "stored_memory_store_count": store_operation_report["succeeded"],
         "store_operation_report": store_operation_report,
         "memory_operation_report": operation_reporter.snapshot(),
-        "source_type": args.source_type,
+        "ambient_recording_enabled": True,
         "session_start": session_start.isoformat(),
+        "episode_summary_result": episode_summary_result,
         "reflect_result": reflect_result,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

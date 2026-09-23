@@ -143,56 +143,39 @@ memory_mcp_server:
 memory_runtime:
   memory_prompt_language_mode: zh
   memory_output_language_mode: zh
-  assistant_wakeup_segmentation:
-    max_pending_interaction_turns: 10
-    max_pending_interaction_tokens: 500
-    min_pending_interaction_turns: 2
-    min_pending_interaction_tokens: 200
-    max_time_gap_seconds: 30
-    episode_summary_max_duration_seconds: 1800.0
-    episode_summary_max_tokens: 6000
-    episode_summary_min_tokens_for_duration: 1000
-
-    threshold: 0.6
-    bias: -1.1
-    surprise_history_window: 64
-    min_surprise_history: 5
-    robust_surprise_weight: 0.8
-    absolute_surprise_weight: 0.8
-    cohesion_drop_weight: 0.8
-    length_weight: 0.40
-    turn_count_weight: 0.4
-
-  allday_recording_segmentation:
-    max_pending_transcript_units: 40
-    max_pending_transcript_tokens: 1000
-    min_pending_transcript_units: 4
-    min_pending_transcript_tokens: 200
-    max_time_gap_seconds: 60.0
-    episode_summary_max_duration_seconds: 3600.0
-    episode_summary_max_tokens: 8000
-    episode_summary_min_tokens_for_duration: 1500
-    
+  transcript_unit_aggregation:
     segment_merge_max_gap_seconds: 1.0
     min_transcript_unit_tokens: 40
     max_transcript_unit_tokens: 120
     max_transcript_unit_duration_seconds: 20.0
     short_fragment_max_tokens: 8
-    min_boundary_scoring_incoming_tokens: 5
-    rolling_window_enabled: true
-    rolling_window_tail_units: 3
-    
-    threshold: 0.6
-    bias: -1.1
-    surprise_history_window: 64
-    min_surprise_history: 5
-    robust_surprise_weight: 0.8
-    absolute_surprise_weight: 0.8
-    cohesion_drop_weight: 0.8
-    length_weight: 0.4
-    turn_count_weight: 0.4
 
-    log_decisions: true
+  memory_context_manager:
+    fact_extraction:
+      max_pending_units: 40
+      max_pending_tokens: 1000
+      min_pending_units: 4
+      min_pending_tokens: 200
+      enforce_min_pending_tokens: true
+      max_time_gap_seconds: 60.0
+      min_boundary_scoring_incoming_tokens: 5
+      rolling_window_enabled: true
+      rolling_window_tail_units: 3
+
+      threshold: 0.6
+      bias: -1.1
+      surprise_history_window: 64
+      min_surprise_history: 5
+      robust_surprise_weight: 0.8
+      absolute_surprise_weight: 0.8
+      cohesion_drop_weight: 0.8
+      length_weight: 0.4
+      turn_count_weight: 0.4
+    episode_summary:
+      max_duration_seconds: 1800.0
+      max_tokens: 6000
+      min_tokens_for_duration: 1000
+  log_segmentation_decisions: true
 
 memory_manager:
   memory_enabled: true
@@ -232,8 +215,6 @@ memory_manager:
     recall_top_k: 8
     recall_budget: mid
     recall_mode: normal
-    retrieval_source_override:
-
     recall_detailed_logging: true
     recall_stage1:
       recall_stage1_entity_matched_score: 0.30

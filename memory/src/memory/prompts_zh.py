@@ -556,7 +556,6 @@ RECALL_QUERY_ANALYSIS_PROMPT_ZH = """你是 AI 眼镜长期记忆系统中的 re
 
 只返回 JSON：
 {
-  "source_types": ["assistant_wakeup", "allday_recording"],
   "recall_object_types": ["fact"],
   "needs_broad_evidence": false,
   "query_rewrite": "面向统一记忆检索的改写",

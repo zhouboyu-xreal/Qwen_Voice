@@ -222,7 +222,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override memory_runtime.max_pending_interaction_turns from config.yaml. "
+            "Override memory_runtime.memory_context_manager.fact_extraction."
+            "max_pending_units "
+            "from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -231,7 +233,9 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help=(
-            "Override memory_runtime.max_pending_interaction_tokens from config.yaml. "
+            "Override memory_runtime.memory_context_manager.fact_extraction."
+            "max_pending_tokens "
+            "from config.yaml. "
             "When omitted, use the config.yaml value."
         ),
     )
@@ -635,13 +639,14 @@ def prepare_runtime_configs(
     memory_runtime_config, memory_manager_config = split_memory_config(config)
     llm_config = memory_manager_config["llm"]
     embedding_config = memory_manager_config["embedding"]
-    segmentation_config = memory_runtime_config.setdefault(
-        "assistant_wakeup_segmentation",
+    memory_input_config = memory_runtime_config.setdefault(
+        "memory_context_manager",
         {},
     )
-    configured_max_turns = segmentation_config.get("max_pending_interaction_turns")
+    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
+    configured_max_turns = segmentation_config.get("max_pending_units")
     if configured_max_turns in (None, ""):
-        configured_max_turns = segmentation_config.get("max_pending_interaction_turns", 1)
+        configured_max_turns = segmentation_config.get("max_pending_units", 1)
     max_pending_interaction_turns = max(
         1,
         int(
@@ -651,8 +656,8 @@ def prepare_runtime_configs(
         ),
     )
     args.fact_extraction_interval = max_pending_interaction_turns
-    segmentation_config["max_pending_interaction_turns"] = max_pending_interaction_turns
-    configured_max_tokens = segmentation_config.get("max_pending_interaction_tokens")
+    segmentation_config["max_pending_units"] = max_pending_interaction_turns
+    configured_max_tokens = segmentation_config.get("max_pending_tokens")
     if args.fact_extraction_max_tokens is not None or configured_max_tokens not in (None, ""):
         max_pending_interaction_tokens = max(
             1,
@@ -663,7 +668,7 @@ def prepare_runtime_configs(
             ),
         )
         args.fact_extraction_max_tokens = max_pending_interaction_tokens
-        segmentation_config["max_pending_interaction_tokens"] = max_pending_interaction_tokens
+        segmentation_config["max_pending_tokens"] = max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")

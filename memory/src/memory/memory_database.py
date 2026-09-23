@@ -234,7 +234,6 @@ class SessionDB:
             """
             CREATE TABLE IF NOT EXISTS memory_episodes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source_type TEXT NOT NULL,
                 episode_type TEXT NOT NULL,
                 title TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
@@ -251,7 +250,6 @@ class SessionDB:
             CREATE TABLE IF NOT EXISTS memory_source_segments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode_id INTEGER,
-                source_type TEXT NOT NULL,
                 text TEXT NOT NULL,
                 started_at TEXT NOT NULL DEFAULT '',
                 ended_at TEXT NOT NULL DEFAULT '',
@@ -265,7 +263,6 @@ class SessionDB:
             CREATE TABLE IF NOT EXISTS memory_facts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode_id INTEGER,
-                source_type TEXT NOT NULL DEFAULT 'assistant_wakeup',
                 fact_type TEXT NOT NULL DEFAULT 'context',
                 summary TEXT NOT NULL,
                 keywords TEXT NOT NULL DEFAULT '[]',
@@ -287,7 +284,6 @@ class SessionDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 object_type TEXT NOT NULL,
                 object_id INTEGER NOT NULL,
-                source_type TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
                 summary TEXT NOT NULL DEFAULT '',
                 identity_text TEXT NOT NULL DEFAULT '',
@@ -638,13 +634,10 @@ class SessionDB:
 
             CREATE INDEX IF NOT EXISTS idx_memory_facts_event_time ON memory_facts(event_time_key);
             CREATE INDEX IF NOT EXISTS idx_memory_facts_dialogue_time ON memory_facts(dialogue_time_key);
-            CREATE INDEX IF NOT EXISTS idx_memory_facts_source ON memory_facts(source_type);
             CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_object
             ON memory_recall_documents(object_type, object_id);
             CREATE INDEX IF NOT EXISTS idx_memory_recall_documents_type_status_time
             ON memory_recall_documents(object_type, status, time_end, updated_at);
-            CREATE INDEX IF NOT EXISTS idx_memory_source_segments_unassigned
-            ON memory_source_segments(source_type, episode_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_source_segments_episode
             ON memory_source_segments(episode_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_fact_episode_episode
@@ -751,7 +744,6 @@ class SessionDB:
         object_id: int,
         identity_text: str,
         identity_text_embedding: Optional[np.ndarray],
-        source_type: str = "",
         title: str = "",
         summary: str = "",
         entity_ids: Optional[Sequence[int]] = None,
@@ -788,13 +780,12 @@ class SessionDB:
         self._conn.execute(
             """
             INSERT INTO memory_recall_documents (
-                object_type, object_id, source_type, title, summary,
+                object_type, object_id, title, summary,
                 identity_text, identity_text_embedding, entity_ids, topic_keys,
                 time_start, time_end, status, confidence, importance, metadata,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(object_type, object_id) DO UPDATE SET
-                source_type = excluded.source_type,
                 title = excluded.title,
                 summary = excluded.summary,
                 identity_text = excluded.identity_text,
@@ -812,7 +803,6 @@ class SessionDB:
             (
                 normalized_type,
                 normalized_id,
-                str(source_type or ""),
                 str(title or ""),
                 str(summary or ""),
                 str(identity_text or ""),
@@ -879,7 +869,6 @@ class SessionDB:
     def insert_episode(
         self,
         *,
-        source_type: str,
         episode_type: str,
         title: str,
         summary: str,
@@ -896,13 +885,12 @@ class SessionDB:
         cur = self._conn.execute(
             """
             INSERT INTO memory_episodes (
-                source_type, episode_type, title, summary, participants,
+                episode_type, title, summary, participants,
                 entity_ids, canonical_topics, started_at, ended_at,
                 metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                source_type,
                 episode_type,
                 title,
                 summary,
@@ -930,7 +918,6 @@ class SessionDB:
     def insert_memory_source_segments(
         self,
         *,
-        source_type: str,
         segments: Sequence[Dict[str, Any]],
     ) -> List[int]:
         """Persist one submitted source-segment batch as one physical row.
@@ -996,12 +983,11 @@ class SessionDB:
         cur = self._conn.execute(
             """
             INSERT INTO memory_source_segments (
-                source_type, text, started_at, ended_at,
+                text, started_at, ended_at,
                 tags, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                str(source_type or "").strip() or "assistant_wakeup",
                 "\n".join(
                     f"{item['speaker'] or 'unknown'}: {item['text']}"
                     for item in normalized_segments
@@ -1024,25 +1010,22 @@ class SessionDB:
     def get_unassigned_memory_source_segments(
         self,
         *,
-        source_type: str,
         limit: int = 240,
     ) -> List[Dict[str, Any]]:
         """Return logical source evidence waiting to be summarized.
 
-        New rows are physical batches and are expanded from
-        ``metadata.segments``.  Legacy one-segment rows remain readable as a
-        single logical segment, so already stored evidence can still be
-        summarized without a migration.
+        Each row is a physical batch; ``metadata.segments`` stores the
+        ordered logical segments used for episode generation.
         """
         rows = self._conn.execute(
             """
             SELECT *
             FROM memory_source_segments
-            WHERE source_type = ? AND episode_id IS NULL
+            WHERE episode_id IS NULL
             ORDER BY id ASC
             LIMIT ?
             """,
-            (str(source_type or "").strip() or "assistant_wakeup", max(1, int(limit or 240))),
+            (max(1, int(limit or 240)),),
         ).fetchall()
         source_segments: List[Dict[str, Any]] = []
         for row in rows:
@@ -1054,7 +1037,6 @@ class SessionDB:
             )
             batch_segments = batch_metadata.get("segments")
             if not isinstance(batch_segments, list):
-                source_segments.append(batch_row)
                 continue
             for segment_index, raw_segment in enumerate(batch_segments):
                 if not isinstance(raw_segment, dict):
@@ -1070,7 +1052,6 @@ class SessionDB:
                 source_segments.append({
                     "id": batch_row["id"],
                     "source_segment_row_id": batch_row["id"],
-                    "source_type": batch_row.get("source_type") or "",
                     "speaker": str(raw_segment.get("speaker") or "").strip(),
                     "text": text,
                     "started_at": str(raw_segment.get("started_at") or "").strip(),
@@ -1290,7 +1271,6 @@ class SessionDB:
         *,
         processing_target: str = "entity_claim",
         reference_timestamp: Any,
-        source_types: Optional[Sequence[str]] = None,
         limit: int = 100,
         restrict_to_today: bool = True,
         require_episode: bool = False,
@@ -1324,10 +1304,6 @@ class SessionDB:
             # it is intentionally not work for the prospective projection.
             clauses.append("processing.signal_key != '__fact__'")
         params: List[Any] = []
-        if source_types:
-            placeholders = ",".join("?" for _ in source_types)
-            clauses.append(f"fact.source_type IN ({placeholders})")
-            params.extend(source_types)
         if require_episode:
             clauses.append("fact.episode_id IS NOT NULL")
         if restrict_to_today:
@@ -1352,7 +1328,6 @@ class SessionDB:
     def get_unassigned_memory_facts_in_time_window(
         self,
         *,
-        source_type: str,
         started_at: str,
         ended_at: str,
         limit: int = 80,
@@ -1366,15 +1341,13 @@ class SessionDB:
             """
             SELECT *
             FROM memory_facts
-            WHERE source_type = ?
-              AND episode_id IS NULL
+            WHERE episode_id IS NULL
               AND dialogue_time_key >= ?
               AND dialogue_time_key <= ?
             ORDER BY dialogue_time_key ASC, id ASC
             LIMIT ?
             """,
             (
-                str(source_type or "").strip() or "assistant_wakeup",
                 start,
                 end,
                 max(1, int(limit or 80)),
@@ -2301,7 +2274,6 @@ class SessionDB:
         *,
         object_type: str,
         statuses: Optional[Sequence[str]] = None,
-        source_types: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Load embeddable recall projections for one direct object type.
 
@@ -2328,17 +2300,6 @@ class SessionDB:
             placeholders = ",".join("?" for _ in normalized_statuses)
             clauses.append(f"status IN ({placeholders})")
             params.extend(normalized_statuses)
-        if source_types:
-            normalized_source_types = [
-                str(value).strip()
-                for value in source_types
-                if str(value).strip()
-            ]
-            if not normalized_source_types:
-                return []
-            placeholders = ",".join("?" for _ in normalized_source_types)
-            clauses.append(f"source_type IN ({placeholders})")
-            params.extend(normalized_source_types)
         rows = self._conn.execute(
             f"""
             SELECT *
@@ -2356,7 +2317,6 @@ class SessionDB:
         object_type: str,
         terms: Optional[Sequence[str]] = None,
         statuses: Optional[Sequence[str]] = None,
-        source_types: Optional[Sequence[str]] = None,
         time_start: Optional[str] = None,
         time_end: Optional[str] = None,
         limit: int = 120,
@@ -2390,17 +2350,6 @@ class SessionDB:
             placeholders = ",".join("?" for _ in normalized_statuses)
             clauses.append(f"document.status IN ({placeholders})")
             params.extend(normalized_statuses)
-        if source_types:
-            normalized_source_types = [
-                str(value).strip()
-                for value in source_types
-                if str(value).strip()
-            ]
-            if not normalized_source_types:
-                return []
-            placeholders = ",".join("?" for _ in normalized_source_types)
-            clauses.append(f"document.source_type IN ({placeholders})")
-            params.extend(normalized_source_types)
         base_where = " AND ".join(clauses)
         normalized_time_start = str(time_start or "").strip()
         normalized_time_end = str(time_end or "").strip()
@@ -2841,7 +2790,6 @@ class SessionDB:
         self,
         *,
         episode_id: Optional[int],
-        source_type: str,
         fact_type: str,
         summary: str,
         keywords: Sequence[str],
@@ -2872,15 +2820,14 @@ class SessionDB:
         cur = self._conn.execute(
             """
             INSERT INTO memory_facts (
-                episode_id, source_type, fact_type,
+                episode_id, fact_type,
                 summary, keywords, entities, entity_ids, fact_root_topic,
                 fact_aspect_topic, event_time_key, dialogue_time_key,
                 confidence, importance, metadata, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id,
-                source_type,
                 fact_type,
                 summary,
                 _json_dumps(keyword_values),
