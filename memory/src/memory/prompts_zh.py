@@ -187,14 +187,14 @@ entity_claim_signal 输出规则：
 - 只有当前 fact 对某个实体主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、临时建议、助手猜测、寒暄和低价值信息输出空数组。
 - 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact 的具体证据，不要引用历史 claim。
 
-prospective_signals 输出规则：
-- `prospective_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
+future_commitment_signals 输出规则：
+- `future_commitment_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
 - 仅在当前 fact 提供用户未来导向的目标、安排、责任，或这些对象的完成、取消、改期、阻塞等生命周期变化的直接证据时输出；其余情况输出空数组。
 - `evidence_kind` 只能是 `goal`、`plan`、`responsibility`、`lifecycle_update`。`candidate_object_types` 只能包含 goal、plan、work_item；goal 只允许来自用户本人明确表达的持续性目标。
 - `user_role` 只能是 owner、participant、responsible，表示用户分别是目标拥有者、安排参与者或责任承担者。用户只是被顺带提及时不得输出 signal。
 - `assertion_source` 只能是 self_statement、third_party_report、observed_event；`explicitness` 只能是 direct、reported、tentative。助手建议、助手复述、开放假设、条件讨论和推测不得输出 signal。
-- `prospective_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、prospective_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact 中可直接定位的内容。
+- `future_commitment_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
+- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、future_commitment_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact 中可直接定位的内容。
 
 输出格式：
 {
@@ -221,13 +221,13 @@ prospective_signals 输出规则：
           "confidence": 0.8
         }
       ],
-      "prospective_signals": [
+      "future_commitment_signals": [
         {
           "subject_entity": "与用户未来相关的主体实体；用户本人填写用户",
           "evidence_kind": "goal|plan|responsibility|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",
-          "prospective_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
+          "future_commitment_anchor": "用于跨 fact 聚合的目标、安排或事项标签",
           "assertion_source": "self_statement|third_party_report|observed_event",
           "explicitness": "direct|reported|tentative",
           "evidence_basis": "当前 fact 中支持该 signal 的具体证据",

@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Reuse existing per-context DBs from "
             "<dir>/<context_group_id>/memory.db. When set, skip replay, "
-            "store, and reflect; only rerun recall and reader answering."
+            "store and entity-claim updates; only rerun recall and reader answering."
         ),
     )
     parser.add_argument("--start", type=int, default=0)
@@ -123,14 +123,6 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(llm_json_mode=None)
     parser.add_argument("--max-pending-interaction-turns", type=int)
     parser.add_argument("--max-pending-interaction-tokens", type=int)
-    parser.add_argument("--enable-reflect", action="store_true")
-    parser.add_argument(
-        "--reflect-every-days",
-        type=int,
-        default=1,
-        help="Run reflect after every N parsed conversation dates when enabled.",
-    )
-    parser.add_argument("--reflect-limit", type=int)
     parser.add_argument("--recall-top-k", type=int)
     parser.add_argument("--recall-budget")
     parser.add_argument(
@@ -334,19 +326,12 @@ def replay_context_into_memory(
     db: Any,
     days: Sequence[Dict[str, Any]],
     group_id: str,
-    enable_reflect: bool,
-    reflect_every_days: int,
-    reflect_limit: int,
 ) -> Dict[str, Any]:
     seen_timestamps: set[str] = set()
     pair_count = 0
     store_batches = 0
-    reflect_runs = 0
-    reflect_reports: List[Dict[str, Any]] = []
-    last_reflected_day = 0
     last_turn_timestamp: Optional[datetime] = None
     ambient_watermark_updates = 0
-    every_days = max(1, int(reflect_every_days or 1))
 
     for day_index, day in enumerate(days, 1):
         for pair_index, (user, assistant) in enumerate(day["pairs"]):
@@ -376,60 +361,10 @@ def replay_context_into_memory(
             if store_report.get("queued"):
                 store_batches += 1
 
-        should_reflect = enable_reflect and (
-            day_index % every_days == 0 or day_index == len(days)
-        )
-        if should_reflect:
-            # Reflection creates an explicit partial boundary.  Advance
-            # coverage through the final turn of this day before flushing, so
-            # the flush does not need to force-release delayed input.
-            watermark_report = runtime.update_ambient_asr_watermark(
-                last_turn_timestamp,
-                evaluate_episode_summary=False,
-            )
-            ambient_watermark_updates += 1
-            if watermark_report.get("queued"):
-                store_batches += 1
-            # Facts are filtered by their local DB created_at date. Keep this
-            # wall-clock timestamp separate from the benchmark dialogue time.
-            reflect_timestamp = datetime.now().astimezone().isoformat()
-            episode_input_flush = runtime.flush_pending_memory_inputs(
-                evaluate_episode_summary=False,
-            )
-            episode_summary_submit = runtime.trigger_memory_episode_summary(
-                reason="clongeval_reflect",
-                tags=[
-                    "clongeval_conversation",
-                    f"context_group:{group_id}",
-                    f"date:{day['date_text']}",
-                    f"day_index:{day_index}",
-                ],
-            )
-            reflect_submit = runtime.trigger_memory_reflect(
-                limit=max(1, int(reflect_limit or 100)),
-                reflect_timestamp=reflect_timestamp,
-            )
-            if episode_input_flush:
-                store_batches += 1
-            if (reflect_submit.get("pending_memory_input_flush") or {}).get("queued"):
-                store_batches += 1
-            if (
-                episode_summary_submit.get("queued") or reflect_submit.get("queued")
-            ) and not runtime.wait_for_memory_tasks():
-                raise RuntimeError("Timed out while draining queued memory reflect")
-            reflect_runs += 1
-            last_reflected_day = day_index
-            reflect_reports.append({
-                "day_index": day_index,
-                "date": day["date_text"],
-                "ambient_watermark": watermark_report,
-                "episode_summary": episode_summary_submit,
-                "report": reflect_submit,
-            })
-
     # The normal benchmark path reaches this point only after every
     # interaction has entered the runtime.  One final watermark advance
     # releases all remaining delayed input through the same append path.
+    finalization: Dict[str, Any] = {}
     if last_turn_timestamp is not None:
         watermark_report = runtime.update_ambient_asr_watermark(
             last_turn_timestamp,
@@ -437,16 +372,22 @@ def replay_context_into_memory(
         ambient_watermark_updates += 1
         if watermark_report.get("queued"):
             store_batches += 1
-    runtime.flush_pending_memory_inputs()
+        finalization = runtime.finalize_memory_session(
+            reason="clongeval_context_complete",
+            tags=[
+                "clongeval_conversation",
+                f"context_group:{group_id}",
+            ],
+        )
+        if bool((finalization.get("input_flush") or {}).get("queued")):
+            store_batches += 1
 
     return {
         "parsed_days": len(days),
         "turn_pairs": pair_count,
         "store_batches": store_batches,
-        "reflect_runs": reflect_runs,
         "ambient_watermark_updates": ambient_watermark_updates,
-        "last_reflected_day": last_reflected_day,
-        "reflect_reports": reflect_reports,
+        "finalization": finalization,
         "db_counts": db_counts(db),
     }
 
@@ -507,7 +448,6 @@ def prepare_runtime(
         args.llm_thinking = str(llm_config.get("llm_thinking") or "disabled")
     if args.llm_json_mode is None:
         args.llm_json_mode = bool(llm_config.get("llm_json_mode", True))
-    args.reflect_limit = max(1, int(args.reflect_limit or memory_manager_config.get("reflect_limit", 100) or 100))
     args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("recall_top_k", 8) or 8))
     args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
     if args.recall_mode is not None:
@@ -641,7 +581,7 @@ def process_context_group(
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Replay, reflect, recall, and optionally answer one isolated context."""
+    """Replay, update entity claims, recall, and optionally answer one context."""
     group_id = context_group_id(context, group_index)
     group_dir = args.output_dir / group_id
     group_dir.mkdir(parents=True, exist_ok=True)
@@ -703,9 +643,7 @@ def process_context_group(
                 "parsed_days": 0,
                 "turn_pairs": 0,
                 "store_batches": 0,
-                "reflect_runs": 0,
-                "last_reflected_day": 0,
-                "reflect_reports": [],
+                "finalization": {},
                 "db_counts": db_counts(db),
             }
         else:
@@ -714,24 +652,23 @@ def process_context_group(
                 db=db,
                 days=days,
                 group_id=group_id,
-                enable_reflect=args.enable_reflect,
-                reflect_every_days=args.reflect_every_days,
-                reflect_limit=args.reflect_limit,
             )
-            if not runtime.flush_pending_memory_inputs():
-                raise RuntimeError("Timed out while draining queued memory stores")
             if not runtime.wait_for_memory_tasks():
                 raise RuntimeError(
-                    "Timed out while draining queued memory store and reflect tasks"
+                    "Timed out while draining queued memory store and derived tasks"
                 )
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
         store_operation_report = operation_counts.get("memory_store") or {}
-        reflect_operation_report = operation_counts.get("memory_reflect") or {}
+        entity_claim_operation_report = (
+            operation_counts.get("memory_entity_claim_update") or {}
+        )
         replay_stats["store_batches"] = int(store_operation_report.get("succeeded") or 0)
-        replay_stats["reflect_runs"] = int(reflect_operation_report.get("submitted") or 0)
+        replay_stats["entity_claim_runs"] = int(
+            entity_claim_operation_report.get("submitted") or 0
+        )
         replay_stats["store_flushes"] = int(store_operation_report.get("submitted") or 0)
 
         for record_index, record in enumerate(group_records, 1):
@@ -775,11 +712,15 @@ def process_context_group(
                     or ("ok" if recall_context else "empty")
                 ),
                 "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-                "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
+                "entity_claim_total_elapsed_ms": float(
+                    entity_claim_operation_report.get("total_elapsed_ms") or 0.0
+                ),
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
                 "memory_total_elapsed_ms": round(
                     float(store_operation_report.get("total_elapsed_ms") or 0.0)
-                    + float(reflect_operation_report.get("total_elapsed_ms") or 0.0)
+                    + float(
+                        entity_claim_operation_report.get("total_elapsed_ms") or 0.0
+                    )
                     + recall_total_elapsed_ms,
                     2,
                 ),
@@ -1068,7 +1009,6 @@ def main() -> int:
                 {str(item.get("actual_recall_mode") or "unknown") for item in results}
             )
         },
-        "enable_reflect": bool(args.enable_reflect),
         "group_summaries": group_summaries,
     }
     summary_path = output_dir / "clongeval_conversation_summary.json"

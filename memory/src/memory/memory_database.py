@@ -326,7 +326,7 @@ class SessionDB:
                 FOREIGN KEY(subject_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
-            CREATE TABLE IF NOT EXISTS memory_fact_prospective_signal_mapping (
+            CREATE TABLE IF NOT EXISTS memory_fact_future_commitment_signal_mapping (
                 fact_id INTEGER NOT NULL,
                 signal_key TEXT NOT NULL,
                 subject_entity_id INTEGER,
@@ -334,13 +334,13 @@ class SessionDB:
                 candidate_object_types TEXT NOT NULL DEFAULT '[]',
                 operation_hint TEXT NOT NULL DEFAULT '',
                 user_role TEXT NOT NULL DEFAULT '',
-                prospective_anchor TEXT NOT NULL DEFAULT '',
-                prospective_anchor_key TEXT NOT NULL DEFAULT '',
+                future_commitment_anchor TEXT NOT NULL DEFAULT '',
+                future_commitment_anchor_key TEXT NOT NULL DEFAULT '',
                 assertion_source TEXT NOT NULL DEFAULT '',
                 explicitness TEXT NOT NULL DEFAULT '',
                 evidence_basis TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT 0.0,
-                processed_for_memory_prospective_update INTEGER NOT NULL DEFAULT 0,
+                processed_for_memory_future_commitment_update INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(fact_id, signal_key),
@@ -656,9 +656,9 @@ class SessionDB:
             ON memory_fact_entity_claim_signal_mapping(
                 subject_entity_id, claim_type_hint, claim_anchor_key, fact_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_prospective_signal_group
-            ON memory_fact_prospective_signal_mapping(
-                subject_entity_id, prospective_anchor_key, evidence_kind, fact_id
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_future_commitment_signal_group
+            ON memory_fact_future_commitment_signal_mapping(
+                subject_entity_id, future_commitment_anchor_key, evidence_kind, fact_id
             );
             CREATE INDEX IF NOT EXISTS idx_memory_fact_entity_claim_processing
             ON memory_fact_entity_claim_signal_mapping(
@@ -668,9 +668,9 @@ class SessionDB:
             ON memory_fact_entity_claim_signal_mapping(
                 processed_for_memory_entity_claim_induction, fact_id
             );
-            CREATE INDEX IF NOT EXISTS idx_memory_fact_prospective_update_processing
-            ON memory_fact_prospective_signal_mapping(
-                processed_for_memory_prospective_update, fact_id
+            CREATE INDEX IF NOT EXISTS idx_memory_fact_future_commitment_update_processing
+            ON memory_fact_future_commitment_signal_mapping(
+                processed_for_memory_future_commitment_update, fact_id
             );
             CREATE INDEX IF NOT EXISTS idx_memory_entity_claim_events_target
             ON memory_entity_claim_events(target_claim_id, effective_at DESC, id DESC);
@@ -1284,9 +1284,9 @@ class SessionDB:
                 "memory_fact_entity_claim_signal_mapping",
                 "processed_for_memory_entity_claim_induction",
             ),
-            "prospective_update": (
-                "memory_fact_prospective_signal_mapping",
-                "processed_for_memory_prospective_update",
+            "future_commitment_update": (
+                "memory_fact_future_commitment_signal_mapping",
+                "processed_for_memory_future_commitment_update",
             ),
         }
         target = str(processing_target or "entity_claim").strip().lower()
@@ -1295,11 +1295,11 @@ class SessionDB:
         except KeyError as exc:
             raise ValueError(
                 "processing_target must be 'entity_claim', "
-                "'entity_claim_induction', or 'prospective_update'"
+                "'entity_claim_induction', or 'future_commitment_update'"
             ) from exc
 
         clauses: List[str] = [f"processing.{processing_column} = 0"]
-        if target == "prospective_update":
+        if target == "future_commitment_update":
             # ``__fact__`` records that extraction found no prospective signal;
             # it is intentionally not work for the prospective projection.
             clauses.append("processing.signal_key != '__fact__'")
@@ -1465,9 +1465,9 @@ class SessionDB:
                 "memory_fact_entity_claim_signal_mapping",
                 "processed_for_memory_entity_claim_induction",
             ),
-            "prospective_update": (
-                "memory_fact_prospective_signal_mapping",
-                "processed_for_memory_prospective_update",
+            "future_commitment_update": (
+                "memory_fact_future_commitment_signal_mapping",
+                "processed_for_memory_future_commitment_update",
             ),
         }
         target = str(processing_target or "").strip().lower()
@@ -1476,7 +1476,7 @@ class SessionDB:
         except KeyError as exc:
             raise ValueError(
                 "processing_target must be 'entity_claim', "
-                "'entity_claim_induction', or 'prospective_update'"
+                "'entity_claim_induction', or 'future_commitment_update'"
             ) from exc
         ids = [int(value) for value in fact_ids if value is not None]
         if not ids:
@@ -1638,7 +1638,7 @@ class SessionDB:
             for mapping in [self._row_to_dict(row)]
         }
 
-    def upsert_fact_prospective_signal_mappings(
+    def upsert_fact_future_commitment_signal_mappings(
         self,
         mappings: Sequence[Dict[str, Any]],
     ) -> int:
@@ -1658,8 +1658,8 @@ class SessionDB:
                 subject_entity_id = 0
             evidence_kind = str(mapping.get("evidence_kind") or "").strip().lower()
             user_role = str(mapping.get("user_role") or "").strip().lower()
-            prospective_anchor = str(mapping.get("prospective_anchor") or "").strip()
-            prospective_anchor_key = str(mapping.get("prospective_anchor_key") or "").strip()
+            future_commitment_anchor = str(mapping.get("future_commitment_anchor") or "").strip()
+            future_commitment_anchor_key = str(mapping.get("future_commitment_anchor_key") or "").strip()
             assertion_source = str(mapping.get("assertion_source") or "").strip().lower()
             explicitness = str(mapping.get("explicitness") or "").strip().lower()
             candidate_object_types = list(dict.fromkeys(
@@ -1672,12 +1672,12 @@ class SessionDB:
             if is_sentinel:
                 subject_entity_id = 0
                 evidence_kind = user_role = ""
-                prospective_anchor = prospective_anchor_key = ""
+                future_commitment_anchor = future_commitment_anchor_key = ""
                 assertion_source = explicitness = ""
                 candidate_object_types = []
                 has_real_signal = self._conn.execute(
                     """
-                    SELECT 1 FROM memory_fact_prospective_signal_mapping
+                    SELECT 1 FROM memory_fact_future_commitment_signal_mapping
                     WHERE fact_id = ? AND signal_key != '__fact__'
                     LIMIT 1
                     """,
@@ -1689,40 +1689,40 @@ class SessionDB:
                 subject_entity_id <= 0
                 or evidence_kind not in {"goal", "plan", "responsibility", "lifecycle_update"}
                 or user_role not in {"owner", "participant", "responsible"}
-                or not prospective_anchor
-                or not prospective_anchor_key
+                or not future_commitment_anchor
+                or not future_commitment_anchor_key
                 or assertion_source not in {"self_statement", "third_party_report", "observed_event"}
                 or explicitness not in {"direct", "reported", "tentative"}
             ):
                 continue
             if not signal_key:
                 signal_key = (
-                    f"{subject_entity_id}|{evidence_kind}|{prospective_anchor_key}"
+                    f"{subject_entity_id}|{evidence_kind}|{future_commitment_anchor_key}"
                 )
             if not is_sentinel:
                 self._conn.execute(
-                    "DELETE FROM memory_fact_prospective_signal_mapping "
+                    "DELETE FROM memory_fact_future_commitment_signal_mapping "
                     "WHERE fact_id = ? AND signal_key = '__fact__'",
                     (fact_id,),
                 )
             self._conn.execute(
                 """
-                INSERT INTO memory_fact_prospective_signal_mapping (
+                INSERT INTO memory_fact_future_commitment_signal_mapping (
                     fact_id, signal_key, subject_entity_id, evidence_kind,
                     candidate_object_types, operation_hint, user_role,
-                    prospective_anchor, prospective_anchor_key,
+                    future_commitment_anchor, future_commitment_anchor_key,
                     assertion_source, explicitness, evidence_basis,
                     confidence, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(fact_id, signal_key) DO UPDATE SET
                     candidate_object_types = excluded.candidate_object_types,
                     user_role = excluded.user_role,
-                    prospective_anchor = excluded.prospective_anchor,
+                    future_commitment_anchor = excluded.future_commitment_anchor,
                     assertion_source = excluded.assertion_source,
                     explicitness = excluded.explicitness,
                     evidence_basis = excluded.evidence_basis,
                     confidence = MAX(
-                        memory_fact_prospective_signal_mapping.confidence,
+                        memory_fact_future_commitment_signal_mapping.confidence,
                         excluded.confidence
                     ),
                     updated_at = excluded.updated_at
@@ -1730,7 +1730,7 @@ class SessionDB:
                 (
                     fact_id, signal_key, subject_entity_id or None, evidence_kind,
                     _json_dumps(candidate_object_types), "", user_role,
-                    prospective_anchor, prospective_anchor_key,
+                    future_commitment_anchor, future_commitment_anchor_key,
                     assertion_source, explicitness,
                     str(mapping.get("evidence_basis") or "").strip(),
                     float(mapping.get("confidence") or 0.0), now, now,
@@ -1740,7 +1740,7 @@ class SessionDB:
         self._commit_if_needed()
         return changed
 
-    def get_fact_prospective_signal_mappings(
+    def get_fact_future_commitment_signal_mappings(
         self,
         fact_id: int,
     ) -> Dict[str, Dict[str, Any]]:
@@ -1750,11 +1750,11 @@ class SessionDB:
         rows = self._conn.execute(
             """
             SELECT signal.*, entity.name AS subject
-            FROM memory_fact_prospective_signal_mapping AS signal
+            FROM memory_fact_future_commitment_signal_mapping AS signal
             LEFT JOIN memory_entity_nodes AS entity ON entity.id = signal.subject_entity_id
             WHERE signal.fact_id = ?
               AND signal.signal_key != '__fact__'
-            ORDER BY signal.evidence_kind, signal.prospective_anchor_key
+            ORDER BY signal.evidence_kind, signal.future_commitment_anchor_key
             """,
             (int(fact_id),),
         ).fetchall()

@@ -106,7 +106,6 @@ class OwnerRuntime:
     seen_path: Path
     seen_order: List[str] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
-    active_ambient_recording_ids: set[str] = field(default_factory=set)
 
     def remember(self, keys: Iterable[str]) -> None:
         for key in keys:
@@ -147,7 +146,6 @@ class AgentMemoryRuntime:
         handlers = {
             "observe": self.observe,
             "observe_transcript_segments": self.observe_transcript_segments,
-            "set_ambient_recording_state": self.set_ambient_recording_state,
             "finalize_transcript_recording": self.finalize_transcript_recording,
             "finalize": self.finalize,
             "recall": self.recall,
@@ -194,41 +192,6 @@ class AgentMemoryRuntime:
         self._owners[key] = created
         return created
 
-    def set_ambient_recording_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Track whether an owner's live input needs ambient-ASR coverage.
-
-        The Gateway only sends completed interaction turns to this sidecar; it
-        does not own the Desktop recording lifecycle.  The ambient sidecar
-        therefore sends this local IPC notification when capture starts and
-        when its final ASR batch has been delivered.  While at least one
-        recording is active, interaction turns enter ``MemoryRuntime`` with
-        ``ambient_recording_enabled=True`` and share its watermark gate with
-        delayed offline-ASR transcript segments.
-        """
-        owner_id = _clean(params.get("ownerId"), 240)
-        recording_id = _clean(params.get("recordingId"), 160)
-        if not recording_id:
-            raise ValueError("recordingId must be non-empty")
-        holder = self._owner_runtime(owner_id)
-        active = bool(params.get("active"))
-        if active:
-            holder.active_ambient_recording_ids.add(recording_id)
-        else:
-            holder.active_ambient_recording_ids.discard(recording_id)
-        result = {
-            "active": bool(holder.active_ambient_recording_ids),
-            "recordingId": recording_id,
-            "activeRecordingCount": len(holder.active_ambient_recording_ids),
-        }
-        self._logger.info(
-            "set_ambient_recording_state owner=%s recording=%s active=%s active_recordings=%s",
-            _owner_key(owner_id)[:12],
-            recording_id[:80],
-            active,
-            result["activeRecordingCount"],
-        )
-        return result
-
     @staticmethod
     def _assistant_text_by_turn(messages: List[Dict[str, Any]]) -> Dict[str, str]:
         values: Dict[str, List[str]] = {}
@@ -253,9 +216,7 @@ class AgentMemoryRuntime:
             item for item in params.get("messages") or [] if isinstance(item, dict)
         ]
         assistants = self._assistant_text_by_turn(messages)
-        ambient_recording_enabled = bool(params.get("ambientRecordingEnabled", False)) or bool(
-            holder.active_ambient_recording_ids
-        )
+        ambient_recording_enabled = bool(params.get("ambientRecordingEnabled", False))
         accepted_keys: List[str] = []
         skipped_sensitive = 0
         for message in messages:
@@ -387,39 +348,44 @@ class AgentMemoryRuntime:
         if not recording_id:
             raise ValueError("recordingId must be non-empty")
         holder = self._owner_runtime(owner_id)
-        input_flushed = holder.runtime.flush_pending_memory_inputs(
-            evaluate_episode_summary=False,
-        )
-        episode = holder.runtime.trigger_memory_episode_summary(
+        finalization = holder.runtime.finalize_memory_session(
             reason=f"ambient_recording_finished:{recording_id}",
             tags=["qwen-audio-agent", "ambient-recording", recording_id],
         )
-        reflect = holder.runtime.trigger_memory_reflect()
+        input_flush = dict(finalization.get("input_flush") or {})
+        episode = dict(finalization.get("episode_summary") or {})
+        derived_tasks = dict(finalization.get("derived_tasks") or {})
+        entity_claim = dict(derived_tasks.get("entity_claim") or {})
+        future_commitment = dict(derived_tasks.get("future_commitment") or {})
         result = {
             "finalized": bool((episode or {}).get("queued")),
             "recordingId": recording_id,
-            "inputFlushed": bool(input_flushed),
+            "inputFlushed": bool(input_flush.get("queued")),
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
-            "reflectQueued": bool((reflect or {}).get("queued")),
+            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
+            "futureCommitmentQueued": bool(future_commitment.get("queued")),
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "episode_summary_queued=%s reflect_queued=%s",
+            "episode_summary_queued=%s entity_claim_queued=%s future_commitment_queued=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
-            result["reflectQueued"],
+            result["entityClaimQueued"],
+            result["futureCommitmentQueued"],
         )
         return result
 
     def finalize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Flush memory input and optionally close its semantic episode.
 
-        ``checkpoint`` is for a transport-level close: it may flush and
-        reflect, but never treats the reconnect as a conversation boundary.
+        ``checkpoint`` is for a transport-level close: it may flush input but
+        never treats the reconnect as a conversation boundary.
         ``session_end`` is reserved for an explicit user-created new session;
-        it submits store, episode summary, and reflection in that FIFO order.
+        it submits store, episode summary, entity-claim update, and future
+        commitment in
+        that FIFO order.
         """
         owner_id = _clean(params.get("ownerId"), 240)
         session_id = _clean(params.get("sessionId"), 240)
@@ -429,41 +395,49 @@ class AgentMemoryRuntime:
         if boundary == "session_end" and not session_id:
             raise ValueError("sessionId must be non-empty for session_end")
         holder = self._owner_runtime(owner_id)
-        input_flushed = holder.runtime.flush_pending_memory_inputs(
-            evaluate_episode_summary=boundary != "session_end",
-        )
-        episode = None
         if boundary == "session_end":
-            episode = holder.runtime.trigger_memory_episode_summary(
+            finalization = holder.runtime.finalize_memory_session(
                 reason=f"qwen_audio_agent_session_closed:{session_id}",
                 tags=["qwen-audio-agent", "session-close"],
             )
-        # For an explicit session end this always queues after the summary;
-        # for a checkpoint it preserves the existing best-effort reflect.
-        reflect = (
-            holder.runtime.trigger_memory_reflect()
-            if boundary == "session_end" or input_flushed
-            else None
-        )
+            input_flush = dict(finalization.get("input_flush") or {})
+            episode = dict(finalization.get("episode_summary") or {})
+            derived_tasks = dict(finalization.get("derived_tasks") or {})
+            entity_claim = dict(derived_tasks.get("entity_claim") or {})
+            future_commitment = dict(
+                derived_tasks.get("future_commitment") or {}
+            )
+        else:
+            input_flushed = holder.runtime.flush_pending_memory_inputs()
+            input_flush = {"queued": bool(input_flushed)}
+            episode = None
+            entity_claim = None
+            future_commitment = None
         result = {
             "finalized": boundary == "session_end" and bool((episode or {}).get("queued")),
             "boundary": boundary,
             "sessionId": session_id,
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
-            "inputFlushed": bool(input_flushed),
-            "reflectQueued": bool((reflect or {}).get("queued")),
+            "inputFlushed": bool(input_flush.get("queued")),
+            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
+            "futureCommitmentQueued": bool(
+                (future_commitment or {}).get("queued")
+            ),
             "episode": episode,
-            "reflect": reflect,
+            "entityClaim": entity_claim,
+            "futureCommitment": future_commitment,
         }
         self._logger.info(
             "finalize owner=%s boundary=%s session=%s input_flushed=%s "
-            "episode_summary_queued=%s reflect_queued=%s reason=%s",
+            "episode_summary_queued=%s entity_claim_queued=%s "
+            "future_commitment_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
             boundary,
             session_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
-            result["reflectQueued"],
+            result["entityClaimQueued"],
+            result["futureCommitmentQueued"],
             (episode or {}).get("reason") or "",
         )
         return result
@@ -516,7 +490,6 @@ class _LocalTranscriptIpcServer:
 
     _ALLOWED_METHODS = {
         "observe_transcript_segments",
-        "set_ambient_recording_state",
         "finalize_transcript_recording",
     }
 

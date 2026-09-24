@@ -175,12 +175,25 @@ memory_runtime:
       max_duration_seconds: 1800.0
       max_tokens: 6000
       min_tokens_for_duration: 1000
+  derived_task_scheduling:
+    # Interaction batches remain more responsive than ambient input, but a
+    # derived task still needs multiple committed batches and signal-bearing
+    # facts. Signal counts themselves are diagnostic only: one fact may emit
+    # several signals in a single extraction result.
+    entity_claim_min_signal_batches: 4
+    entity_claim_min_signal_facts: 8
+    interaction_entity_claim_min_signal_batches: 3
+    interaction_entity_claim_min_signal_facts: 5
+    future_commitment_min_signal_batches: 4
+    future_commitment_min_signal_facts: 5
+    interaction_future_commitment_min_signal_batches: 3
+    interaction_future_commitment_min_signal_facts: 3
   log_segmentation_decisions: true
 
 memory_manager:
   memory_enabled: true
   enable_memory_entity_claim_update: true
-  enable_memory_prospective_update: true
+  enable_memory_future_commitment_update: true
   llm:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash
@@ -202,7 +215,8 @@ memory_manager:
 
   task_queue_maxsize: 100
 
-  reflect_limit: 100
+  entity_claim_limit: 100
+  future_commitment_limit: 100
   entity_claim_explicit_min_confidence: 0.72
   entity_claim_derived_min_confidence: 0.75
   entity_claim_signal_max_per_fact: 3

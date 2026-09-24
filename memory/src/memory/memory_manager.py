@@ -24,7 +24,7 @@ import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import requests
@@ -349,24 +349,30 @@ class MemoryOperationReporter:
 
     @staticmethod
     def _operation_succeeded(operation_type: str, result: Any) -> bool:
+        failure_statuses = {
+            "failed",
+            "skipped",
+            "error",
+            "queue_rejected",
+        }
         if operation_type == "memory_store":
             if not isinstance(result, dict):
                 return bool(result)
-            return str(result.get("status") or "ok").strip().lower() not in {
-                "failed",
-                "skipped",
-                "error",
-                "queue_rejected",
-            }
-        if operation_type == "memory_reflect":
+            return (
+                str(result.get("status") or "ok").strip().lower()
+                not in failure_statuses
+            )
+        if operation_type in {
+            "memory_episode_summary",
+            "memory_entity_claim_update",
+            "memory_future_commitment_update",
+        }:
             if not isinstance(result, dict):
                 return False
-            return str(result.get("status") or "ok").strip().lower() not in {
-                "failed",
-                "error",
-                "queue_rejected",
-                "skipped",
-            }
+            return (
+                str(result.get("status") or "ok").strip().lower()
+                not in failure_statuses
+            )
         return True
 
     @staticmethod
@@ -451,8 +457,8 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_entity_claim_update", True),
             True,
         )
-        self._enable_memory_prospective_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_prospective_update", True),
+        self._enable_memory_future_commitment_update = self._config_bool(
+            self._memory_cfg.get("enable_memory_future_commitment_update", True),
             True,
         )
         self._world_owner_entity_name = _compact_whitespace(
@@ -503,6 +509,10 @@ class MemoryNodeManager:
         self._task_worker_lock = threading.Lock()
         self._task_shutdown_event = threading.Event()
         self._memory_operation_lock = threading.RLock()
+        self._task_completion_listener_lock = threading.Lock()
+        self._task_completion_listeners: List[
+            Callable[[Dict[str, Any]], None]
+        ] = []
 
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
@@ -821,12 +831,53 @@ class MemoryNodeManager:
         return self._memory_enabled
 
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
-        """Set the logger used by memory store, reflect, and recall operations."""
+        """Set the logger used by memory store, entity-claim, and recall operations."""
         self._logger = logger or logging.getLogger(__name__)
 
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
         """Share a pre-initialized embedding client with memory runtime callers."""
         self._embedding_client = embedding_client
+
+    def register_task_completion_listener(
+        self,
+        listener: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        """Register a non-blocking observer for completed asynchronous tasks.
+
+        Listeners receive task metadata only after the manager's domain lock has
+        been released.  They must not perform memory work synchronously; the
+        runtime uses this hook only to update its local scheduling state and
+        optionally enqueue follow-up tasks.
+        """
+        with self._task_completion_listener_lock:
+            if listener not in self._task_completion_listeners:
+                self._task_completion_listeners.append(listener)
+
+    def unregister_task_completion_listener(
+        self,
+        listener: Callable[[Dict[str, Any]], None],
+    ) -> None:
+        """Remove a previously registered asynchronous task observer."""
+        with self._task_completion_listener_lock:
+            self._task_completion_listeners = [
+                candidate
+                for candidate in self._task_completion_listeners
+                if candidate != listener
+            ]
+
+    def _emit_task_completion(self, event: Dict[str, Any]) -> None:
+        """Notify observers without allowing an observer failure to stop work."""
+        with self._task_completion_listener_lock:
+            listeners = list(self._task_completion_listeners)
+        for listener in listeners:
+            try:
+                listener(dict(event))
+            except Exception:
+                self._logger.exception(
+                    "Memory task completion listener failed task_kind=%s task_id=%s",
+                    event.get("task_kind"),
+                    event.get("task_id"),
+                )
 
     def _task_worker_loop(self) -> None:
         while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
@@ -837,16 +888,18 @@ class MemoryNodeManager:
             task_kind = str(task.get("kind") or "")
             task_id = str(task.get("task_id") or "")
             started_at = float(task.get("started_at") or time.monotonic())
+            result: Any = None
+            error: Optional[BaseException] = None
             try:
                 with self._memory_operation_lock:
                     if task_kind == "memory_store":
                         result = self._process_memory_store_task(**task["payload"])
                     elif task_kind == "memory_episode_summary":
                         result = self._process_memory_episode_summary_task(**task["payload"])
-                    elif task_kind == "memory_reflect":
-                        result = self._process_memory_reflect_task(**task["payload"])
-                    elif task_kind == "memory_prospective_update":
-                        result = self._process_memory_prospective_update_task(**task["payload"])
+                    elif task_kind == "memory_entity_claim_update":
+                        result = self._process_memory_entity_claim_update_task(**task["payload"])
+                    elif task_kind == "memory_future_commitment_update":
+                        result = self._process_memory_future_commitment_update_task(**task["payload"])
                     else:
                         raise ValueError(f"Unsupported memory async task: {task_kind}")
                 self._operation_reporter.on_task_finished(
@@ -856,6 +909,7 @@ class MemoryNodeManager:
                     result=result,
                 )
             except Exception as exc:
+                error = exc
                 self._logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
                 self._operation_reporter.on_task_finished(
                     operation_type=task_kind,
@@ -864,6 +918,19 @@ class MemoryNodeManager:
                     error=exc,
                 )
             finally:
+                self._emit_task_completion({
+                    "task_kind": task_kind,
+                    "task_id": task_id,
+                    "result": result,
+                    "error": error,
+                    "succeeded": error is None and self._operation_reporter._operation_succeeded(
+                        task_kind,
+                        result,
+                    ),
+                    "completion_context": dict(
+                        task.get("completion_context") or {}
+                    ),
+                })
                 self._task_queue.task_done()
 
     def _ensure_task_worker_locked(self) -> None:
@@ -881,6 +948,7 @@ class MemoryNodeManager:
         *,
         task_kind: str,
         payload: Dict[str, Any],
+        completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         task_id = self._operation_reporter.next_task_id(task_kind)
         with self._task_worker_lock:
@@ -897,6 +965,7 @@ class MemoryNodeManager:
                     "payload": payload,
                     "task_id": task_id,
                     "started_at": time.monotonic(),
+                    "completion_context": dict(completion_context or {}),
                 })
             except queue.Full:
                 self._logger.warning(
@@ -966,7 +1035,7 @@ class MemoryNodeManager:
         When ``wait`` is true, do not report shutdown as successful until every
         queued task has called ``task_done`` and the worker thread has exited.
         This is important because callers close the database immediately after
-        shutdown; closing it while a reflection transaction is still running
+        shutdown; closing it while an entity-claim transaction is still running
         rolls back all state updates made by that transaction.
         """
         with self._task_worker_lock:
@@ -993,6 +1062,7 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         tags: List[str],
         prompt_language: str,
+        completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Queue one normalized episode for ordered background storage."""
         if not self._memory_enabled or not raw_segments:
@@ -1010,6 +1080,7 @@ class MemoryNodeManager:
                 "tags": tags,
                 "prompt_language": prompt_language,
             },
+            completion_context=completion_context,
         )
 
     def submit_memory_episode_summary_task(
@@ -1196,6 +1267,18 @@ class MemoryNodeManager:
             "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
+            "entity_claim_signal_fact_count": int(
+                save_fact_info.get("entity_claim_signal_fact_count") or 0
+            ),
+            "entity_claim_signal_count": int(
+                save_fact_info.get("entity_claim_signal_count") or 0
+            ),
+            "future_commitment_signal_fact_count": int(
+                save_fact_info.get("future_commitment_signal_fact_count") or 0
+            ),
+            "future_commitment_signal_count": int(
+                save_fact_info.get("future_commitment_signal_count") or 0
+            ),
             "source_segment_ids": source_segment_ids,
             "source_segment_count": len(raw_segments),
             "source_segment_row_count": len(source_segment_ids),
@@ -1364,7 +1447,7 @@ class MemoryNodeManager:
                     "fact_root_topic": fact.get("fact_root_topic") or "",
                     "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
                     "entity_claim_signal": fact.get("entity_claim_signal") or [],
-                    "prospective_signals": fact.get("prospective_signals") or [],
+                    "future_commitment_signals": fact.get("future_commitment_signals") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
                     "time_confidence": metadata.get("time_confidence") or "",
@@ -1694,8 +1777,8 @@ class MemoryNodeManager:
                 raw_fact.get("entity_claim_signal"),
                 fallback_entity=primary_entity,
             )
-            prospective_signals = self._normalize_prospective_signals(
-                raw_fact.get("prospective_signals"),
+            future_commitment_signals = self._normalize_future_commitment_signals(
+                raw_fact.get("future_commitment_signals"),
                 fallback_entity=primary_entity,
             )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
@@ -1708,7 +1791,7 @@ class MemoryNodeManager:
                 "entities": entities,
                 "primary_entity": primary_entity,
                 "entity_claim_signal": entity_claim_signal,
-                "prospective_signals": prospective_signals,
+                "future_commitment_signals": future_commitment_signals,
                 "fact_root_topic": fact_root_topic,
                 "fact_aspect_topic": fact_aspect_topic,
                 "importance": max(0.6, min(1.0, priority / 100.0)),
@@ -1835,7 +1918,7 @@ class MemoryNodeManager:
                 break
         return normalized
 
-    def _normalize_prospective_signals(
+    def _normalize_future_commitment_signals(
         self,
         value: Any,
         *,
@@ -1850,7 +1933,7 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("prospective_signal_max_per_fact", 2) or 2
+                else self._memory_cfg.get("future_commitment_signal_max_per_fact", 2) or 2
             ),
         )
         if max_items <= 0:
@@ -1915,19 +1998,19 @@ class MemoryNodeManager:
                 subject_name = _compact_whitespace(subject)
             if subject_name.lower() in {"我", "本人", "用户", "user", "the user"}:
                 subject_name = self._world_owner_entity_name
-            prospective_anchor = _compact_whitespace(
-                raw.get("prospective_anchor") or raw.get("intent_anchor") or ""
+            future_commitment_anchor = _compact_whitespace(
+                raw.get("future_commitment_anchor") or raw.get("intent_anchor") or ""
             )[:240]
             evidence_basis = _compact_whitespace(
                 raw.get("evidence_basis") or raw.get("evidence") or raw.get("reason") or ""
             )[:480]
-            if not subject_name or not prospective_anchor or not evidence_basis:
+            if not subject_name or not future_commitment_anchor or not evidence_basis:
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
             key = (
                 subject_name.lower(),
                 evidence_kind,
-                self._generate_topic_name_key(prospective_anchor),
+                self._generate_topic_name_key(future_commitment_anchor),
             )
             if key in seen:
                 continue
@@ -1937,7 +2020,7 @@ class MemoryNodeManager:
                 "evidence_kind": evidence_kind,
                 "candidate_object_types": candidate_object_types,
                 "user_role": user_role,
-                "prospective_anchor": prospective_anchor,
+                "future_commitment_anchor": future_commitment_anchor,
                 "assertion_source": assertion_source,
                 "explicitness": explicitness,
                 "evidence_basis": evidence_basis,
@@ -2452,7 +2535,9 @@ class MemoryNodeManager:
         fact_ids: List[int] = []
         topic_item_updates: List[Dict[str, Any]] = []
         entity_claim_signal_mapping_updates: List[Dict[str, Any]] = []
-        prospective_signal_mapping_updates: List[Dict[str, Any]] = []
+        future_commitment_signal_mapping_updates: List[Dict[str, Any]] = []
+        entity_claim_signal_fact_ids: List[int] = []
+        future_commitment_signal_fact_ids: List[int] = []
         normalized_entity_info = {
             str(entity_name): int(entity_id)
             for entity_name, entity_id in (entity_info or {}).items()
@@ -2521,12 +2606,24 @@ class MemoryNodeManager:
                 importance=float(fact["importance"]),
             )
             fact_ids.append(fact_id)
-            entity_claim_signal_mapping_updates.extend(
+            entity_claim_updates = (
                 self._fact_entity_claim_signal_mapping_updates(fact_id, fact)
             )
-            prospective_signal_mapping_updates.extend(
-                self._fact_prospective_signal_mapping_updates(fact_id, fact)
+            entity_claim_signal_mapping_updates.extend(entity_claim_updates)
+            if any(
+                str(item.get("signal_key") or "") != "__fact__"
+                for item in entity_claim_updates
+            ):
+                entity_claim_signal_fact_ids.append(fact_id)
+            future_commitment_updates = (
+                self._fact_future_commitment_signal_mapping_updates(fact_id, fact)
             )
+            future_commitment_signal_mapping_updates.extend(future_commitment_updates)
+            if any(
+                str(item.get("signal_key") or "") != "__fact__"
+                for item in future_commitment_updates
+            ):
+                future_commitment_signal_fact_ids.append(fact_id)
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
                     canonical_topics=[fact_root_topic],
@@ -2537,63 +2634,94 @@ class MemoryNodeManager:
         self._db.upsert_fact_entity_claim_signal_mappings(
             entity_claim_signal_mapping_updates
         )
-        self._db.upsert_fact_prospective_signal_mappings(
-            prospective_signal_mapping_updates
+        self._db.upsert_fact_future_commitment_signal_mappings(
+            future_commitment_signal_mapping_updates
         )
         return {
             "fact_ids": fact_ids,
             "topic_item_updates": topic_item_updates,
+            "entity_claim_signal_fact_count": len(entity_claim_signal_fact_ids),
+            "entity_claim_signal_count": sum(
+                1
+                for item in entity_claim_signal_mapping_updates
+                if str(item.get("signal_key") or "") != "__fact__"
+            ),
+            "future_commitment_signal_fact_count": len(
+                future_commitment_signal_fact_ids
+            ),
+            "future_commitment_signal_count": sum(
+                1
+                for item in future_commitment_signal_mapping_updates
+                if str(item.get("signal_key") or "") != "__fact__"
+            ),
         }
 
-    # ── Reflection: facts/episodes -> entity claims ──────────────────────
+    # ── Entity-claim update: facts/episodes -> entity claims ─────────────
 
-    def submit_memory_reflect_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
-        """Queue reflection after all previously accepted memory tasks."""
+    def submit_memory_entity_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+        """Queue an entity-claim update after accepted memory tasks."""
+        completion_context = kwargs.pop("completion_context", None)
         if not self._memory_enabled:
-            task_id = self._operation_reporter.next_task_id("memory_reflect")
+            task_id = self._operation_reporter.next_task_id(
+                "memory_entity_claim_update"
+            )
             return self._reject_memory_task(
-                task_kind="memory_reflect",
+                task_kind="memory_entity_claim_update",
                 task_id=task_id,
                 reason="memory_disabled",
             )
         return self._submit_memory_task(
-            task_kind="memory_reflect",
+            task_kind="memory_entity_claim_update",
             payload=dict(kwargs),
+            completion_context=(
+                dict(completion_context)
+                if isinstance(completion_context, dict)
+                else None
+            ),
         )
 
-    def submit_memory_prospective_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
-        """Queue a prospective-world-model update after an episode boundary."""
-        if not self._memory_enabled or not self._enable_memory_prospective_update:
-            task_id = self._operation_reporter.next_task_id("memory_prospective_update")
+    def submit_memory_future_commitment_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
+        """Queue a future-commitment projection after committed fact evidence."""
+        completion_context = kwargs.pop("completion_context", None)
+        if not self._memory_enabled or not self._enable_memory_future_commitment_update:
+            task_id = self._operation_reporter.next_task_id("memory_future_commitment_update")
             return self._reject_memory_task(
-                task_kind="memory_prospective_update",
+                task_kind="memory_future_commitment_update",
                 task_id=task_id,
-                reason=("memory_disabled" if not self._memory_enabled else "prospective_update_disabled"),
+                reason=("memory_disabled" if not self._memory_enabled else "future_commitment_update_disabled"),
             )
         return self._submit_memory_task(
-            task_kind="memory_prospective_update",
+            task_kind="memory_future_commitment_update",
             payload=dict(kwargs),
+            completion_context=(
+                dict(completion_context)
+                if isinstance(completion_context, dict)
+                else None
+            ),
         )
 
-    def _process_memory_reflect_task(
+    def _process_memory_entity_claim_update_task(
         self,
         limit: Optional[int] = None,
-        reflect_timestamp: Optional[Any] = None,
+        reference_timestamp: Optional[Any] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Project new facts and completed episodes into entity claims."""
-        reflect_started_at = time.monotonic()
-        limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
-        if reflect_timestamp is None:
-            reflect_timestamp = kwargs.get("timestamp") or _now_text()
-        self._log_info("memory_reflect", "start", {
+        update_started_at = time.monotonic()
+        limit = max(
+            1,
+            int(limit or self._memory_cfg.get("entity_claim_limit") or 100),
+        )
+        if reference_timestamp is None:
+            reference_timestamp = kwargs.get("timestamp") or _now_text()
+        self._log_info("memory_entity_claim", "start", {
             "limit": limit,
-            "reflect_timestamp": reflect_timestamp,
+            "timestamp": reference_timestamp,
         })
         with self._db.transaction():
             claim_report = self._update_memory_entity_claims(
                 limit=limit,
-                reference_timestamp=reflect_timestamp,
+                reference_timestamp=reference_timestamp,
             )
         report = {
             "status": (
@@ -2621,24 +2749,27 @@ class MemoryNodeManager:
                 claim_report.get("inductive", {}).get("facts_marked_processed", 0) or 0
             ),
             "total_elapsed_ms": round(
-                (time.monotonic() - reflect_started_at) * 1000,
+                (time.monotonic() - update_started_at) * 1000,
                 2,
             ),
         }
-        self._log_info("memory_reflect", "finish", report)
+        self._log_info("memory_entity_claim", "finish", report)
         return report
 
-    def _process_memory_prospective_update_task(
+    def _process_memory_future_commitment_update_task(
         self,
         *,
         limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Settle pending future-facing evidence in isolated evidence groups."""
-        limit = max(1, int(limit or self._memory_cfg.get("reflect_limit") or 100))
+        limit = max(
+            1,
+            int(limit or self._memory_cfg.get("future_commitment_limit") or 100),
+        )
         reference_timestamp = reference_timestamp or _now_text()
         facts = self._db.get_unprocessed_facts(
-            processing_target="prospective_update",
+            processing_target="future_commitment_update",
             reference_timestamp=reference_timestamp,
             limit=limit,
             restrict_to_today=False,
@@ -2646,7 +2777,7 @@ class MemoryNodeManager:
         report: Dict[str, Any] = {
             "status": "empty",
             "seed_fact_count": len(facts),
-            "prospective_signal_count": 0,
+            "future_commitment_signal_count": 0,
             "evidence_group_count": 0,
             "candidate_count": 0,
             "applied_count": 0,
@@ -2655,11 +2786,11 @@ class MemoryNodeManager:
             "facts_marked_processed": 0,
             "failed_group_count": 0,
         }
-        self._log_reflect_facts_loaded(
-            "prospective_update", facts, limit, reference_timestamp,
+        self._log_future_commitment_facts_loaded(
+            "future_commitment_update", facts, limit, reference_timestamp,
         )
         if not facts:
-            self._log_info("memory_prospective_update", "finish", report)
+            self._log_info("memory_future_commitment_update", "finish", report)
             return report
 
         facts_by_id = {
@@ -2667,19 +2798,19 @@ class MemoryNodeManager:
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         }
-        prospective_signals = [
+        future_commitment_signals = [
             signal
             for fact in facts_by_id.values()
-            for signal in self._prospective_signals_from_fact(fact)
+            for signal in self._future_commitment_signals_from_fact(fact)
         ]
-        report["prospective_signal_count"] = len(prospective_signals)
-        if not prospective_signals:
-            self._log_info("memory_prospective_update", "finish", report)
+        report["future_commitment_signal_count"] = len(future_commitment_signals)
+        if not future_commitment_signals:
+            self._log_info("memory_future_commitment_update", "finish", report)
             return report
 
         world_owner_id = self._intent_world_owner_entity_id()
-        evidence_groups = self._group_prospective_signals(
-            prospective_signals,
+        evidence_groups = self._group_future_commitment_signals(
+            future_commitment_signals,
             facts_by_id=facts_by_id,
         )
         report["evidence_group_count"] = len(evidence_groups)
@@ -2699,7 +2830,7 @@ class MemoryNodeManager:
                 prompt_template.replace("{world_owner_name}", self._world_owner_entity_name)
                 .replace("{reference_timestamp}", str(reference_timestamp))
                 .replace("{facts}", json.dumps(
-                    self._prospective_group_fact_prompt_views(group),
+                    self._future_commitment_group_fact_prompt_views(group),
                     ensure_ascii=False,
                     indent=2,
                 ))
@@ -2717,11 +2848,11 @@ class MemoryNodeManager:
             ):
                 report["failed_group_count"] += 1
                 failed_group_fact_ids.update(group_fact_ids)
-                self._log_info("memory_prospective_update", "group_error", {
+                self._log_info("memory_future_commitment_update", "group_error", {
                     "group_index": group_index,
                     "group_key": group["group_key"],
                     "fact_ids": group_fact_ids,
-                    "error": "invalid_llm_prospective_extraction_response",
+                    "error": "invalid_llm_future_commitment_extraction_response",
                 })
                 continue
 
@@ -2749,7 +2880,7 @@ class MemoryNodeManager:
                 candidates,
                 world_owner_id=world_owner_id,
                 prompt_language=language,
-                existing_by_type=self._retrieve_prospective_related_intent_objects(
+                existing_by_type=self._retrieve_future_commitment_related_intent_objects(
                     candidates,
                     world_owner_id=world_owner_id,
                 ),
@@ -2760,11 +2891,11 @@ class MemoryNodeManager:
             report["applied_count"] += len(applied)
             report["created"] += sum(item["created"] for item in applied)
             report["updated"] += sum(not item["created"] for item in applied)
-            self._log_info("memory_prospective_update", "group_finish", {
+            self._log_info("memory_future_commitment_update", "group_finish", {
                 "group_index": group_index,
                 "group_key": group["group_key"],
                 "fact_ids": group_fact_ids,
-                "prospective_signal_count": len(group["signals"]),
+                "future_commitment_signal_count": len(group["signals"]),
                 "candidate_count": len(candidates),
                 "created": sum(item["created"] for item in applied),
                 "updated": sum(not item["created"] for item in applied),
@@ -2776,7 +2907,7 @@ class MemoryNodeManager:
         if completed_group_fact_ids:
             with self._db.transaction():
                 report["facts_marked_processed"] += self._db.mark_facts_processed(
-                    processing_target="prospective_update",
+                    processing_target="future_commitment_update",
                     fact_ids=completed_group_fact_ids,
                 )
 
@@ -2784,18 +2915,18 @@ class MemoryNodeManager:
             "error" if report["failed_group_count"] == len(evidence_groups)
             else "ok"
         )
-        self._log_info("memory_prospective_update", "finish", report)
+        self._log_info("memory_future_commitment_update", "finish", report)
         return report
 
-    def _group_prospective_signals(
+    def _group_future_commitment_signals(
         self,
-        prospective_signals: Sequence[Dict[str, Any]],
+        future_commitment_signals: Sequence[Dict[str, Any]],
         *,
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Group compatible persisted signals while keeping each prompt small."""
         groups_by_key: Dict[str, List[Dict[str, Any]]] = {}
-        for signal in prospective_signals:
+        for signal in future_commitment_signals:
             fact_id = int(signal["fact_id"])
             if fact_id not in facts_by_id:
                 continue
@@ -2831,7 +2962,7 @@ class MemoryNodeManager:
             for group in groups
         ]
 
-    def _prospective_group_fact_prompt_views(
+    def _future_commitment_group_fact_prompt_views(
         self,
         group: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
@@ -2841,12 +2972,12 @@ class MemoryNodeManager:
         views: List[Dict[str, Any]] = []
         for fact in group["facts"]:
             view = self._intent_fact_prompt_view(fact)
-            view["prospective_signals"] = [
+            view["future_commitment_signals"] = [
                 {
                     key: signal[key]
                     for key in (
                         "evidence_kind", "candidate_object_types", "subject_entity",
-                        "user_role", "prospective_anchor",
+                        "user_role", "future_commitment_anchor",
                         "assertion_source", "explicitness",
                     )
                 }
@@ -2855,7 +2986,7 @@ class MemoryNodeManager:
             views.append(view)
         return views
 
-    def _retrieve_prospective_related_intent_objects(
+    def _retrieve_future_commitment_related_intent_objects(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
@@ -3180,7 +3311,7 @@ class MemoryNodeManager:
         existing_by_type: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> Dict[int, Dict[str, Any]]:
         if existing_by_type is None:
-            existing_by_type = self._retrieve_prospective_related_intent_objects(
+            existing_by_type = self._retrieve_future_commitment_related_intent_objects(
                 candidates,
                 world_owner_id=world_owner_id,
             )
@@ -3274,7 +3405,7 @@ class MemoryNodeManager:
             field: item.get(field) or "" for field in fields
         }}
 
-    def _sync_prospective_recall_document(
+    def _sync_future_commitment_recall_document(
         self,
         *,
         object_type: str,
@@ -3347,7 +3478,7 @@ class MemoryNodeManager:
             confidence=float(item.get("confidence") or 0.0),
             importance=0.7,
             metadata={
-                "prospective_object_type": normalized_type,
+                "future_commitment_object_type": normalized_type,
                 "projection_version": "v1",
             },
         )
@@ -3391,7 +3522,7 @@ class MemoryNodeManager:
                 object_id=object_id,
             )
             if stored_object:
-                self._sync_prospective_recall_document(
+                self._sync_future_commitment_recall_document(
                     object_type=object_type,
                     item=stored_object,
                 )
@@ -3442,7 +3573,7 @@ class MemoryNodeManager:
         if candidate["object_type"] == "work_item":
             payload.update(
                 completed_at=(self._intent_effective_at(candidate) if status == "completed" else ""),
-                extractor_version="prospective_update_v1", prompt_version="v1",
+                extractor_version="future_commitment_update_v1", prompt_version="v1",
             )
         return payload
 
@@ -3545,7 +3676,7 @@ class MemoryNodeManager:
             )
         else:
             inductive_report["facts_marked_processed"] = 0
-        self._log_info("memory_reflect", "entity_claim_update_finish", {
+        self._log_info("memory_entity_claim", "entity_claim_update_finish", {
             "explicit": explicit_report,
             "derived": derived_report,
             "inductive": inductive_report,
@@ -4088,7 +4219,7 @@ class MemoryNodeManager:
                 "relations": candidate_decisions,
                 "merged": False,
             })
-        self._log_info("memory_reflect", "entity_claim_reconciled", {
+        self._log_info("memory_entity_claim", "entity_claim_reconciled", {
             "candidate_count": len(unique_candidates),
             "applied_count": len(applied),
             "relations": [
@@ -4794,15 +4925,15 @@ class MemoryNodeManager:
             "signal_key": "__fact__",
         }]
 
-    def _fact_prospective_signal_mapping_updates(
+    def _fact_future_commitment_signal_mapping_updates(
         self,
         fact_id: int,
         fact: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """Project one fact's normalized prospective signals into DB rows."""
         updates: List[Dict[str, Any]] = []
-        raw_signals = self._normalize_prospective_signals(
-            fact.get("prospective_signals"),
+        raw_signals = self._normalize_future_commitment_signals(
+            fact.get("future_commitment_signals"),
             fallback_entity=fact.get("primary_entity"),
         )
         for signal in raw_signals:
@@ -4810,24 +4941,24 @@ class MemoryNodeManager:
             entity_mapping = self._db.add_entity_names([subject_name])
             if not subject_name or subject_name not in entity_mapping:
                 continue
-            prospective_anchor = _compact_whitespace(
-                signal.get("prospective_anchor") or ""
+            future_commitment_anchor = _compact_whitespace(
+                signal.get("future_commitment_anchor") or ""
             )
-            prospective_anchor_key = self._generate_topic_name_key(prospective_anchor)
-            if not prospective_anchor or prospective_anchor_key == "general":
+            future_commitment_anchor_key = self._generate_topic_name_key(future_commitment_anchor)
+            if not future_commitment_anchor or future_commitment_anchor_key == "general":
                 continue
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
                     f"{int(entity_mapping[subject_name])}|{signal['evidence_kind']}|"
-                    f"{prospective_anchor_key}"
+                    f"{future_commitment_anchor_key}"
                 ),
                 "subject_entity_id": int(entity_mapping[subject_name]),
                 "evidence_kind": signal["evidence_kind"],
                 "candidate_object_types": signal["candidate_object_types"],
                 "user_role": signal["user_role"],
-                "prospective_anchor": prospective_anchor,
-                "prospective_anchor_key": prospective_anchor_key,
+                "future_commitment_anchor": future_commitment_anchor,
+                "future_commitment_anchor_key": future_commitment_anchor_key,
                 "assertion_source": signal["assertion_source"],
                 "explicitness": signal["explicitness"],
                 "evidence_basis": signal["evidence_basis"],
@@ -5006,15 +5137,15 @@ class MemoryNodeManager:
         target = _compact_whitespace(object_name)
         return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
-    def _log_reflect_facts_loaded(
+    def _log_future_commitment_facts_loaded(
         self,
         processing_target: str,
         facts: List[Dict[str, Any]],
         limit: int,
         reference_timestamp: Any,
     ) -> None:
-        """Log the independent fact batch consumed by one reflect projection."""
-        self._log_info("memory_reflect", "facts_loaded", {
+        """Log the independent fact batch consumed by future-commitment update."""
+        self._log_info("memory_future_commitment_update", "facts_loaded", {
             "processing_target": processing_target,
             "fact_count": len(facts),
             "fact_ids": [fact.get("id") for fact in facts],
@@ -5313,13 +5444,13 @@ class MemoryNodeManager:
             self._db.get_fact_entity_claim_signal_mappings(fact_id).values()
         )
 
-    def _prospective_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _future_commitment_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Read prospective evidence solely from its normalized mapping rows."""
         fact_id = int(fact.get("id") or 0)
         if fact_id <= 0:
             return []
         return list(
-            self._db.get_fact_prospective_signal_mappings(fact_id).values()
+            self._db.get_fact_future_commitment_signal_mappings(fact_id).values()
         )
 
     def _entities_for_entity_claim_signal(
@@ -5369,7 +5500,7 @@ class MemoryNodeManager:
             out.append(clean)
         return out[:1]
 
-    def _should_route_fact_to_prospective_update(self, fact: Dict[str, Any]) -> bool:
+    def _should_route_fact_to_future_commitment_update(self, fact: Dict[str, Any]) -> bool:
         """Return whether a fact merits semantic review by the intent task.
 
         This is deliberately a high-recall, deterministic intake gate.  It does
@@ -5963,7 +6094,7 @@ class MemoryNodeManager:
         prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Run recall immediately against the latest committed memory snapshot."""
-        # Recall is read-only and must not wait for the store/reflect worker's
+        # Recall is read-only and must not wait for the store/entity-claim worker's
         # long-running LLM or embedding work. A separate WAL reader gives it
         # a consistent committed snapshot without sharing the writer connection.
         with self._db.reader_transaction() as reader_db:
@@ -7005,7 +7136,7 @@ class MemoryNodeManager:
             candidate for candidate in direct_candidates or []
             if str(candidate.get("index_level") or "") == "entity_claim"
         ]
-        prospective_candidates = [
+        future_commitment_candidates = [
             candidate for candidate in direct_candidates or []
             if str(candidate.get("index_level") or "")
             in {"goal", "plan", "work_item"}
@@ -7036,11 +7167,11 @@ class MemoryNodeManager:
                     str(candidate.get("index_level") or ""),
                     int(candidate.get("target_id") or 0),
                 )
-                for candidate in prospective_candidates
+                for candidate in future_commitment_candidates
             ],
-            limit=max(24, len(prospective_candidates) * 4),
+            limit=max(24, len(future_commitment_candidates) * 4),
         )
-        for candidate in prospective_candidates:
+        for candidate in future_commitment_candidates:
             key = (
                 str(candidate.get("index_level") or ""),
                 int(candidate.get("target_id") or 0),
@@ -7484,7 +7615,7 @@ class MemoryNodeManager:
             and status_eligible
             and bool(time_score_info.get("within_temporal_bounds"))
         ):
-            strong_anchor_reasons.append("temporal_prospective_match")
+            strong_anchor_reasons.append("temporal_future_commitment_match")
         has_strong_anchor = bool(strong_anchor_reasons)
         fast_match_details = {
             # Preserve the same detail shape consumed by the Stage 1 evidence
@@ -7699,7 +7830,7 @@ class MemoryNodeManager:
             if str(candidate.get("index_level") or "") == "entity_claim"
             and not candidate.get("_recall_association_relation")
         ]
-        direct_prospective_candidates = [
+        direct_future_commitment_candidates = [
             candidate for candidate in candidates or []
             if str(candidate.get("index_level") or "")
             in {"goal", "plan", "work_item"}
@@ -7715,10 +7846,10 @@ class MemoryNodeManager:
             if str(candidate.get("_recall_association_relation") or "")
             == "intent_evidence"
         )
-        has_temporal_prospective_match = any(
-            "temporal_prospective_match"
+        has_temporal_future_commitment_match = any(
+            "temporal_future_commitment_match"
             in (candidate.get("strong_anchor_reasons") or [])
-            for candidate in direct_prospective_candidates
+            for candidate in direct_future_commitment_candidates
         )
         # A future-oriented question can intentionally omit the subject of
         # the planned object (for example, "我明天要去哪里？").  In that
@@ -7729,21 +7860,21 @@ class MemoryNodeManager:
             lexical_query_term_coverage_sufficient
             or (
                 "prospective" in modes
-                and has_temporal_prospective_match
+                and has_temporal_future_commitment_match
             )
         )
         has_primary_query_coverage = bool(
             matched_topic_term_keys
             or matched_high_value_entities
-            or has_temporal_prospective_match
+            or has_temporal_future_commitment_match
         )
         knowledge_evidence_sufficient = (
             "knowledge" not in modes
             or bool(direct_claim_candidates and claim_evidence_count)
         )
-        prospective_evidence_sufficient = (
+        future_commitment_evidence_sufficient = (
             "prospective" not in modes
-            or bool(direct_prospective_candidates and intent_evidence_count)
+            or bool(direct_future_commitment_candidates and intent_evidence_count)
         )
         trusted = (
             bool(candidates)
@@ -7751,7 +7882,7 @@ class MemoryNodeManager:
             and query_term_coverage_sufficient
             and query_entity_coverage_sufficient
             and knowledge_evidence_sufficient
-            and prospective_evidence_sufficient
+            and future_commitment_evidence_sufficient
         )
         return {
             "trusted": trusted,
@@ -7781,10 +7912,10 @@ class MemoryNodeManager:
             "direct_entity_claim_count": len(direct_claim_candidates),
             "claim_evidence_count": claim_evidence_count,
             "knowledge_evidence_sufficient": knowledge_evidence_sufficient,
-            "direct_prospective_count": len(direct_prospective_candidates),
+            "direct_future_commitment_count": len(direct_future_commitment_candidates),
             "intent_evidence_count": intent_evidence_count,
-            "prospective_evidence_sufficient": prospective_evidence_sufficient,
-            "has_temporal_prospective_match": has_temporal_prospective_match,
+            "future_commitment_evidence_sufficient": future_commitment_evidence_sufficient,
+            "has_temporal_future_commitment_match": has_temporal_future_commitment_match,
         }
 
     @staticmethod

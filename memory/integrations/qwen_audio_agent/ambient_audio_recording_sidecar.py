@@ -196,14 +196,6 @@ class AmbientAudioRecordingService:
         self._stopping = False
         self._memory_finalized = False
         self._write_manifest()
-        self._agent_memory_ipc.request(
-            "set_ambient_recording_state",
-            {
-                "ownerId": self._agent_memory_ipc.owner_id,
-                "recordingId": recording_id,
-                "active": True,
-            },
-        )
         self._logger.info(
             "ambient recording started recording_id=%s chunk_seconds=%.3f",
             recording_id,
@@ -459,14 +451,6 @@ class AmbientAudioRecordingService:
             },
         )
         self._memory_finalized = True
-        self._agent_memory_ipc.request(
-            "set_ambient_recording_state",
-            {
-                "ownerId": self._agent_memory_ipc.owner_id,
-                "recordingId": self._recording_id,
-                "active": False,
-            },
-        )
         self._logger.info(
             "ambient recording memory finalized recording_id=%s episode_summary_queued=%s",
             self._recording_id,

@@ -68,7 +68,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-pending-memory-input-units", type=int, default=0)
     parser.add_argument("--min-pending-memory-input-tokens", type=int, default=0)
     parser.add_argument("--max-gap-seconds", type=float, default=-1.0)
-    parser.add_argument("--enable-reflect", action="store_true", help="Run memory reflection after storing episodes.")
     parser.add_argument("--disable-llm", action="store_true", help="Use heuristic fallback extraction only.")
     parser.add_argument("--llm-model")
     parser.add_argument("--llm-base-url")
@@ -164,61 +163,54 @@ def main() -> None:
         logger=memory_logger,
     )
 
-    queued_memory_store_count = 0
-    for segment_index, segment in enumerate(memory_segments, 1):
-        input_report = runtime.accept_memory_input(
-            transcript_segments=[segment],
-            tags=["Eval_Ali", textgrid_path.stem],
-            ambient_recording_enabled=True,
-        )
-        queued_memory_store_count += int(bool(input_report.get("queued")))
-        if input_report.get("queued"):
-            logging.info(
-                "Queued memory input batch while processing transcript segment %s/%s",
-                segment_index,
-                len(memory_segments),
-            )
-
-    final_input_flush = runtime.flush_pending_memory_inputs(
-        evaluate_episode_summary=False,
+    input_report = runtime.accept_memory_input(
+        transcript_segments=memory_segments,
+        tags=["Eval_Ali", textgrid_path.stem],
+        ambient_recording_enabled=True,
     )
-    queued_memory_store_count += int(final_input_flush)
-    episode_summary_result = runtime.trigger_memory_episode_summary(
+    queued_memory_store_count = int(bool(input_report.get("queued")))
+    if input_report.get("queued"):
+        logging.info(
+            "Queued one or more memory input batches from transcript segments=%s",
+            len(memory_segments),
+        )
+
+    finalization = runtime.finalize_memory_session(
         reason="ali_eval_complete",
         tags=["Eval_Ali", textgrid_path.stem],
     )
-
-    reflect_result: Dict[str, Any] = {}
-    reflect_submit: Dict[str, Any] = {}
-    if args.enable_reflect:
-        reflect_timestamp = (
-            memory_segments[-1].get("ended_at")
-            if memory_segments
-            else session_start.isoformat()
-        )
-        reflect_submit = runtime.trigger_memory_reflect(
-            reflect_timestamp=reflect_timestamp,
-        )
-        queued_memory_store_count += int(
-            bool((reflect_submit.get("pending_memory_input_flush") or {}).get("queued"))
-        )
+    final_input_flush = dict(finalization.get("input_flush") or {})
+    episode_summary_result = dict(finalization.get("episode_summary") or {})
+    entity_claim_submit = dict(
+        (finalization.get("derived_tasks") or {}).get("entity_claim") or {}
+    )
+    future_commitment_submit = dict(
+        (finalization.get("derived_tasks") or {}).get("future_commitment") or {}
+    )
+    queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
     if (
         queued_memory_store_count
         or episode_summary_result.get("queued")
-        or reflect_submit.get("queued")
+        or entity_claim_submit.get("queued")
+        or future_commitment_submit.get("queued")
     ) and not runtime.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
-    if args.enable_reflect:
-        reflect_result = operation_reporter.latest_report("memory_reflect") or reflect_submit
-        logging.info("Reflect result: %s", reflect_result)
     store_operation_report = operation_reporter.operation_report("memory_store")
+    entity_claim_result = (
+        operation_reporter.latest_report("memory_entity_claim_update")
+        or entity_claim_submit
+    )
+    future_commitment_result = (
+        operation_reporter.latest_report("memory_future_commitment_update")
+        or future_commitment_submit
+    )
     logging.info(
         "Transcript input complete segments=%s pending=%s queued_memory_stores=%s "
         "stored_memory_stores=%s",
         len(memory_segments),
-        len(runtime._memory_input_segmenter.pending_unit_snapshot()),
+        len(runtime._memory_context_manager.pending_unit_snapshot()),
         queued_memory_store_count,
         store_operation_report["succeeded"],
     )
@@ -236,7 +228,8 @@ def main() -> None:
         "ambient_recording_enabled": True,
         "session_start": session_start.isoformat(),
         "episode_summary_result": episode_summary_result,
-        "reflect_result": reflect_result,
+        "entity_claim_result": entity_claim_result,
+        "future_commitment_result": future_commitment_result,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)

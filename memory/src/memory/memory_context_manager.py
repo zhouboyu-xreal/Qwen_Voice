@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from collections import deque
 import re
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -581,7 +581,7 @@ class MemoryContextManager:
 
         Ambient input whose event time has not yet been covered by ASR is
         retained separately.  Once the watermark advances,
-        :meth:`process_awaiting_ambient_units` feeds it back through this
+        :meth:`iter_awaiting_ambient_units` feeds it back through this
         same method, preserving one canonical boundary path.
         """
         if (
@@ -605,29 +605,35 @@ class MemoryContextManager:
         self._insert_pending_unit(incoming_unit, incoming_embedding)
         return decision, finalized_units
 
-    def update_ambient_asr_watermark(self, value: Any) -> None:
-        """Advance the latest event time known to be covered by ambient ASR."""
+    def update_ambient_asr_watermark(self, value: Any) -> Optional[datetime]:
+        """Advance and return the latest event time covered by ambient ASR."""
         parsed = self._parse_timestamp(value)
         if parsed is not None and (
             self._ambient_asr_watermark is None
             or parsed > self._ambient_asr_watermark
         ):
             self._ambient_asr_watermark = parsed
+        return self._ambient_asr_watermark
 
-    def process_awaiting_ambient_units(
+    def awaiting_ambient_unit_count(self) -> int:
+        """Return the number of input units waiting for ambient-ASR coverage."""
+        return len(self._awaiting_ambient_buffer)
+
+    def iter_awaiting_ambient_units(
         self,
         *,
         force: bool = False,
-    ) -> List[Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]]:
-        """Process watermark-covered waiting units through ``insert_incoming_unit``.
+    ) -> Iterator[Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]]:
+        """Yield each covered unit immediately after its boundary decision.
 
         ``force`` is reserved for an explicit runtime flush, when the caller
         intentionally accepts the remaining ASR-delay risk rather than
         leaving an input unit unpersisted.
+
+        The iterator deliberately does not accumulate decisions. Its caller
+        can submit a finalized prefix while later waiting units are still
+        being embedded and scored.
         """
-        processed: List[
-            Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]
-        ] = []
         while self._awaiting_ambient_buffer:
             unit = self._awaiting_ambient_buffer[0]
             if not force and not self._ambient_asr_covers_unit(unit):
@@ -637,8 +643,20 @@ class MemoryContextManager:
                 unit,
                 ambient_recording_enabled=not force,
             )
-            processed.append((unit, decision, finalized_units))
-        return processed
+            yield unit, decision, finalized_units
+
+    def process_awaiting_ambient_units(
+        self,
+        *,
+        force: bool = False,
+    ) -> List[Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]]:
+        """Return all released units for callers that require a materialized list.
+
+        Runtime ingestion uses :meth:`iter_awaiting_ambient_units` so a long
+        ambient-ASR batch does not delay memory-store submission until every
+        later unit has been scored.
+        """
+        return list(self.iter_awaiting_ambient_units(force=force))
 
     def _ambient_asr_covers_unit(self, unit: MemoryUnit) -> bool:
         if self._ambient_asr_watermark is None:
@@ -1078,21 +1096,15 @@ class MemoryContextManager:
             cls.unit_timestamp(incoming_unit),
         )
 
-    @staticmethod
+    @classmethod
     def timestamp_gap_seconds(
+        cls,
         previous_end: Any,
         current_start: Any,
     ) -> Optional[float]:
         """Return the gap between two timestamp values, if both are valid."""
-        if not previous_end or not current_start:
-            return None
-        try:
-            previous = datetime.fromisoformat(
-                str(previous_end).replace("Z", "+00:00"),
-            )
-            current = datetime.fromisoformat(
-                str(current_start).replace("Z", "+00:00"),
-            )
-        except ValueError:
+        previous = cls._parse_timestamp(previous_end)
+        current = cls._parse_timestamp(current_start)
+        if previous is None or current is None:
             return None
         return (current - previous).total_seconds()
