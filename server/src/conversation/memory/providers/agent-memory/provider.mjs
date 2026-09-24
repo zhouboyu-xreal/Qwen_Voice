@@ -27,6 +27,21 @@ function clean(value, limit = 8_000) {
   return [...String(value || '').replaceAll('\0', '').trim()].slice(0, limit).join('')
 }
 
+function timestamp(value) {
+  const normalized = Number(value)
+  return Number.isFinite(normalized) && normalized > 0 ? normalized : null
+}
+
+function turnTimingFields(turnTiming) {
+  const timing = turnTiming && typeof turnTiming === 'object' ? turnTiming : {}
+  return {
+    userStartedAt: timestamp(timing.userStartedAt),
+    userEndedAt: timestamp(timing.userEndedAt),
+    assistantStartedAt: timestamp(timing.assistantStartedAt),
+    assistantEndedAt: timestamp(timing.assistantEndedAt),
+  }
+}
+
 function defaultPythonCommand(env) {
   if (String(env.AGENT_MEMORY_PYTHON || '').trim()) return env.AGENT_MEMORY_PYTHON
   return process.platform === 'win32' ? 'python' : 'python3'
@@ -204,6 +219,7 @@ export class AgentMemoryProvider {
   }
 
   async observe(ownerId, exchange, context = {}) {
+    const timing = turnTimingFields(context.turnTiming)
     const messages = Array.isArray(exchange?.messages)
       ? exchange.messages.map(message => ({
           id: clean(message?.id, 240),
@@ -213,6 +229,7 @@ export class AgentMemoryProvider {
           createdAt: Number.isFinite(Number(message?.createdAt))
             ? Number(message.createdAt)
             : null,
+          ...timing,
         })).filter(message => message.content && !SENSITIVE.test(message.content))
       : []
     if (!messages.length) return { observed: false }

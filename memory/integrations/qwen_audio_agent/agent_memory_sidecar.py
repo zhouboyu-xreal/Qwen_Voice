@@ -237,11 +237,31 @@ class AgentMemoryRuntime:
             if key in holder.seen:
                 continue
             turn_id = _clean(message.get("turnId"), 240)
+            fallback_timestamp = _normalize_turn_timestamp(message.get("createdAt"))
             report = holder.runtime.accept_memory_input(
                 interaction_turn={
                     "user_message": content,
                     "assistant_response": assistants.get(turn_id, ""),
-                    "turn_timestamp": _normalize_turn_timestamp(message.get("createdAt")),
+                    # The Gateway preserves VAD and actual client-playback
+                    # boundaries on the message.  Keep ``turn_timestamp`` as
+                    # a compatibility fallback for text-only/older clients.
+                    "turn_timestamp": fallback_timestamp,
+                    "user_started_at": (
+                        _normalize_turn_timestamp(message.get("userStartedAt"))
+                        or fallback_timestamp
+                    ),
+                    "user_ended_at": (
+                        _normalize_turn_timestamp(message.get("userEndedAt"))
+                        or fallback_timestamp
+                    ),
+                    "assistant_started_at": (
+                        _normalize_turn_timestamp(message.get("assistantStartedAt"))
+                        or fallback_timestamp
+                    ),
+                    "assistant_ended_at": (
+                        _normalize_turn_timestamp(message.get("assistantEndedAt"))
+                        or fallback_timestamp
+                    ),
                 },
                 tags=["qwen-audio-agent"],
                 ambient_recording_enabled=ambient_recording_enabled,

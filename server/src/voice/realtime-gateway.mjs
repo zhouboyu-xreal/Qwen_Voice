@@ -984,6 +984,26 @@ export function attachRealtimeGateway(server, {
       responseStartWatchdog.unref?.()
     }
 
+    // Keep one timing record for the lifecycle of each user turn.  User VAD
+    // boundaries originate at the realtime provider; assistant boundaries
+    // originate at the client that actually renders the audio.
+    const memoryTurnTiming = new Map()
+    const recordMemoryTurnTiming = (turnId, field, occurredAt) => {
+      const key = String(turnId || '').trim()
+      if (!key) return
+      const value = Number(occurredAt)
+      const timestamp = Number.isFinite(value) && value > 0 ? value : Date.now()
+      const timing = memoryTurnTiming.get(key) || {}
+      if (field === 'userStartedAt') {
+        timing.userStartedAt ??= timestamp
+      } else if (field === 'assistantStartedAt') {
+        timing.assistantStartedAt ??= timestamp
+      } else {
+        timing[field] = timestamp
+      }
+      memoryTurnTiming.set(key, timing)
+    }
+
     const inputs = new RealtimeInputRuntime({
       ownerId,
       sessionId,
@@ -1007,21 +1027,27 @@ export function attachRealtimeGateway(server, {
         // attached on this turn when needed, and remains available through
         // the rest of the activation without being duplicated per turn.
         void injectActivePreWakeContext('voice_speech_started')
+        recordMemoryTurnTiming(fields?.turnId, 'userStartedAt', fields?.occurredAt)
         presentationRuntime.interruptActiveResponses()
         observeMemoryAudio({ type: 'speech_started', ...fields })
       },
       onSpeechStopped: fields => {
         connectionLogger.info('realtime.provider.speech_stopped', fields)
+        recordMemoryTurnTiming(fields?.turnId, 'userEndedAt', fields?.occurredAt)
         observeMemoryAudio({ type: 'speech_stopped', ...fields })
       },
     })
 
-    const observeCompletedMemoryTurn = assistantMessage => {
+    const observeCompletedMemoryTurn = (assistantMessage, deliveryTiming = {}) => {
       if (
         !memoryService?.ownsSessionObservation?.()
         || !assistantMessage?.turnId
       ) return
       const turnId = String(assistantMessage.turnId)
+      const turnTiming = {
+        ...(memoryTurnTiming.get(turnId) || {}),
+        ...(deliveryTiming || {}),
+      }
       const messages = conversationSync.frontendContext({ ownerId, sessionId })
         .filter(message => (
           message.turnId === turnId
@@ -1033,6 +1059,7 @@ export function attachRealtimeGateway(server, {
       }, {
         source: 'turn-complete',
         sessionId,
+        turnTiming,
       })).catch(error => {
         connectionLogger.warn('memory.provider_turn_observe_failed', {
           turnId,
@@ -1040,7 +1067,10 @@ export function attachRealtimeGateway(server, {
         })
       })
       pendingMemoryOperations.add(observing)
-      observing.finally(() => pendingMemoryOperations.delete(observing))
+      observing.finally(() => {
+        pendingMemoryOperations.delete(observing)
+        memoryTurnTiming.delete(turnId)
+      })
     }
 
     const presentationRuntime = new RealtimePresentationRuntime({
@@ -2073,7 +2103,7 @@ export function attachRealtimeGateway(server, {
             turnId: playbackContext?.turnId || '',
             origin: playbackContext?.origin || 'model',
           })
-          presentationRuntime.startPlayback(id)
+          presentationRuntime.startPlayback(id, { occurredAt: event.occurredAt })
         }
       } else if (event.type === GatewayClientEvent.PLAYBACK_ENDED) {
         const id = String(event.responseId || '')
@@ -2082,7 +2112,7 @@ export function attachRealtimeGateway(server, {
           active: activeVoiceClients.isActive(ownerId, voiceClient),
           responseKnown: presentationRuntime.has(id),
         })) {
-          presentationRuntime.finishPlayback(id)
+          presentationRuntime.finishPlayback(id, { occurredAt: event.occurredAt })
           // Start the shared CLI/Desktop inactivity window only after the
           // user has actually heard the complete response. Otherwise a long
           // response can consume its whole idle budget while playback blocks

@@ -54,6 +54,11 @@ function awaitsToolFollowUp(context) {
   return Boolean(context?.awaitsToolFollowUp ?? context?.hasFunctionCall)
 }
 
+function playbackOccurredAt(value) {
+  const timestamp = Number(value)
+  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now()
+}
+
 /**
  * Owns response correlation and user-visible presentation for one realtime
  * connection. Audio/text provider events and client playback receipts meet at
@@ -554,7 +559,12 @@ export class RealtimePresentationRuntime {
     context.memoryObservationNotified = true
     // The callback must stay synchronous and isolated from the realtime
     // presentation path. Gateway wires asynchronous memory observation here.
-    try { this.onAssistantMessageRecorded?.(context.assistantMessage) } catch { /* observer isolation */ }
+    try {
+      this.onAssistantMessageRecorded?.(context.assistantMessage, {
+        assistantStartedAt: context.playbackStartedAt ?? null,
+        assistantEndedAt: context.playbackEndedAt ?? null,
+      })
+    } catch { /* observer isolation */ }
   }
 
   #scheduleContextCleanup(id, context) {
@@ -577,7 +587,7 @@ export class RealtimePresentationRuntime {
     timer.unref?.()
   }
 
-  startPlayback(id) {
+  startPlayback(id, { occurredAt = null } = {}) {
     const context = this.contexts.get(id)
     if (context?.suppressed) return
     this.announcementWindow.startPlayback(id)
@@ -592,13 +602,14 @@ export class RealtimePresentationRuntime {
     })
     if (!context || context.playbackStarted) return
     context.playbackStarted = true
+    context.playbackStartedAt = playbackOccurredAt(occurredAt)
     if (confirmsTaskNotificationOnPlaybackStart(context)) {
       this.announcements.confirmMany(contextTaskIds(context))
     }
     this.#flushPendingTranscripts(id, context)
   }
 
-  finishPlayback(id) {
+  finishPlayback(id, { occurredAt = null } = {}) {
     const playbackTurnId = this.playbackTurns.get(id) || this.turns.turnId
     const context = this.contexts.get(id)
     if (context?.suppressed) {
@@ -611,6 +622,7 @@ export class RealtimePresentationRuntime {
     this.playbackTurns.delete(id)
     if (context) {
       context.playbackEnded = true
+      context.playbackEndedAt = playbackOccurredAt(occurredAt)
       this.#notifyDeliveredAssistantMessage(id, context)
       this.#finishContextIfComplete(id, context)
       if (this.contexts.get(id) === context) {

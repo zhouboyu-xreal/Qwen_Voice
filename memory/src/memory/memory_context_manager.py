@@ -329,7 +329,13 @@ def convert_interaction_turn_to_online_unit(
         "user_message": user_message,
         "assistant_response": assistant_response,
     })
-    timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or ""
+    fallback_timestamp = _to_timestamp_text(turn.get("turn_timestamp")) or ""
+    user_started_at = _to_timestamp_text(turn.get("user_started_at")) or fallback_timestamp
+    user_ended_at = _to_timestamp_text(turn.get("user_ended_at")) or user_started_at
+    assistant_started_at = (
+        _to_timestamp_text(turn.get("assistant_started_at")) or fallback_timestamp
+    )
+    assistant_ended_at = _to_timestamp_text(turn.get("assistant_ended_at")) or assistant_started_at
     tags = [
         str(tag).strip()
         for tag in turn.get("tags") or []
@@ -340,23 +346,29 @@ def convert_interaction_turn_to_online_unit(
         raw_segments.append({
             "speaker": "用户",
             "text": user_message,
-            "started_at": timestamp,
-            "ended_at": timestamp,
+            "started_at": user_started_at,
+            "ended_at": user_ended_at,
             "tags": tags,
         })
     if assistant_response:
         raw_segments.append({
             "speaker": "助手",
             "text": assistant_response,
-            "started_at": timestamp,
-            "ended_at": timestamp,
+            "started_at": assistant_started_at,
+            "ended_at": assistant_ended_at,
             "tags": tags,
         })
     return MemoryUnit(
         text=text,
         token_count=_estimate_interaction_token_count(text),
-        timestamp=timestamp,
-        ended_at=timestamp,
+        # A unified unit needs a sortable envelope while raw segments retain
+        # their individual speech/playback intervals.
+        timestamp=(
+            user_started_at if user_message else assistant_started_at
+        ) or fallback_timestamp,
+        ended_at=(
+            assistant_ended_at if assistant_response else user_ended_at
+        ) or fallback_timestamp,
         raw={
             "raw_segments": raw_segments,
             "input_kind": "interaction",

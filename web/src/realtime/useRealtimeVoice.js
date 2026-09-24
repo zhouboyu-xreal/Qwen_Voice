@@ -339,6 +339,7 @@ export default function useRealtimeVoice({
       sendSocketEvent({
         type,
         responseId,
+        occurredAt: Date.now(),
         ...(reason ? { reason } : {}),
       })
     }

@@ -111,6 +111,10 @@ export class RealtimeInputRuntime {
     this.onSpeechStarted({
       turnId: started.context.turnId,
       source: 'realtime_provider',
+      // The provider VAD event is the earliest reliable boundary available to
+      // the Gateway for a voice turn.  Preserve its receipt time so durable
+      // memory does not later stamp the whole interaction at ASR completion.
+      occurredAt: Date.now(),
     })
     this.announcementWindow.beginTurn(started.context.turnId)
     this.announcements.dismissActive()
@@ -142,6 +146,7 @@ export class RealtimeInputRuntime {
     this.onSpeechStopped({
       turnId: stoppedTurn.turnId,
       source: 'realtime_provider',
+      occurredAt: Date.now(),
       ...(event.reason ? { reason: String(event.reason) } : {}),
     })
     this.turns.endSpeech()

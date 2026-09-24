@@ -482,6 +482,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         socket.send({
           type: GatewayClientEvent.PLAYBACK_STARTED,
           responseId,
+          occurredAt: Date.now(),
         })
       }
     },
@@ -490,6 +491,7 @@ export async function runTui(options = parseArguments(process.argv.slice(2))) {
         socket.send({
           type: GatewayClientEvent.PLAYBACK_ENDED,
           responseId,
+          occurredAt: Date.now(),
         })
       }
     },

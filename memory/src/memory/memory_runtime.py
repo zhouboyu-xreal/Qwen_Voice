@@ -13,6 +13,7 @@ import json
 import re
 import threading
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -35,6 +36,14 @@ from .memory_context_manager import (
     build_transcript_aggregation_config,
     convert_interaction_turn_to_online_unit,
 )
+
+
+_MEMORY_INPUT_TOKEN_RE = re.compile(
+    r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]"
+)
+_MEMORY_INPUT_DEDUP_MIN_TEXT_CHARS = 8
+_MEMORY_INPUT_DEDUP_MAX_TIME_GAP_SECONDS = 120.0
+_MEMORY_INPUT_DEDUP_MIN_FUZZY_RATIO = 0.90
 
 
 class _DerivedMemoryTaskScheduler:
@@ -596,15 +605,31 @@ class MemoryRuntime:
             "assistant_response": _compact_whitespace(interaction_turn.get("assistant_response") or ""),
             "tags": list(tags),
             "turn_timestamp": turn_timestamp,
+            "user_started_at": _to_timestamp_text(
+                interaction_turn.get("user_started_at")
+            ) or turn_timestamp,
+            "user_ended_at": _to_timestamp_text(
+                interaction_turn.get("user_ended_at")
+            ) or turn_timestamp,
+            "assistant_started_at": _to_timestamp_text(
+                interaction_turn.get("assistant_started_at")
+            ) or turn_timestamp,
+            "assistant_ended_at": _to_timestamp_text(
+                interaction_turn.get("assistant_ended_at")
+            ) or turn_timestamp,
         }
         if not turn["user_message"] and not turn["assistant_response"]:
             return {"queued": False, "reason": "empty_turn"}
         self._logger.info(
             "memory runtime received interaction turn ambient_recording_enabled=%s "
-            "timestamp=%s tags=%s user_chars=%s assistant_chars=%s "
+            "user_started_at=%s user_ended_at=%s assistant_started_at=%s "
+            "assistant_ended_at=%s tags=%s user_chars=%s assistant_chars=%s "
             "user_message=%s assistant_response=%s",
             ambient_recording_enabled,
-            turn["turn_timestamp"],
+            turn["user_started_at"],
+            turn["user_ended_at"],
+            turn["assistant_started_at"],
+            turn["assistant_ended_at"],
             turn["tags"],
             len(turn["user_message"]),
             len(turn["assistant_response"]),
@@ -915,8 +940,11 @@ class MemoryRuntime:
     ) -> Dict[str, Any]:
         """Submit already selected shared units without changing their route."""
         pending_units = list(units)
+        canonical_units, deduplication_report = (
+            self._deduplicate_memory_input_units(pending_units)
+        )
         raw_segments, prompt_language = self._normalize_units_into_memory_raw_segments(
-            pending_units,
+            canonical_units,
         )
         if not raw_segments:
             if clear_segmenter:
@@ -935,8 +963,13 @@ class MemoryRuntime:
                 "reason": reason,
                 "tags": sorted(tags),
                 "raw_segment_count": len(raw_segments),
-                "semantic_unit_count": len(pending_units),
+                "original_raw_segment_count": deduplication_report[
+                    "original_segment_count"
+                ],
+                "semantic_unit_count": len(canonical_units),
+                "original_semantic_unit_count": len(pending_units),
                 "prompt_language": prompt_language,
+                "deduplication": deduplication_report,
                 "segments": raw_segments,
             },
         )
@@ -944,7 +977,7 @@ class MemoryRuntime:
             raw_segments=raw_segments,
             tags=sorted(tags),
             prompt_language=prompt_language,
-            completion_context=self._memory_store_completion_context(pending_units),
+            completion_context=self._memory_store_completion_context(canonical_units),
         )
         queued = bool(queue_report.get("queued"))
         episode_summary_report = None
@@ -953,13 +986,13 @@ class MemoryRuntime:
             self._episode_prompt_language = prompt_language
             self._episode_tags = sorted(set(self._episode_tags).union(tags))
             episode_decision = self._memory_context_manager.record_stored_units(
-                pending_units,
+                canonical_units,
             )
             self._logger.info(
                 "transcript episode queued reason=%s raw_segment_count=%s semantic_unit_count=%s",
                 reason,
                 len(raw_segments),
-                len(pending_units),
+                len(canonical_units),
             )
             if clear_segmenter:
                 self._memory_context_manager.clear_pending_units()
@@ -1237,6 +1270,252 @@ class MemoryRuntime:
                 else ""
             ),
         }
+
+    def _deduplicate_memory_input_units(
+        self,
+        units: Sequence[MemoryUnit],
+    ) -> Tuple[List[MemoryUnit], Dict[str, Any]]:
+        """Drop transcript copies of interaction text from one store batch."""
+        raw_segments_by_unit = [
+            self._memory_unit_raw_segments(unit)
+            for unit in units
+        ]
+        report: Dict[str, Any] = {
+            "original_segment_count": sum(
+                len(segments) for segments in raw_segments_by_unit
+            ),
+            "suppressed_segment_count": 0,
+            "suppressed_segments": [],
+        }
+        suppressed_by_unit: Dict[int, set[int]] = {}
+        for interaction_index, interaction_unit in enumerate(units):
+            interaction_segments = self._interaction_turn_raw_segments(
+                interaction_unit,
+                raw_segments_by_unit[interaction_index],
+            )
+            if not interaction_segments:
+                continue
+            for transcript_index in self._iter_time_nearby_transcript_unit_indexes(
+                units,
+                interaction_index,
+            ):
+                transcript_segments = raw_segments_by_unit[transcript_index]
+                for segment_index, transcript_segment in enumerate(
+                    transcript_segments,
+                ):
+                    if segment_index in suppressed_by_unit.get(transcript_index, set()):
+                        continue
+                    matched = self._find_interaction_duplicate_match(
+                        transcript_segment,
+                        interaction_segments,
+                    )
+                    if matched is None:
+                        continue
+                    interaction_segment, match_info = matched
+                    suppressed_by_unit.setdefault(transcript_index, set()).add(
+                        segment_index,
+                    )
+                    report["suppressed_segment_count"] += 1
+                    report["suppressed_segments"].append({
+                        "speaker": transcript_segment.get("speaker") or "",
+                        "text": transcript_segment.get("text") or "",
+                        "started_at": transcript_segment.get("started_at") or "",
+                        "ended_at": transcript_segment.get("ended_at") or "",
+                        "matched_interaction_speaker": interaction_segment.get(
+                            "speaker",
+                        ) or "",
+                        "matched_interaction_text": interaction_segment.get(
+                            "text",
+                        ) or "",
+                        **match_info,
+                    })
+
+        if not suppressed_by_unit:
+            return list(units), report
+        canonical_units: List[MemoryUnit] = []
+        for unit_index, (unit, segments) in enumerate(
+            zip(units, raw_segments_by_unit),
+        ):
+            suppressed_indexes = suppressed_by_unit.get(unit_index)
+            if not suppressed_indexes:
+                canonical_units.append(unit)
+                continue
+            retained_segments = [
+                segment
+                for segment_index, segment in enumerate(segments)
+                if segment_index not in suppressed_indexes
+            ]
+            if retained_segments:
+                canonical_units.append(
+                    self._rebuild_memory_input_unit(unit, retained_segments)
+                )
+        return canonical_units, report
+
+    @staticmethod
+    def _memory_unit_raw_segments(
+        unit: MemoryUnit,
+    ) -> List[Dict[str, Any]]:
+        raw = unit.raw if isinstance(unit.raw, dict) else {}
+        return [
+            dict(segment)
+            for segment in raw.get("raw_segments") or []
+            if isinstance(segment, dict)
+            and _compact_whitespace(segment.get("text") or "")
+        ]
+
+    @staticmethod
+    def _interaction_turn_raw_segments(
+        unit: MemoryUnit,
+        raw_segments: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        raw = unit.raw if isinstance(unit.raw, dict) else {}
+        if str(raw.get("input_kind") or "") != "interaction":
+            return []
+        return [
+            segment
+            for segment in raw_segments
+            if _compact_whitespace(segment.get("speaker") or "")
+            in {"用户", "助手"}
+        ]
+
+    def _iter_time_nearby_transcript_unit_indexes(
+        self,
+        units: Sequence[MemoryUnit],
+        interaction_index: int,
+    ) -> Sequence[int]:
+        """Return non-interaction units near one interaction in time order."""
+        interaction_unit = units[interaction_index]
+        interaction_started_at = MemoryContextManager._parse_timestamp(
+            self._memory_context_manager.unit_timestamp(interaction_unit),
+        )
+        interaction_ended_at = MemoryContextManager._parse_timestamp(
+            self._memory_context_manager.unit_end_timestamp(interaction_unit),
+        )
+        if interaction_started_at is None or interaction_ended_at is None:
+            return []
+        nearby_indexes: List[int] = []
+        for candidate_index in range(interaction_index - 1, -1, -1):
+            candidate = units[candidate_index]
+            candidate_ended_at = MemoryContextManager._parse_timestamp(
+                self._memory_context_manager.unit_end_timestamp(candidate),
+            )
+            if candidate_ended_at is None:
+                continue
+            if (
+                interaction_started_at - candidate_ended_at
+            ).total_seconds() > _MEMORY_INPUT_DEDUP_MAX_TIME_GAP_SECONDS:
+                break
+            raw = candidate.raw if isinstance(candidate.raw, dict) else {}
+            if str(raw.get("input_kind") or "") != "interaction":
+                nearby_indexes.append(candidate_index)
+        for candidate_index in range(interaction_index + 1, len(units)):
+            candidate = units[candidate_index]
+            candidate_started_at = MemoryContextManager._parse_timestamp(
+                self._memory_context_manager.unit_timestamp(candidate),
+            )
+            if candidate_started_at is None:
+                continue
+            if (
+                candidate_started_at - interaction_ended_at
+            ).total_seconds() > _MEMORY_INPUT_DEDUP_MAX_TIME_GAP_SECONDS:
+                break
+            raw = candidate.raw if isinstance(candidate.raw, dict) else {}
+            if str(raw.get("input_kind") or "") != "interaction":
+                nearby_indexes.append(candidate_index)
+        return nearby_indexes
+
+    def _find_interaction_duplicate_match(
+        self,
+        segment: Dict[str, Any],
+        interaction_segments: Sequence[Dict[str, Any]],
+    ) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        best_match: Optional[Tuple[Dict[str, Any], Dict[str, Any]]] = None
+        for reference in interaction_segments:
+            text_match = self._memory_input_text_duplicate_match(
+                str(segment.get("text") or ""),
+                str(reference.get("text") or ""),
+            )
+            if text_match is None:
+                continue
+            match_info = {
+                "match_kind": text_match["kind"],
+                "text_similarity": text_match["similarity"],
+            }
+            if (
+                best_match is None
+                or match_info["text_similarity"]
+                > best_match[1]["text_similarity"]
+            ):
+                best_match = (reference, match_info)
+        return best_match
+
+    @staticmethod
+    def _memory_input_text_duplicate_match(
+        left: str,
+        right: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_left = re.sub(
+            r"[^0-9a-zA-Z\u4e00-\u9fff]+",
+            "",
+            str(left or "").lower(),
+        )
+        normalized_right = re.sub(
+            r"[^0-9a-zA-Z\u4e00-\u9fff]+",
+            "",
+            str(right or "").lower(),
+        )
+        if (
+            min(len(normalized_left), len(normalized_right))
+            < _MEMORY_INPUT_DEDUP_MIN_TEXT_CHARS
+        ):
+            return None
+        if normalized_left == normalized_right:
+            return {"kind": "exact", "similarity": 1.0}
+        shorter, longer = sorted(
+            (normalized_left, normalized_right),
+            key=len,
+        )
+        containment = len(shorter) / max(1, len(longer))
+        if shorter in longer and containment >= _MEMORY_INPUT_DEDUP_MIN_FUZZY_RATIO:
+            return {"kind": "contained", "similarity": round(containment, 4)}
+        similarity = SequenceMatcher(
+            None,
+            normalized_left,
+            normalized_right,
+            autojunk=False,
+        ).ratio()
+        if similarity >= _MEMORY_INPUT_DEDUP_MIN_FUZZY_RATIO:
+            return {"kind": "fuzzy", "similarity": round(similarity, 4)}
+        return None
+
+    @staticmethod
+    def _rebuild_memory_input_unit(
+        unit: MemoryUnit,
+        raw_segments: Sequence[Dict[str, Any]],
+    ) -> MemoryUnit:
+        raw = dict(unit.raw) if isinstance(unit.raw, dict) else {}
+        segments = [dict(segment) for segment in raw_segments]
+        raw["raw_segments"] = segments
+        raw["speaker_labels"] = list(dict.fromkeys(
+            _compact_whitespace(segment.get("speaker") or "unknown_speaker")
+            for segment in segments
+        ))
+        text = " ".join(
+            _compact_whitespace(segment.get("text") or "")
+            for segment in segments
+            if _compact_whitespace(segment.get("text") or "")
+        )
+        timestamp = _to_timestamp_text(segments[0].get("started_at")) or unit.timestamp
+        ended_at = _to_timestamp_text(
+            segments[-1].get("ended_at") or segments[-1].get("started_at"),
+        ) or unit.ended_at or timestamp
+        return MemoryUnit(
+            text=text,
+            token_count=max(1, len(_MEMORY_INPUT_TOKEN_RE.findall(text))),
+            timestamp=timestamp,
+            ended_at=ended_at,
+            raw=raw,
+        )
 
     @staticmethod
     def _memory_raw_segment_time_order_key(
