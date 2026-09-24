@@ -55,15 +55,13 @@ def _owner_key(owner_id: str) -> str:
 
 
 def _normalize_turn_timestamp(value: Any) -> Optional[str]:
-    """Normalize Gateway epoch timestamps for MemoryRuntime's text schema."""
+    """Normalize Gateway epoch timestamps without dropping timezone metadata."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         seconds = float(value)
         if seconds > 10_000_000_000:
             seconds /= 1_000.0
         try:
-            return datetime.fromtimestamp(seconds).astimezone().strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            return datetime.fromtimestamp(seconds).astimezone().isoformat()
         except (OSError, OverflowError, ValueError):
             return None
     text = _clean(value, 120)
@@ -106,6 +104,7 @@ class OwnerRuntime:
     seen_path: Path
     seen_order: List[str] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
+    active_ambient_recording_ids: set[str] = field(default_factory=set)
 
     def remember(self, keys: Iterable[str]) -> None:
         for key in keys:
@@ -145,6 +144,7 @@ class AgentMemoryRuntime:
         """Serialize stdio and local-IPC mutations through one runtime."""
         handlers = {
             "observe": self.observe,
+            "set_ambient_recording_state": self.set_ambient_recording_state,
             "observe_transcript_segments": self.observe_transcript_segments,
             "finalize_transcript_recording": self.finalize_transcript_recording,
             "finalize": self.finalize,
@@ -216,7 +216,12 @@ class AgentMemoryRuntime:
             item for item in params.get("messages") or [] if isinstance(item, dict)
         ]
         assistants = self._assistant_text_by_turn(messages)
-        ambient_recording_enabled = bool(params.get("ambientRecordingEnabled", False))
+        # This flag denotes whether the system is recording ambient audio, not
+        # whether this particular input is an ASR transcript.  The recorder
+        # updates owner-local state over the private IPC channel, because the
+        # Gateway process that submits interaction turns does not own Desktop's
+        # recording lifecycle.
+        ambient_recording_enabled = bool(holder.active_ambient_recording_ids)
         accepted_keys: List[str] = []
         skipped_sensitive = 0
         for message in messages:
@@ -250,16 +255,52 @@ class AgentMemoryRuntime:
             "observed": bool(accepted_keys),
             "messages": len(accepted_keys),
             "skippedSensitive": skipped_sensitive,
+            "activeAmbientRecordingCount": len(holder.active_ambient_recording_ids),
         }
         self._logger.info(
             "observe owner=%s session=%s input_messages=%s accepted_users=%s "
-            "skipped_sensitive=%s ambient_recording_enabled=%s",
+            "skipped_sensitive=%s ambient_recording_enabled=%s active_ambient_recordings=%s",
             owner_key[:12],
             session_id[:80] or "[none]",
             len(messages),
             result["messages"],
             skipped_sensitive,
             ambient_recording_enabled,
+            result["activeAmbientRecordingCount"],
+        )
+        return result
+
+    def set_ambient_recording_state(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Record the ambient-recorder lifecycle for one memory owner.
+
+        This state is intentionally runtime-local.  It only controls the
+        ordering gate for newly received interaction turns and is cleared once
+        the ambient recording has submitted its final ASR batch.
+        """
+        owner_id = _clean(params.get("ownerId"), 240)
+        recording_id = _clean(params.get("recordingId"), 160)
+        if not recording_id:
+            raise ValueError("recordingId must be non-empty")
+        active = params.get("active")
+        if not isinstance(active, bool):
+            raise ValueError("active must be a boolean")
+        holder = self._owner_runtime(owner_id)
+        if active:
+            holder.active_ambient_recording_ids.add(recording_id)
+        else:
+            holder.active_ambient_recording_ids.discard(recording_id)
+        result = {
+            "ownerId": _owner_key(owner_id),
+            "recordingId": recording_id,
+            "active": active,
+            "activeAmbientRecordingCount": len(holder.active_ambient_recording_ids),
+        }
+        self._logger.info(
+            "ambient recording state owner=%s recording=%s active=%s active_recordings=%s",
+            result["ownerId"][:12],
+            recording_id[:80],
+            active,
+            result["activeAmbientRecordingCount"],
         )
         return result
 
@@ -277,6 +318,7 @@ class AgentMemoryRuntime:
             raise ValueError("recordingId and batchId must be non-empty")
         holder = self._owner_runtime(owner_id)
         owner_key = _owner_key(owner_id)
+        ambient_recording_enabled = bool(holder.active_ambient_recording_ids)
         dedupe_key = hashlib.sha256(
             f"ambient\0{owner_id}\0{recording_id}\0{batch_id}".encode("utf-8")
         ).hexdigest()
@@ -321,7 +363,7 @@ class AgentMemoryRuntime:
             report = holder.runtime.accept_memory_input(
                 transcript_segments=transcript_segments,
                 tags=tags,
-                ambient_recording_enabled=True,
+                ambient_recording_enabled=ambient_recording_enabled,
             )
             if report.get("reason") == "memory_disabled":
                 raise RuntimeError("agent_memory is disabled")
@@ -333,11 +375,13 @@ class AgentMemoryRuntime:
             "segments": len(transcript_segments),
         }
         self._logger.info(
-            "observe_transcript_segments owner=%s recording=%s batch=%s accepted_segments=%s",
+            "observe_transcript_segments owner=%s recording=%s batch=%s "
+            "accepted_segments=%s ambient_recording_enabled=%s",
             owner_key[:12],
             recording_id[:80],
             batch_id[:120],
             len(transcript_segments),
+            ambient_recording_enabled,
         )
         return result
 
@@ -352,6 +396,7 @@ class AgentMemoryRuntime:
             reason=f"ambient_recording_finished:{recording_id}",
             tags=["qwen-audio-agent", "ambient-recording", recording_id],
         )
+        holder.active_ambient_recording_ids.discard(recording_id)
         input_flush = dict(finalization.get("input_flush") or {})
         episode = dict(finalization.get("episode_summary") or {})
         derived_tasks = dict(finalization.get("derived_tasks") or {})
@@ -364,16 +409,19 @@ class AgentMemoryRuntime:
             "episodeSummaryQueued": bool((episode or {}).get("queued")),
             "entityClaimQueued": bool((entity_claim or {}).get("queued")),
             "futureCommitmentQueued": bool(future_commitment.get("queued")),
+            "activeAmbientRecordingCount": len(holder.active_ambient_recording_ids),
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "episode_summary_queued=%s entity_claim_queued=%s future_commitment_queued=%s",
+            "episode_summary_queued=%s entity_claim_queued=%s future_commitment_queued=%s "
+            "active_ambient_recordings=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
             result["inputFlushed"],
             result["episodeSummaryQueued"],
             result["entityClaimQueued"],
             result["futureCommitmentQueued"],
+            result["activeAmbientRecordingCount"],
         )
         return result
 
@@ -489,6 +537,7 @@ class _LocalTranscriptIpcServer:
     """
 
     _ALLOWED_METHODS = {
+        "set_ambient_recording_state",
         "observe_transcript_segments",
         "finalize_transcript_recording",
     }

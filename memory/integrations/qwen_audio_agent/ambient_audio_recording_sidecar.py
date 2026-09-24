@@ -196,6 +196,14 @@ class AmbientAudioRecordingService:
         self._stopping = False
         self._memory_finalized = False
         self._write_manifest()
+        self._agent_memory_ipc.request(
+            "set_ambient_recording_state",
+            {
+                "ownerId": self._agent_memory_ipc.owner_id,
+                "recordingId": recording_id,
+                "active": True,
+            },
+        )
         self._logger.info(
             "ambient recording started recording_id=%s chunk_seconds=%.3f",
             recording_id,
