@@ -32,6 +32,7 @@ from .memory_context_manager import (
     MemoryUnit,
     TranscriptUnitAssembler,
     build_episode_summary_config,
+    build_fact_extraction_window_config,
     build_online_segmentation_config,
     build_transcript_aggregation_config,
     convert_interaction_turn_to_online_unit,
@@ -139,7 +140,7 @@ class _DerivedMemoryTaskScheduler:
         """Consume a manager completion event on the manager worker thread."""
         task_kind = str(event.get("task_kind") or "")
         result = event.get("result")
-        if task_kind == "memory_store":
+        if task_kind == "memory_fact_extraction":
             if not event.get("succeeded") or not isinstance(result, dict):
                 return
             self._record_store_completion(
@@ -459,9 +460,7 @@ class MemoryRuntime:
             self._embedding_client,
             memory_context_manager_config,
             build_episode_summary_config(runtime_config),
-        )
-        self._transcript_segmentation_log_decisions = bool(
-            runtime_config.get("log_segmentation_decisions", False),
+            build_fact_extraction_window_config(runtime_config),
         )
         self._episode_tags: List[str] = []
         self._episode_prompt_language = "zh"
@@ -536,7 +535,6 @@ class MemoryRuntime:
         interaction_turn: Optional[Dict[str, Any]] = None,
         transcript_segments: Optional[Sequence[Dict[str, Any]]] = None,
         tags: Optional[List[str]] = None,
-        is_last_segment: bool = False,
         ambient_recording_enabled: bool = False,
     ) -> Dict[str, Any]:
         """Accept one interaction turn or one batch of transcript segments.
@@ -572,7 +570,6 @@ class MemoryRuntime:
         return self._accept_transcript_memory_inputs(
             transcript_segments or [],
             tags=normalized_tags,
-            is_last_segment=is_last_segment,
             ambient_recording_enabled=ambient_recording_enabled,
         )
 
@@ -651,7 +648,6 @@ class MemoryRuntime:
         transcript_segments: Sequence[Dict[str, Any]],
         *,
         tags: Sequence[str],
-        is_last_segment: bool,
         ambient_recording_enabled: bool,
     ) -> Dict[str, Any]:
         """Assemble and append one ordered ASR batch to the shared buffer."""
@@ -777,14 +773,12 @@ class MemoryRuntime:
         evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
         """Append one normalized input unit to the shared semantic buffer."""
-        decision, finalized_units = self._memory_context_manager.insert_incoming_unit(
+        decision = self._memory_context_manager.insert_incoming_unit(
             unit,
             ambient_recording_enabled,
         )
-        return self._handle_memory_context_boundary(
-            unit,
+        return self._handle_memory_fact_task_decision(
             decision=decision,
-            finalized_units=finalized_units,
             evaluate_episode_summary=evaluate_episode_summary,
         )
 
@@ -794,18 +788,16 @@ class MemoryRuntime:
         evaluate_episode_summary: bool,
         force: bool = False,
     ) -> Dict[str, Any]:
-        """Submit boundary results released after ambient ASR coverage advances."""
+        """Process boundary results released after ambient ASR coverage advances."""
         queued = False
         last_reason = ""
-        for unit, decision, finalized_units in (
+        for _unit, decision in (
             self._memory_context_manager.iter_awaiting_ambient_units(
                 force=force,
             )
         ):
-            append_report = self._handle_memory_context_boundary(
-                unit,
+            append_report = self._handle_memory_fact_task_decision(
                 decision=decision,
-                finalized_units=finalized_units,
                 evaluate_episode_summary=evaluate_episode_summary,
             )
             queued = bool(append_report.get("queued")) or queued
@@ -823,38 +815,112 @@ class MemoryRuntime:
             "reason": last_reason,
         }
 
-    def _handle_memory_context_boundary(
+    def _handle_memory_fact_task_decision(
         self,
-        unit: MemoryUnit,
         *,
         decision: Any,
-        finalized_units: Sequence[MemoryUnit],
         evaluate_episode_summary: bool,
     ) -> Dict[str, Any]:
-        """Log one boundary decision and submit its finalized prefix, if any."""
-        self._log_memory_context_manager_decision(unit, decision=decision)
-        if not decision.should_finalize:
+        """Log one boundary and schedule fact extraction for sealed chapters."""
+        self._logger.info(
+            "memory fact task decision trigger=%s "
+            "reason=%s sealed_chapter_count=%s sealed_token_count=%s",
+            decision.should_trigger,
+            decision.reason,
+            decision.sealed_chapter_count,
+            decision.sealed_token_count,
+        )
+        if not decision.should_trigger:
             return {
                 "accepted": True,
                 "queued": False,
-                "reason": str(decision.reason or ""),
+                "reason": decision.reason,
             }
-        store_report = self._submit_memory_input_units(
-            finalized_units,
-            reason=decision.reason,
-            evaluate_episode_summary=evaluate_episode_summary,
-        )
+        self._log_sealed_memory_input_chapters_for_fact_task(decision=decision)
+        store_report = self._trigger_memory_store_task_for_sealed_memory_input()
         if not store_report.get("queued"):
             return {
                 "accepted": False,
                 "queued": False,
                 "reason": str(store_report.get("reason") or "queue_rejected"),
             }
+        episode_summary_report = None
+        episode_decision = self._memory_context_manager.evaluate_episode_summary_trigger_decision()
+        if evaluate_episode_summary and episode_decision.should_trigger:
+            episode_summary_report = self._trigger_memory_episode_summary(
+                reason=f"episode_{episode_decision.reason}",
+            )
         return {
             "accepted": True,
             "queued": True,
-            "reason": str(store_report.get("reason") or ""),
+            "reason": (
+                "episode_limit"
+                if bool((episode_summary_report or {}).get("queued"))
+                else str(store_report.get("reason") or "")
+            ),
+            "episode_summary": episode_summary_report,
         }
+
+    def _log_sealed_memory_input_chapters_for_fact_task(
+        self,
+        *,
+        decision: Any,
+    ) -> None:
+        """Log the exact sealed chapter window before it is submitted.
+
+        This is intentionally emitted only for a fact-task trigger.  The
+        ordinary boundary log remains compact for append decisions, while this
+        payload makes it possible to audit the chapter grouping that supplied
+        one extraction request.
+        """
+        sealed_chapters = self._memory_context_manager.sealed_chapter_snapshot()
+        chapter_payloads: List[Dict[str, Any]] = []
+        for chapter_index, chapter in enumerate(sealed_chapters, 1):
+            units = list(chapter.units)
+            chapter_payloads.append({
+                "chapter_index": chapter_index,
+                "boundary_reason": chapter.boundary_reason,
+                "unit_count": len(units),
+                "token_count": sum(unit.token_count for unit in units),
+                "started_at": (
+                    self._memory_context_manager.unit_timestamp(units[0])
+                    if units
+                    else ""
+                ),
+                "ended_at": (
+                    self._memory_context_manager.unit_end_timestamp(units[-1])
+                    if units
+                    else ""
+                ),
+                "units": [
+                    {
+                        "unit_index": unit_index,
+                        "started_at": self._memory_context_manager.unit_timestamp(unit),
+                        "ended_at": self._memory_context_manager.unit_end_timestamp(unit),
+                        "token_count": unit.token_count,
+                        "raw_segment_count": len(
+                            (unit.raw if isinstance(unit.raw, dict) else {}).get(
+                                "raw_segments",
+                            ) or [],
+                        ),
+                        "text": unit.text,
+                    }
+                    for unit_index, unit in enumerate(units, 1)
+                ],
+            })
+        self._log_info(
+            "memory_runtime",
+            "memory_fact_task_sealed_chapters",
+            {
+                "trigger_reason": str(getattr(decision, "reason", "") or ""),
+                "sealed_chapter_count": len(chapter_payloads),
+                "sealed_token_count": sum(
+                    int(chapter.get("token_count") or 0)
+                    for chapter in chapter_payloads
+                ),
+                "chapters": chapter_payloads,
+            },
+        )
 
     def _flush_pending_memory_input_units(
         self,
@@ -888,10 +954,8 @@ class MemoryRuntime:
                 "queued": queued,
                 "reason": str(drain_report.get("reason") or "queue_rejected"),
             }
-        store_report = self._trigger_memory_store_task_for_pending_memory_input(
-            reason=reason,
-            evaluate_episode_summary=False,
-        )
+        self._memory_context_manager.seal_pending_units(boundary_reason=reason)
+        store_report = self._trigger_memory_store_task_for_sealed_memory_input()
         episode_summary_report = self._trigger_memory_episode_summary(
             reason=reason,
             tags=tags,
@@ -913,42 +977,39 @@ class MemoryRuntime:
             "derived_tasks": derived_task_reports,
         }
 
-    def _trigger_memory_store_task_for_pending_memory_input(
+    def _trigger_memory_store_task_for_sealed_memory_input(
         self,
-        *,
-        reason: str,
-        evaluate_episode_summary: bool = True,
     ) -> Dict[str, Any]:
-        """Normalize and submit one shared semantic buffer to fact extraction."""
-        pending_units = self._memory_context_manager.pending_unit_snapshot()
-        if not pending_units:
-            return {"queued": False, "reason": "no_pending_segments"}
-        return self._submit_memory_input_units(
-            pending_units,
-            reason=reason,
-            evaluate_episode_summary=evaluate_episode_summary,
-            clear_segmenter=True,
+        """Submit the currently sealed chapters as one fact task."""
+        sealed_chapters = self._memory_context_manager.sealed_chapter_snapshot()
+        if not sealed_chapters:
+            return {"queued": False, "reason": "no_sealed_chapters"}
+        sealed_units = [
+            unit
+            for chapter in sealed_chapters
+            for unit in chapter.units
+        ]
+        self._logger.info(
+            "memory fact task submitting sealed_chapter_count=%s "
+            "sealed_token_count=%s boundary_reasons=%s",
+            len(sealed_chapters),
+            sum(unit.token_count for unit in sealed_units),
+            [chapter.boundary_reason for chapter in sealed_chapters],
         )
-
-    def _submit_memory_input_units(
-        self,
-        units: Sequence[MemoryUnit],
-        *,
-        reason: str,
-        evaluate_episode_summary: bool,
-        clear_segmenter: bool = False,
-    ) -> Dict[str, Any]:
-        """Submit already selected shared units without changing their route."""
-        pending_units = list(units)
+        pending_units = list(sealed_units)
         canonical_units, deduplication_report = (
             self._deduplicate_memory_input_units(pending_units)
+        )
+        preceding_context_units = (
+            self._memory_context_manager.preceding_context_units_snapshot()
         )
         raw_segments, prompt_language = self._normalize_units_into_memory_raw_segments(
             canonical_units,
         )
+        preceding_context_segments, _ = self._normalize_units_into_memory_raw_segments(
+            preceding_context_units,
+        )
         if not raw_segments:
-            if clear_segmenter:
-                self._memory_context_manager.clear_pending_units()
             return {"queued": False, "reason": "invalid_pending_segments"}
         tags = {
             str(tag)
@@ -960,7 +1021,6 @@ class MemoryRuntime:
             "memory_runtime",
             "memory_input_batch_detail",
             {
-                "reason": reason,
                 "tags": sorted(tags),
                 "raw_segment_count": len(raw_segments),
                 "original_raw_segment_count": deduplication_report[
@@ -968,85 +1028,44 @@ class MemoryRuntime:
                 ],
                 "semantic_unit_count": len(canonical_units),
                 "original_semantic_unit_count": len(pending_units),
+                "preceding_context_unit_count": len(preceding_context_units),
+                "preceding_context_segment_count": len(preceding_context_segments),
                 "prompt_language": prompt_language,
                 "deduplication": deduplication_report,
+                "preceding_context_segments": preceding_context_segments,
                 "segments": raw_segments,
             },
         )
-        queue_report = self._memory_manager.submit_memory_store_task(
+        queue_report = self._memory_manager.submit_memory_fact_extraction_task(
             raw_segments=raw_segments,
+            preceding_context_segments=preceding_context_segments,
             tags=sorted(tags),
             prompt_language=prompt_language,
             completion_context=self._memory_store_completion_context(canonical_units),
         )
         queued = bool(queue_report.get("queued"))
-        episode_summary_report = None
         if queued:
+            self._memory_context_manager.clear_sealed_chapter_buffers()
             self._has_pending_episode_sources = True
             self._episode_prompt_language = prompt_language
             self._episode_tags = sorted(set(self._episode_tags).union(tags))
-            episode_decision = self._memory_context_manager.record_stored_units(
+            self._memory_context_manager.record_stored_units(
+                canonical_units,
+            )
+            self._memory_context_manager.record_preceding_context_units(
                 canonical_units,
             )
             self._logger.info(
-                "transcript episode queued reason=%s raw_segment_count=%s semantic_unit_count=%s",
-                reason,
+                "memory episode source queued raw_segment_count=%s semantic_unit_count=%s "
+                "preceding_context_unit_count=%s",
                 len(raw_segments),
                 len(canonical_units),
+                len(preceding_context_units),
             )
-            if clear_segmenter:
-                self._memory_context_manager.clear_pending_units()
-            if evaluate_episode_summary and episode_decision.should_trigger:
-                episode_summary_report = self._trigger_memory_episode_summary(
-                    reason=f"episode_{episode_decision.reason}",
-                )
         return {
-            "queued": queued or bool((episode_summary_report or {}).get("queued")),
-            "reason": (
-                "episode_limit"
-                if (episode_summary_report or {}).get("queued")
-                else ""
-                if queued
-                else str(queue_report.get("reason") or "queue_rejected")
-            ),
-            "episode_summary": episode_summary_report,
+            "queued": queued,
+            "reason": "" if queued else str(queue_report.get("reason") or "queue_rejected"),
         }
-
-    def _log_memory_context_manager_decision(
-        self,
-        unit: MemoryUnit,
-        *,
-        decision: Optional[Any] = None,
-        reason: Optional[str] = None,
-    ) -> None:
-        """Emit per-unit semantic boundary details when transcript logging is enabled."""
-        if not self._transcript_segmentation_log_decisions:
-            return
-        raw = unit.raw if isinstance(unit.raw, dict) else {}
-        raw_segments = raw.get("raw_segments") or []
-        speaker_labels = raw.get("speaker_labels") or []
-        resolved_reason = str(reason or getattr(decision, "reason", "append"))
-        self._logger.info(
-            "memory context decision started_at=%s ended_at=%s reason=%s raw_segment_count=%s "
-            "token_count=%s speakers=%s cut_probability=%s score=%s "
-            "semantic_surprise=%s cohesion_drop=%s time_gap_seconds=%s "
-            "scoring_mode=%s rolling_tail_units=%s rolling_tail_tokens=%s text=%s",
-            self._memory_context_manager.unit_timestamp(unit),
-            self._memory_context_manager.unit_end_timestamp(unit),
-            resolved_reason,
-            len(raw_segments),
-            unit.token_count,
-            ",".join(str(label) for label in speaker_labels),
-            getattr(decision, "cut_probability", None),
-            getattr(decision, "score", None),
-            getattr(decision, "semantic_surprise", None),
-            getattr(decision, "cohesion_drop", None),
-            getattr(decision, "time_gap_seconds", None),
-            getattr(decision, "scoring_mode", None),
-            getattr(decision, "rolling_window_tail_units", None),
-            getattr(decision, "rolling_window_tail_tokens", None),
-            unit.text[:240],
-        )
 
     def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
         """Emit a structured JSON log record for runtime diagnostics."""

@@ -738,7 +738,7 @@ def main() -> int:
                 if ok.get("queued") and not runtime.flush_pending_memory_inputs():
                     raise RuntimeError("Timed out while draining queued memory stores")
                 nodes = list(iter_stored_nodes(db, before_id))
-                store_operation_report = operation_reporter.latest_report("memory_store")
+                store_operation_report = operation_reporter.latest_report("memory_fact_extraction")
                 if ok.get("queued"):
                     stored_turns += 1
                     stored_facts += len(nodes)
@@ -819,7 +819,7 @@ def main() -> int:
 
     memory_operation_report = operation_reporter.snapshot()
     operation_counts = memory_operation_report.get("counts") or {}
-    store_operation_report = operation_counts.get("memory_store") or {}
+    store_operation_report = operation_counts.get("memory_fact_extraction") or {}
     reflect_operation_report = operation_counts.get("memory_reflect") or {}
     summary = {
         "sample_source": args.sample_source,

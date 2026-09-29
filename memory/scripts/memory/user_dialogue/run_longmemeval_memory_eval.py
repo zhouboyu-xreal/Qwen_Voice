@@ -1203,7 +1203,7 @@ def build_instance_memory_context(
             memory_context = str(recall_report.get("memory_context") or "")
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
-            store_operation_report = operation_counts.get("memory_store") or {}
+            store_operation_report = operation_counts.get("memory_fact_extraction") or {}
             reflect_operation_report = operation_counts.get("memory_reflect") or {}
             recall_operation_report = operation_counts.get("recall") or {}
             store_turn_calls = replay_stats.turn_pairs_total

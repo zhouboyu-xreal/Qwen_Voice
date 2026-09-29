@@ -120,6 +120,11 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 
 你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据持久化的原始片段及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
 
+前置上下文使用规则：
+- 下方的“前置上下文”仅来自紧邻当前批次之前的一小段已处理内容，只用于理解代词、省略、承接关系和当前话题的起点。
+- 唯一允许直接支持本次新 fact 的证据是“对话/转写证据批次”。不得只根据前置上下文生成、补全或确认 fact，也不得把其中已经表达过的内容再次写成新的 fact。
+- 当前批次与前置上下文存在矛盾时，以当前批次为准；若当前批次仍不足以消歧或验证，宁可不输出该 fact。
+
 写入资格门槛（先判断，未通过时直接输出空 `facts`；不要为了覆盖输入而生成 fact）：
 - 默认输出 0 条 fact。只有同时满足“证据可靠”和“未来可用”时才输出；可被流畅概括不等于值得长期记忆。
 - fact 的核心内容必须由用户的语义完整、指代明确的表达，或当前批次中可验证的执行结果支撑。助手的猜测、补全、泛化介绍、安慰、追问、复述和推荐，不能单独证明用户的偏好、身份、情绪、计划、能力或事实。
@@ -185,6 +190,7 @@ entity_claim_signal 输出规则：
 - `claim_type_hint` 只能是 identity_profile、affiliation、relationship、preference、constraint、behavior_pattern。单次行为不得作为 explicit_assertion 直接生成 behavior_pattern；它至多是 pattern_observation。
 - `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 entity claim。
 - 只有当前 fact 对某个实体主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、临时建议、助手猜测、寒暄和低价值信息输出空数组。
+- 每个 signal 的 `entity.name` 必须原样复用同一 fact 的 `entities` 中某一个实体名称，`entity.type` 也必须与该实体一致。不得为 signal 新增、改写或猜测 fact 未列出的实体；无法对应时不输出该 signal。
 - 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact 的具体证据，不要引用历史 claim。
 
 future_commitment_signals 输出规则：
@@ -213,7 +219,7 @@ future_commitment_signals 输出规则：
       "where": "明确出现的地点、场景、平台或项目范围；没有明确证据时保持为空字符串，不要填写‘未提及’或类似说明",
       "entity_claim_signal": [
         {
-          "entity": {"name": "明确受影响的实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
+          "entity": {"name": "必须原样取自本 fact entities 的实体名", "type": "必须与该 fact entities 中同名实体的类型一致"},
           "signal_kind": "explicit_assertion|pattern_observation",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
           "claim_anchor": "用于跨 fact 聚合的具体主张或规律标签",
@@ -240,6 +246,9 @@ future_commitment_signals 输出规则：
 
 已有 memory_topic_items 命名候选：
 {existing_memory_topic_items}
+
+前置上下文（仅用于理解，不是本次 fact 的独立证据）：
+{preceding_context}
 
 对话/转写证据批次：
 {dialogue_batch}

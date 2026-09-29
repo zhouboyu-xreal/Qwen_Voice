@@ -2863,17 +2863,51 @@ class SessionDB:
         self._commit_if_needed()
         return fact_id
 
-    def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
+    def upsert_entity_nodes(
+        self,
+        entities: Iterable[Any],
+    ) -> Dict[str, int]:
+        """Create entity nodes and conservatively promote their node types.
+
+        ``memory_entity_nodes.name`` remains the current identity key.  A
+        concrete type supplied by fact extraction may upgrade a legacy
+        ``OTHER`` node, but never replaces a previously established concrete
+        type.  That avoids a later weak observation silently relabelling an
+        entity while still allowing the fact-store path to repair old nodes.
+        """
         now = local_now_text()
-        normalized: List[str] = []
-        for name in names:
-            clean = str(name or "").strip()
-            if not clean or clean in normalized:
+        allowed_types = {
+            "PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT",
+            "TECHNOLOGY", "CONCEPT", "TOPIC", "PREFERENCE", "OTHER",
+        }
+        normalized: Dict[str, str] = {}
+        for entity in entities:
+            if isinstance(entity, dict):
+                clean = str(entity.get("name") or entity.get("text") or "").strip()
+                entity_type = str(entity.get("type") or "OTHER").strip().upper()
+            else:
+                clean = str(entity or "").strip()
+                entity_type = "OTHER"
+            if not clean:
                 continue
-            normalized.append(clean)
+            if entity_type not in allowed_types:
+                entity_type = "OTHER"
+            previous_type = normalized.get(clean)
+            if previous_type is not None:
+                if previous_type == "OTHER" and entity_type != "OTHER":
+                    normalized[clean] = entity_type
+                continue
             self._conn.execute(
                 "INSERT OR IGNORE INTO memory_entity_nodes (name, type, created_at) VALUES (?, ?, ?)",
-                (clean, "OTHER", now),
+                (clean, entity_type, now),
+            )
+            normalized[clean] = entity_type
+        for name, entity_type in normalized.items():
+            if entity_type == "OTHER":
+                continue
+            self._conn.execute(
+                "UPDATE memory_entity_nodes SET type = ? WHERE name = ? AND type = 'OTHER'",
+                (entity_type, name),
             )
         self._commit_if_needed()
         if not normalized:
@@ -2881,9 +2915,13 @@ class SessionDB:
         placeholders = ",".join("?" for _ in normalized)
         rows = self._conn.execute(
             f"SELECT id, name FROM memory_entity_nodes WHERE name IN ({placeholders})",
-            normalized,
+            list(normalized),
         ).fetchall()
         return {str(row["name"]): int(row["id"]) for row in rows}
+
+    def add_entity_names(self, names: Iterable[str]) -> Dict[str, int]:
+        """Compatibility wrapper for legacy name-only callers."""
+        return self.upsert_entity_nodes(names)
 
     def find_entity_nodes_in_text(
         self,

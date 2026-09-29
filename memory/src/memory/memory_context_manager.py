@@ -17,7 +17,9 @@ INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 
 
 @dataclass
-class FactExtractionBoundaryDecision:
+class ChapterBoundaryDecision:
+    """Whether an incoming unit closes the current active_units chapter."""
+
     reason: str
     should_finalize: bool = False
     cut_probability: Optional[float] = None
@@ -29,7 +31,6 @@ class FactExtractionBoundaryDecision:
     cohesion_after: Optional[float] = None
     cohesion_drop: Optional[float] = None
     length_signal: Optional[float] = None
-    turn_signal: Optional[float] = None
     centroid_similarity: Optional[float] = None
     recent_similarity: Optional[float] = None
     prospective_tokens: Optional[int] = None
@@ -47,12 +48,7 @@ class MemoryUnit:
     timestamp: str = ""
     ended_at: str = ""
     raw: Optional[Dict[str, Any]] = None
-
-
-@dataclass
-class ActiveUnit:
-    unit: Any
-    embedding: Optional[np.ndarray]
+    embedding: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -65,18 +61,28 @@ class MemoryContextMangerConfig:
     absolute_surprise_weight: float = 0.8
     cohesion_drop_weight: float = 1.0
     length_weight: float = 0.40
-    turn_count_weight: float = 0.40
-    max_pending_turns: int = 0
+    max_pending_units: int = 40
     max_pending_tokens: int = 500
-    max_pending_chars: int = 0
+    min_pending_units: int = 4
     min_pending_tokens: int = 100
-    min_pending_turns: int = 2
     min_segment_override_probability: float = 0.90
     max_time_gap_seconds: float = -1.0
     enforce_min_pending_tokens: bool = False
     rolling_window_enabled: bool = False
     rolling_window_tail_units: int = 0
     min_boundary_scoring_incoming_tokens: int = 0
+
+
+@dataclass
+class FactExtractionWindowConfig:
+    """Limits for coalescing sealed chapters into one fact task."""
+
+    min_sealed_chapters: int = 2
+    target_sealed_tokens: int = 1200
+    max_sealed_chapters: int = 5
+    max_sealed_tokens: int = 1800
+    preceding_context_max_units: int = 3
+    preceding_context_max_tokens: int = 400
 
 
 @dataclass
@@ -92,6 +98,25 @@ class EpisodeSummaryBoundaryDecision:
     reason: str = "append"
     accumulated_tokens: int = 0
     elapsed_seconds: Optional[float] = None
+
+
+@dataclass
+class FactExtractionTaskDecision:
+    """Whether the currently sealed chapters should start a fact task."""
+
+    should_trigger: bool = False
+    reason: str = "append"
+    sealed_chapter_count: int = 0
+    sealed_token_count: int = 0
+    chapter_boundary_decision: Optional[ChapterBoundaryDecision] = None
+
+
+@dataclass
+class SealedMemoryChapter:
+    """One confirmed chapter awaiting inclusion in a fact task."""
+
+    units: List[MemoryUnit]
+    boundary_reason: str
 
 
 @dataclass
@@ -201,10 +226,7 @@ def _build_online_segmentation_config(
             segmentation_config.get("cohesion_drop_weight", 1.0),
         ),
         length_weight=float(segmentation_config.get("length_weight", 0.40)),
-        turn_count_weight=float(
-            segmentation_config.get("turn_count_weight", 0.40),
-        ),
-        max_pending_turns=max(
+        max_pending_units=max(
             1,
             config_int("max_pending_units", 40),
         ),
@@ -212,15 +234,11 @@ def _build_online_segmentation_config(
             1,
             config_int("max_pending_tokens", 1000),
         ),
-        max_pending_chars=max(
-            0,
-            config_int("max_pending_chars", 0),
-        ),
         min_pending_tokens=max(
             1,
             config_int("min_pending_tokens", 200),
         ),
-        min_pending_turns=max(
+        min_pending_units=max(
             1,
             config_int("min_pending_units", 4),
         ),
@@ -256,6 +274,51 @@ def build_online_segmentation_config(
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
     return _build_online_segmentation_config(segmentation_config)
+
+
+def build_fact_extraction_window_config(
+    runtime_config: Dict[str, Any],
+) -> FactExtractionWindowConfig:
+    """Build the fact-window coalescing limits from memory input settings."""
+    memory_input_config = runtime_config.get("memory_context_manager")
+    if not isinstance(memory_input_config, dict):
+        memory_input_config = {}
+    extraction_config = memory_input_config.get("fact_extraction")
+    if not isinstance(extraction_config, dict):
+        extraction_config = {}
+
+    min_chapters = max(
+        1,
+        int(extraction_config.get("min_sealed_chapters", 2)),
+    )
+    target_tokens = max(
+        1,
+        int(extraction_config.get("target_sealed_tokens", 1200)),
+    )
+    max_chapters = max(
+        min_chapters,
+        int(extraction_config.get("max_sealed_chapters", 5)),
+    )
+    max_tokens = max(
+        target_tokens,
+        int(extraction_config.get("max_sealed_tokens", 1800)),
+    )
+    preceding_context_max_units = max(
+        0,
+        int(extraction_config.get("preceding_context_max_units", 3)),
+    )
+    preceding_context_max_tokens = max(
+        0,
+        int(extraction_config.get("preceding_context_max_tokens", 400)),
+    )
+    return FactExtractionWindowConfig(
+        min_sealed_chapters=min_chapters,
+        target_sealed_tokens=target_tokens,
+        max_sealed_chapters=max_chapters,
+        max_sealed_tokens=max_tokens,
+        preceding_context_max_units=preceding_context_max_units,
+        preceding_context_max_tokens=preceding_context_max_tokens,
+    )
 
 
 def build_episode_summary_config(
@@ -551,16 +614,22 @@ class MemoryContextManager:
         embedding_client: EmbeddingClient,
         config: Optional[MemoryContextMangerConfig] = None,
         episode_summary_config: Optional[EpisodeSummaryConfig] = None,
+        fact_extraction_window_config: Optional[FactExtractionWindowConfig] = None,
     ) -> None:
         self.embedding_client = embedding_client
         self.config = config or MemoryContextMangerConfig()
         self.surprise_history: Deque[float] = deque(
             maxlen=max(1, self.config.surprise_history_window),
         )
-        self._pending_buffer: List[ActiveUnit] = []
-        self._awaiting_ambient_buffer: List[MemoryUnit] = []
+        self._pending_unit_buffer: List[MemoryUnit] = []
+        self._sealed_chapter_buffers: List[SealedMemoryChapter] = []
+        self._preceding_context_units: List[MemoryUnit] = []
+        self._awaiting_ambient_unit_buffer: List[MemoryUnit] = []
         self._ambient_asr_watermark: Optional[datetime] = None
         self.episode_summary_config = episode_summary_config or EpisodeSummaryConfig()
+        self.fact_extraction_window_config = (
+            fact_extraction_window_config or FactExtractionWindowConfig()
+        )
         self._episode_started_at: Optional[datetime] = None
         self._episode_latest_at: Optional[datetime] = None
         self._episode_token_count = 0
@@ -568,54 +637,59 @@ class MemoryContextManager:
     def _insert_pending_unit(
         self,
         unit: MemoryUnit,
-        embedding: Optional[np.ndarray],
     ) -> None:
         """Insert a unit into the pending buffer in chronological order."""
-        self._pending_buffer.append(ActiveUnit(
-            unit=unit,
-            embedding=_as_embedding_vector(embedding),
-        ))
-        self._pending_buffer.sort(
-            key=lambda item: self._unit_time_order_key(item.unit),
+        self._pending_unit_buffer.append(unit)
+        self._pending_unit_buffer.sort(
+            key=self._unit_time_order_key,
         )
 
     def _insert_awaiting_ambient_unit(self, unit: MemoryUnit) -> None:
         """Retain one input until ambient ASR has covered its event time."""
-        self._awaiting_ambient_buffer.append(unit)
-        self._awaiting_ambient_buffer.sort(key=self._unit_time_order_key)
+        self._awaiting_ambient_unit_buffer.append(unit)
+        self._awaiting_ambient_unit_buffer.sort(key=self._unit_time_order_key)
 
     def insert_incoming_unit(
         self,
         incoming_unit: MemoryUnit,
         ambient_recording_enabled: bool = False,
-    ) -> Tuple[FactExtractionBoundaryDecision, List[MemoryUnit]]:
-        """Evaluate one unit and retain it in the pending context buffer.
+    ) -> FactExtractionTaskDecision:
+        """Evaluate one unit against the active_units chapter.
 
         Ambient input whose event time has not yet been covered by ASR is
         retained separately.  Once the watermark advances,
         :meth:`iter_awaiting_ambient_units` feeds it back through this
-        same method, preserving one canonical boundary path.
+        same method, preserving one canonical boundary path.  A confirmed
+        boundary moves the preceding active_units chapter into ``_sealed_chapter_buffers``;
+        the incoming unit always begins or extends the next active chapter.
         """
         if (
             ambient_recording_enabled
             and not self._ambient_asr_covers_unit(incoming_unit)
         ):
             self._insert_awaiting_ambient_unit(incoming_unit)
-            return FactExtractionBoundaryDecision(
+            chapter_boundary_decision = ChapterBoundaryDecision(
                 reason="awaiting_ambient_asr_watermark",
-            ), []
-
-        incoming_embedding = self.embed_unit(incoming_unit).embedding
-        decision = self._evaluate_incoming_unit(
+            )
+            return self._fact_task_decision_without_new_sealed_chapter(
+                chapter_boundary_decision,
+            )
+        incoming_unit.embedding = _as_embedding_vector(self.embedding_client.embed_text(self.unit_text(incoming_unit)))
+        chapter_boundary_decision = self._evaluate_incoming_unit_for_chapter(
             incoming_unit,
-            incoming_embedding,
-            ambient_recording_enabled,
         )
-        finalized_units = self.pending_unit_snapshot() if decision.should_finalize else []
-        if decision.should_finalize:
-            self.clear_pending_units()
-        self._insert_pending_unit(incoming_unit, incoming_embedding)
-        return decision, finalized_units
+        if chapter_boundary_decision.should_finalize:
+            self.seal_pending_units(
+                boundary_reason=chapter_boundary_decision.reason,
+            )
+        self._insert_pending_unit(incoming_unit)
+        if not chapter_boundary_decision.should_finalize:
+            return self._fact_task_decision_without_new_sealed_chapter(
+                chapter_boundary_decision,
+            )
+        fact_task_decision = self.evaluate_sealed_chapter_buffers_for_fact_task()
+        fact_task_decision.chapter_boundary_decision = chapter_boundary_decision
+        return fact_task_decision
 
     def update_ambient_asr_watermark(self, value: Any) -> Optional[datetime]:
         """Advance and return the latest event time covered by ambient ASR."""
@@ -629,39 +703,39 @@ class MemoryContextManager:
 
     def awaiting_ambient_unit_count(self) -> int:
         """Return the number of input units waiting for ambient-ASR coverage."""
-        return len(self._awaiting_ambient_buffer)
+        return len(self._awaiting_ambient_unit_buffer)
 
     def iter_awaiting_ambient_units(
         self,
         *,
         force: bool = False,
-    ) -> Iterator[Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]]:
-        """Yield each covered unit immediately after its boundary decision.
+    ) -> Iterator[Tuple[MemoryUnit, FactExtractionTaskDecision]]:
+        """Yield each covered unit immediately after its fact-task decision.
 
         ``force`` is reserved for an explicit runtime flush, when the caller
         intentionally accepts the remaining ASR-delay risk rather than
         leaving an input unit unpersisted.
 
         The iterator deliberately does not accumulate decisions. Its caller
-        can submit a finalized prefix while later waiting units are still
-        being embedded and scored.
+        can evaluate a newly sealed chapter while later waiting units are
+        still being embedded and scored.
         """
-        while self._awaiting_ambient_buffer:
-            unit = self._awaiting_ambient_buffer[0]
+        while self._awaiting_ambient_unit_buffer:
+            unit = self._awaiting_ambient_unit_buffer[0]
             if not force and not self._ambient_asr_covers_unit(unit):
                 break
-            self._awaiting_ambient_buffer.pop(0)
-            decision, finalized_units = self.insert_incoming_unit(
+            self._awaiting_ambient_unit_buffer.pop(0)
+            decision = self.insert_incoming_unit(
                 unit,
                 ambient_recording_enabled=not force,
             )
-            yield unit, decision, finalized_units
+            yield unit, decision
 
     def process_awaiting_ambient_units(
         self,
         *,
         force: bool = False,
-    ) -> List[Tuple[MemoryUnit, FactExtractionBoundaryDecision, List[MemoryUnit]]]:
+    ) -> List[Tuple[MemoryUnit, FactExtractionTaskDecision]]:
         """Return all released units for callers that require a materialized list.
 
         Runtime ingestion uses :meth:`iter_awaiting_ambient_units` so a long
@@ -677,22 +751,145 @@ class MemoryContextManager:
         return ended_at is not None and ended_at <= self._ambient_asr_watermark
 
     def pending_unit_snapshot(self) -> List[MemoryUnit]:
-        """Return a shallow copy of the current pending online units."""
-        return [item.unit for item in self._pending_buffer]
+        """Return a shallow copy of the current active chapter."""
+        return list(self._pending_unit_buffer)
 
-    def has_pending_units(self) -> bool:
-        """Return whether the segmenter has units waiting for storage."""
-        return bool(self._pending_buffer or self._awaiting_ambient_buffer)
+    def seal_pending_units(self, *, boundary_reason: str) -> List[MemoryUnit]:
+        """Move the current active chapter into the sealed chapter queue."""
+        units = self.pending_unit_snapshot()
+        if not units:
+            return []
+        self._sealed_chapter_buffers.append(SealedMemoryChapter(
+            units=units,
+            boundary_reason=str(boundary_reason or "boundary"),
+        ))
+        self.clear_pending_units()
+        return units
+
+    def sealed_chapter_snapshot(self) -> List[SealedMemoryChapter]:
+        """Return copies of chapters ready to be coalesced into fact input."""
+        return [
+            SealedMemoryChapter(
+                units=list(chapter.units),
+                boundary_reason=chapter.boundary_reason,
+            )
+            for chapter in self._sealed_chapter_buffers
+        ]
+
+    def sealed_unit_snapshot(self) -> List[MemoryUnit]:
+        """Flatten the sealed chapters in their original chronological order."""
+        return [
+            unit
+            for chapter in self._sealed_chapter_buffers
+            for unit in chapter.units
+        ]
+
+    def clear_sealed_chapter_buffers(self) -> None:
+        """Discard sealed chapters after their fact task has been accepted."""
+        self._sealed_chapter_buffers.clear()
+
+    def preceding_context_units_snapshot(self) -> List[MemoryUnit]:
+        """Return the prior fact task's bounded trailing canonical units."""
+        return list(self._preceding_context_units)
+
+    def record_preceding_context_units(
+        self,
+        units: Sequence[MemoryUnit],
+    ) -> None:
+        """Replace the next task's auxiliary context with this batch's tail.
+
+        The context is deliberately non-accumulating: it provides only the
+        immediately preceding local discourse, rather than becoming a second
+        history buffer.  Units are selected from newest to oldest under both
+        configured bounds, then restored to chronological order.
+        """
+        config = self.fact_extraction_window_config
+        max_units = max(0, int(config.preceding_context_max_units))
+        max_tokens = max(0, int(config.preceding_context_max_tokens))
+        if max_units <= 0 or max_tokens <= 0:
+            self._preceding_context_units.clear()
+            return
+
+        selected_reversed: List[MemoryUnit] = []
+        selected_tokens = 0
+        for unit in reversed(list(units or [])):
+            if len(selected_reversed) >= max_units:
+                break
+            token_count = max(0, self.unit_token_count(unit))
+            if selected_reversed and selected_tokens + token_count > max_tokens:
+                break
+            if not selected_reversed and token_count > max_tokens:
+                # Preserve one complete trailing unit rather than splitting a
+                # semantic unit solely to satisfy an approximate token count.
+                selected_reversed.append(unit)
+                break
+            selected_reversed.append(unit)
+            selected_tokens += token_count
+        self._preceding_context_units = list(reversed(selected_reversed))
+
+    def _sealed_buffer_statistics(self) -> Tuple[int, int]:
+        """Return the current sealed chapter count and token count."""
+        return (
+            len(self._sealed_chapter_buffers),
+            sum(
+                self.unit_token_count(unit)
+                for chapter in self._sealed_chapter_buffers
+                for unit in chapter.units
+            ),
+        )
+
+    def _fact_task_decision_without_new_sealed_chapter(
+        self,
+        chapter_boundary_decision: ChapterBoundaryDecision,
+    ) -> FactExtractionTaskDecision:
+        """Expose a no-op fact-task decision for an active chapter update."""
+        chapter_count, token_count = self._sealed_buffer_statistics()
+        return FactExtractionTaskDecision(
+            reason=str(chapter_boundary_decision.reason or "append"),
+            sealed_chapter_count=chapter_count,
+            sealed_token_count=token_count,
+            chapter_boundary_decision=chapter_boundary_decision,
+        )
+
+    def evaluate_sealed_chapter_buffers_for_fact_task(
+        self,
+        ) -> FactExtractionTaskDecision:
+        """Decide whether sealed chapters now form a fact extraction window."""
+        chapter_count, token_count = self._sealed_buffer_statistics()
+        decision = FactExtractionTaskDecision(
+            sealed_chapter_count=chapter_count,
+            sealed_token_count=token_count,
+        )
+        if chapter_count <= 0:
+            decision.reason = "no_sealed_chapters"
+            return decision
+        config = self.fact_extraction_window_config
+        if (
+            chapter_count >= config.max_sealed_chapters
+            or token_count >= config.max_sealed_tokens
+        ):
+            decision.should_trigger = True
+            decision.reason = "sealed_capacity"
+            return decision
+        if (
+            chapter_count >= config.min_sealed_chapters
+            and token_count >= config.target_sealed_tokens
+        ):
+            decision.should_trigger = True
+            decision.reason = "sealed_target"
+            return decision
+        decision.reason = "awaiting_sealed_context"
+        return decision
 
     def clear_pending_units(self) -> None:
-        """Clear units after the corresponding memory task was queued."""
-        self._pending_buffer.clear()
+        """Clear only the current active chapter."""
+        self._pending_unit_buffer.clear()
 
     def record_stored_units(
         self,
         units: Sequence[MemoryUnit],
-    ) -> EpisodeSummaryBoundaryDecision:
-        """Record successfully queued units and evaluate the episode window."""
+    ) -> None:
+        """Record successfully queued canonical units in the episode window."""
         for unit in units:
             token_count = max(0, self.unit_token_count(unit))
             if token_count <= 0:
@@ -707,14 +904,13 @@ class MemoryContextManager:
             ):
                 self._episode_latest_at = latest_at
             self._episode_token_count += token_count
-        return self._evaluate_episode_summary()
 
     def reset_episode_summary_window(self) -> None:
         self._episode_started_at = None
         self._episode_latest_at = None
         self._episode_token_count = 0
 
-    def _evaluate_episode_summary(self) -> EpisodeSummaryBoundaryDecision:
+    def evaluate_episode_summary_trigger_decision(self) -> EpisodeSummaryBoundaryDecision:
         token_count = self._episode_token_count
         if token_count <= 0:
             return EpisodeSummaryBoundaryDecision(accumulated_tokens=token_count)
@@ -739,246 +935,129 @@ class MemoryContextManager:
             )
         return EpisodeSummaryBoundaryDecision(False, "append", token_count, elapsed_seconds)
 
-    def embed_unit(self, unit: Any) -> ActiveUnit:
-        embedding = self.embedding_client.embed_text(self.unit_text(unit))
-        vector = _as_embedding_vector(embedding)
-        return ActiveUnit(unit=unit, embedding=vector)
-
-    def _evaluate_incoming_unit(
+    def _evaluate_incoming_unit_for_chapter(
         self,
-        incoming_unit: Any,
-        incoming_embedding: Optional[np.ndarray],
-        ambient_recording_enabled: bool = False,
-    ) -> FactExtractionBoundaryDecision:
-        active = list(self._pending_buffer)
-        active_units = [item.unit for item in active]
+        incoming_unit: MemoryUnit,
+    ) -> ChapterBoundaryDecision:
+        active_units = list(self._pending_unit_buffer)
         time_gap_seconds = (
             self.unit_time_gap_seconds(active_units[-1], incoming_unit)
             if active_units
             else None
         )
         if not active_units:
-            decision = FactExtractionBoundaryDecision(
-                reason="start_segment",
+            decision = ChapterBoundaryDecision(
+                reason="start_unit",
                 prospective_tokens=self.unit_token_count(incoming_unit),
                 prospective_units=1,
                 time_gap_seconds=time_gap_seconds,
             )
             return decision
-        existing_capacity_reason = self._pending_capacity_reason(active_units)
-        if existing_capacity_reason:
-            return self._apply_ambient_finalize_gate(
-                should_finalize=True,
-                decision=FactExtractionBoundaryDecision(
-                    reason=existing_capacity_reason,
-                    prospective_tokens=sum(
-                        self.unit_token_count(item) for item in active_units
-                    ),
-                    prospective_units=len(active_units),
-                    time_gap_seconds=time_gap_seconds,
-                ),
-                active_units=active_units,
-                ambient_recording_enabled=ambient_recording_enabled,
-            )
-        if self.time_gap_exceeded(time_gap_seconds):
-            return self._apply_ambient_finalize_gate(
-                should_finalize=True,
-                decision=FactExtractionBoundaryDecision(
-                    reason="time_gap",
-                    prospective_tokens=sum(
-                        self.unit_token_count(item) for item in active_units
-                    ),
-                    prospective_units=len(active_units),
-                    time_gap_seconds=time_gap_seconds,
-                ),
-                active_units=active_units,
-                ambient_recording_enabled=ambient_recording_enabled,
-            )
-        incoming_token_count = self.unit_token_count(incoming_unit)
-        minimum_scoring_tokens = max(
-            0,
-            int(self.config.min_boundary_scoring_incoming_tokens),
+        active_token_count = sum(
+            self.unit_token_count(item) for item in active_units
         )
         if (
-            minimum_scoring_tokens > 0
-            and incoming_token_count < minimum_scoring_tokens
+            self.config.max_pending_units > 0
+            and len(active_units) >= self.config.max_pending_units
         ):
-            return FactExtractionBoundaryDecision(
-                reason="short_incoming_append",
+            return ChapterBoundaryDecision(
+                reason="pending_unit_limit",
+                should_finalize=True,
+                prospective_tokens=active_token_count,
+                prospective_units=len(active_units),
+                time_gap_seconds=time_gap_seconds,
+            )
+        if (
+            self.config.max_pending_tokens > 0
+            and active_token_count >= self.config.max_pending_tokens
+        ):
+            return ChapterBoundaryDecision(
+                reason="pending_token_limit",
+                should_finalize=True,
+                prospective_tokens=active_token_count,
+                prospective_units=len(active_units),
+                time_gap_seconds=time_gap_seconds,
+            )
+        if (
+            self.config.max_time_gap_seconds >= 0
+            and time_gap_seconds is not None
+            and time_gap_seconds > self.config.max_time_gap_seconds
+        ):
+            return ChapterBoundaryDecision(
+                reason="time_gap",
+                should_finalize=True,
+                prospective_tokens=active_token_count,
+                prospective_units=len(active_units),
+                time_gap_seconds=time_gap_seconds,
+            )
+        incoming_token_count = self.unit_token_count(incoming_unit)
+        if incoming_token_count < self.config.min_boundary_scoring_incoming_tokens:
+            return ChapterBoundaryDecision(
+                reason="short_unit_append",
                 prospective_tokens=(
-                    sum(self.unit_token_count(item) for item in active_units)
-                    + incoming_token_count
+                    active_token_count + incoming_token_count
                 ),
                 prospective_units=len(active_units) + 1,
                 time_gap_seconds=time_gap_seconds,
-                scoring_mode="short_incoming_skipped",
             )
-        incoming, scoring_context = self._build_boundary_scoring_incoming(
-            active_units,
-            incoming_unit,
-            incoming_embedding,
+        decision = self._scoring_boundary_for_chapter(active_units, incoming_unit)
+        decision.time_gap_seconds = time_gap_seconds
+        return decision
+
+    def _scoring_boundary_for_chapter(
+        self,
+        active_units: Sequence[MemoryUnit],
+        incoming_unit: MemoryUnit,
+    ) -> ChapterBoundaryDecision:
+        """Score one chapter boundary, including its rolling incoming context."""
+        tail_limit = max(0, int(self.config.rolling_window_tail_units))
+        scoring_mode = "single_unit"
+        tail_units: List[MemoryUnit] = []
+        incoming_embedding = incoming_unit.embedding
+        if self.config.rolling_window_enabled and tail_limit > 0:
+            tail_units = list(active_units[-tail_limit:])
+            texts = [
+                self.unit_text(unit)
+                for unit in tail_units
+                if self.unit_text(unit)
+            ]
+            incoming_text = self.unit_text(incoming_unit)
+            if incoming_text:
+                texts.append(incoming_text)
+            if len(texts) > 1:
+                rolling_embedding = _as_embedding_vector(
+                    self.embedding_client.embed_text("\n".join(texts)),
+                )
+                if rolling_embedding is not None:
+                    scoring_mode = "rolling_window"
+                    incoming_embedding = rolling_embedding
+                else:
+                    tail_units = []
+            else:
+                tail_units = []
+
+        tail_token_count = sum(
+            self.unit_token_count(unit)
+            for unit in tail_units
         )
-        if incoming.embedding is None or any(
-            item.embedding is None for item in active
+        if incoming_embedding is None or any(
+            item.embedding is None for item in active_units
         ):
-            return FactExtractionBoundaryDecision(
+            return ChapterBoundaryDecision(
                 reason="embedding_unavailable",
                 prospective_tokens=sum(
                     self.unit_token_count(item) for item in active_units
                 ),
                 prospective_units=len(active_units),
-                time_gap_seconds=time_gap_seconds,
-                scoring_mode="embedding_unavailable",
-                rolling_window_tail_units=scoring_context["tail_units"],
-                rolling_window_tail_tokens=scoring_context["tail_tokens"],
+                rolling_window_tail_units=len(tail_units),
+                rolling_window_tail_tokens=tail_token_count,
             )
-        decision = self.score_boundary(active, incoming)
-        decision.time_gap_seconds = time_gap_seconds
-        decision.scoring_mode = scoring_context["scoring_mode"]
-        decision.rolling_window_tail_units = scoring_context["tail_units"]
-        decision.rolling_window_tail_tokens = scoring_context["tail_tokens"]
-        if self.semantic_boundary_allowed(active, decision):
-            decision.reason = "semantic_boundary"
-            return self._apply_ambient_finalize_gate(
-                should_finalize=True,
-                decision=decision,
-                active_units=active_units,
-                ambient_recording_enabled=ambient_recording_enabled,
-            )
-        decision.reason = "append"
-        return decision
 
-    def _apply_ambient_finalize_gate(
-        self,
-        *,
-        should_finalize: bool,
-        decision: FactExtractionBoundaryDecision,
-        active_units: Sequence[Any],
-        ambient_recording_enabled: bool,
-    ) -> FactExtractionBoundaryDecision:
-        """Delay a finalized prefix until ambient ASR covers its tail.
-
-        The semantic, capacity, and time-gap decision has already been made.
-        Watermark coverage is only a persistence gate, not an alternate
-        boundary decision. Equality is safe: a watermark at the same instant
-        as the pending tail confirms that the tail is already covered.
-        """
-        if not should_finalize or not ambient_recording_enabled or not active_units:
-            decision.should_finalize = should_finalize
-            return decision
-        pending_tail_time = self._parse_timestamp(
-            self.unit_end_timestamp(active_units[-1]),
-        )
-        if (
-            self._ambient_asr_watermark is None
-            or pending_tail_time is None
-            or pending_tail_time > self._ambient_asr_watermark
-        ):
-            decision.reason = "awaiting_ambient_asr_watermark"
-            decision.should_finalize = False
-            return decision
-        decision.should_finalize = True
-        return decision
-
-    def _build_boundary_scoring_incoming(
-        self,
-        active_units: Sequence[Any],
-        incoming_unit: Any,
-        incoming_embedding: Optional[np.ndarray],
-    ) -> Tuple[ActiveUnit, Dict[str, Any]]:
-        """Build the incoming embedding used only for boundary scoring."""
-        tail_limit = max(0, int(self.config.rolling_window_tail_units))
-        if not self.config.rolling_window_enabled or tail_limit <= 0:
-            return ActiveUnit(
-                unit=incoming_unit,
-                embedding=_as_embedding_vector(incoming_embedding),
-            ), {
-                "scoring_mode": "single_unit",
-                "tail_units": 0,
-                "tail_tokens": 0,
-            }
-
-        tail_units = list(active_units[-tail_limit:])
-        texts = [
-            self.unit_text(unit)
-            for unit in tail_units
-            if self.unit_text(unit)
-        ]
-        incoming_text = self.unit_text(incoming_unit)
-        if incoming_text:
-            texts.append(incoming_text)
-        if len(texts) <= 1:
-            return ActiveUnit(
-                unit=incoming_unit,
-                embedding=_as_embedding_vector(incoming_embedding),
-            ), {
-                "scoring_mode": "single_unit",
-                "tail_units": 0,
-                "tail_tokens": 0,
-            }
-
-        rolling_text = "\n".join(texts)
-        embedding = self.embedding_client.embed_text(rolling_text)
-        vector = _as_embedding_vector(embedding)
-        if vector is None:
-            return ActiveUnit(
-                unit=incoming_unit,
-                embedding=_as_embedding_vector(incoming_embedding),
-            ), {
-                "scoring_mode": "single_unit",
-                "tail_units": 0,
-                "tail_tokens": 0,
-            }
-        return ActiveUnit(
-            unit=incoming_unit,
-            embedding=vector,
-        ), {
-            "scoring_mode": "rolling_window",
-            "tail_units": len(tail_units),
-            "tail_tokens": sum(
-                self.unit_token_count(unit)
-                for unit in tail_units
-            ),
-        }
-
-    def _pending_capacity_reason(
-        self,
-        units: Sequence[Any],
-    ) -> Optional[str]:
-        """Return the pending semantic-unit, token, or character limit reason."""
-        if not units:
-            return None
-        if (
-            self.config.max_pending_turns > 0
-            and len(units) >= self.config.max_pending_turns
-        ):
-            return "pending_turn_limit"
-        token_count = sum(self.unit_token_count(unit) for unit in units)
-        if (
-            self.config.max_pending_tokens > 0
-            and token_count >= self.config.max_pending_tokens
-        ):
-            return "pending_token_limit"
-        char_count = sum(
-            len(self.unit_text(unit)) for unit in units
-        )
-        if (
-            self.config.max_pending_chars > 0
-            and char_count >= self.config.max_pending_chars
-        ):
-            return "pending_char_limit"
-        return None
-
-    def score_boundary(
-        self,
-        active: Sequence[ActiveUnit],
-        incoming: ActiveUnit,
-    ) -> FactExtractionBoundaryDecision:
-        active_embeddings = [item.embedding for item in active]
+        active_embeddings = [item.embedding for item in active_units]
         active_centroid = _centroid(active_embeddings)
-        recent_embedding = active[-1].embedding
-        centroid_sim = _cal_embedding_cosine_similarity(incoming.embedding, active_centroid)
-        recent_sim = _cal_embedding_cosine_similarity(incoming.embedding, recent_embedding)
+        recent_embedding = active_units[-1].embedding
+        centroid_sim = _cal_embedding_cosine_similarity(incoming_embedding, active_centroid)
+        recent_sim = _cal_embedding_cosine_similarity(incoming_embedding, recent_embedding)
         semantic_surprise = 1.0 - max(centroid_sim, recent_sim)
 
         robust_surprise = robust_surprise_signal(
@@ -989,24 +1068,25 @@ class MemoryContextManager:
         absolute_surprise = absolute_surprise_signal(semantic_surprise)
 
         cohesion_before = _cohesion(active_embeddings)
-        cohesion_after = _cohesion([*active_embeddings, incoming.embedding])
+        cohesion_after = _cohesion([*active_embeddings, incoming_embedding])
         cohesion_drop = max(0.0, cohesion_before - cohesion_after)
-        prospective_tokens = sum(self.unit_token_count(item.unit) for item in active) + self.unit_token_count(incoming.unit)
-        prospective_units = len(active) + 1
+        prospective_tokens = (
+            sum(self.unit_token_count(item) for item in active_units)
+            + self.unit_token_count(incoming_unit)
+        )
+        prospective_units = len(active_units) + 1
         length_signal = length_pressure(prospective_tokens, self.config)
-        turn_signal = turn_count_pressure(prospective_units)
         score = (
             self.config.robust_surprise_weight * robust_surprise
             + self.config.absolute_surprise_weight * absolute_surprise
             + self.config.cohesion_drop_weight * cohesion_drop
             + self.config.length_weight * length_signal
-            + self.config.turn_count_weight * turn_signal
         )
         cut_probability = _sigmoid(self.config.bias + score)
         self.surprise_history.append(float(semantic_surprise))
 
-        return FactExtractionBoundaryDecision(
-            reason="score",
+        decision = ChapterBoundaryDecision(
+            reason="append",
             cut_probability=cut_probability,
             score=score,
             semantic_surprise=semantic_surprise,
@@ -1016,42 +1096,35 @@ class MemoryContextManager:
             cohesion_after=cohesion_after,
             cohesion_drop=cohesion_drop,
             length_signal=length_signal,
-            turn_signal=turn_signal,
             centroid_similarity=centroid_sim,
             recent_similarity=recent_sim,
             prospective_tokens=prospective_tokens,
             prospective_units=prospective_units,
+            scoring_mode=scoring_mode,
+            rolling_window_tail_units=len(tail_units),
+            rolling_window_tail_tokens=tail_token_count,
         )
-
-    def semantic_boundary_allowed(
-        self,
-        active: Sequence[ActiveUnit],
-        decision: FactExtractionBoundaryDecision,
-    ) -> bool:
-        if (decision.cut_probability or 0.0) < self.config.threshold:
-            return False
-        min_units = max(1, int(self.config.min_pending_turns))
+        if cut_probability < self.config.threshold:
+            return decision
+        min_units = max(1, int(self.config.min_pending_units))
         active_token_count = sum(
-            self.unit_token_count(item.unit) for item in active
+            self.unit_token_count(item) for item in active_units
         )
         meets_token_minimum = (
             not self.config.enforce_min_pending_tokens
             or active_token_count >= max(1, int(self.config.min_pending_tokens))
         )
-        if len(active) >= min_units and meets_token_minimum:
-            return True
-        if self.config.enforce_min_pending_tokens:
-            return False
-        return (decision.cut_probability or 0.0) >= float(
-            self.config.min_segment_override_probability,
-        )
-
-    def time_gap_exceeded(self, time_gap_seconds: Optional[float]) -> bool:
-        return bool(
-            self.config.max_time_gap_seconds >= 0
-            and time_gap_seconds is not None
-            and time_gap_seconds > self.config.max_time_gap_seconds
-        )
+        if len(active_units) >= min_units and meets_token_minimum:
+            decision.reason = "semantic_boundary"
+            decision.should_finalize = True
+            return decision
+        if (
+            not self.config.enforce_min_pending_tokens
+            and cut_probability >= float(self.config.min_segment_override_probability)
+        ):
+            decision.reason = "semantic_boundary"
+            decision.should_finalize = True
+        return decision
 
     @staticmethod
     def unit_text(unit: Any) -> str:

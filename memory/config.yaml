@@ -152,6 +152,17 @@ memory_runtime:
 
   memory_context_manager:
     fact_extraction:
+      # Semantic boundaries close chapters. Fact extraction waits until
+      # multiple closed chapters provide a sufficiently complete context.
+      min_sealed_chapters: 2
+      target_sealed_tokens: 1200
+      max_sealed_chapters: 5
+      max_sealed_tokens: 1800
+      # Tail of the last accepted fact window, used only to resolve the
+      # following window's local discourse context.
+      preceding_context_max_units: 3
+      preceding_context_max_tokens: 400
+
       max_pending_units: 40
       max_pending_tokens: 1000
       min_pending_units: 4
@@ -170,7 +181,6 @@ memory_runtime:
       absolute_surprise_weight: 0.8
       cohesion_drop_weight: 0.8
       length_weight: 0.4
-      turn_count_weight: 0.4
     episode_summary:
       max_duration_seconds: 1800.0
       max_tokens: 6000

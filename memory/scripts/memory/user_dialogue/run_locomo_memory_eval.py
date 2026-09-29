@@ -514,7 +514,7 @@ def build_sample_memory_context(
                 raise RuntimeError("Timed out while draining queued memory stores")
             memory_operation_report = operation_reporter.snapshot()
             operation_counts = memory_operation_report.get("counts") or {}
-            store_operation_report = operation_counts.get("memory_store") or {}
+            store_operation_report = operation_counts.get("memormemory_fact_extractiony_store") or {}
             reflect_operation_report = operation_counts.get("memory_reflect") or {}
             replay_stats = LocomoReplayStats(
                 replay_stats.dialog_turns_total,

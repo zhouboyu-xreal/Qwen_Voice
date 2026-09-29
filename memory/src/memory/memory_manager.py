@@ -355,7 +355,7 @@ class MemoryOperationReporter:
             "error",
             "queue_rejected",
         }
-        if operation_type == "memory_store":
+        if operation_type == "memory_fact_extraction":
             if not isinstance(result, dict):
                 return bool(result)
             return (
@@ -401,7 +401,7 @@ class MemoryOperationReporter:
             ),
             "total_elapsed_ms": elapsed_ms,
         })
-        if operation_type in {"memory_store", "memory_episode_summary"}:
+        if operation_type in {"memory_fact_extraction", "memory_episode_summary"}:
             report["stored"] = bool(succeeded and error is None)
         if error is not None:
             report["error_type"] = type(error).__name__
@@ -892,8 +892,8 @@ class MemoryNodeManager:
             error: Optional[BaseException] = None
             try:
                 with self._memory_operation_lock:
-                    if task_kind == "memory_store":
-                        result = self._process_memory_store_task(**task["payload"])
+                    if task_kind == "memory_fact_extraction":
+                        result = self._process_memory_fact_extraction_task(**task["payload"])
                     elif task_kind == "memory_episode_summary":
                         result = self._process_memory_episode_summary_task(**task["payload"])
                     elif task_kind == "memory_entity_claim_update":
@@ -1056,10 +1056,11 @@ class MemoryNodeManager:
         worker.join(timeout=remaining)
         return not worker.is_alive() and not self._task_queue.unfinished_tasks
 
-    def submit_memory_store_task(
+    def submit_memory_fact_extraction_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         tags: List[str],
         prompt_language: str,
         completion_context: Optional[Dict[str, Any]] = None,
@@ -1067,16 +1068,17 @@ class MemoryNodeManager:
         """Queue one normalized episode for ordered background storage."""
         if not self._memory_enabled or not raw_segments:
             reason = "memory_disabled" if not self._memory_enabled else "no_raw_segments"
-            task_id = self._operation_reporter.next_task_id("memory_store")
+            task_id = self._operation_reporter.next_task_id("memory_fact_extraction")
             return self._reject_memory_task(
-                task_kind="memory_store",
+                task_kind="memory_fact_extraction",
                 task_id=task_id,
                 reason=reason,
             )
         return self._submit_memory_task(
-            task_kind="memory_store",
+            task_kind="memory_fact_extraction",
             payload={
                 "raw_segments": raw_segments,
+                "preceding_context_segments": list(preceding_context_segments or []),
                 "tags": tags,
                 "prompt_language": prompt_language,
             },
@@ -1197,7 +1199,7 @@ class MemoryNodeManager:
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
         })
-        self._log_info("memory_store", "episode_summary_generated", {
+        self._log_info("memory_fact_extraction", "episode_summary_generated", {
             "episode_id": episode_id,
             "fact_count": attached,
             "source_segment_count": len(source_segments),
@@ -1208,16 +1210,19 @@ class MemoryNodeManager:
         })
         return episode_info
 
-    def _process_memory_store_task(
+    def _process_memory_fact_extraction_task(
         self,
         *,
         raw_segments: List[Dict[str, Any]],
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         tags: List[str],
         prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
-        self._log_info("memory_store", "start", {
+        preceding_segments = list(preceding_context_segments or [])
+        self._log_info("memory_fact_extraction", "start", {
             "source_segment_count": len(raw_segments),
+            "preceding_context_segment_count": len(preceding_segments),
             "raw_segments": self._build_memory_segments_for_prompt(
                 raw_segments,
                 prompt_language=prompt_language,
@@ -1225,7 +1230,7 @@ class MemoryNodeManager:
         })
         if not raw_segments:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
-            self._log_info("memory_store", "finish", {
+            self._log_info("memory_fact_extraction", "finish", {
                 "status": "skipped",
                 "reason": "no_raw_segments",
                 "total_elapsed_ms": elapsed_ms,
@@ -1233,7 +1238,6 @@ class MemoryNodeManager:
             return {
                 "status": "skipped",
                 "reason": "no_raw_segments",
-                "new_episode_count": 0,
                 "new_fact_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
@@ -1243,28 +1247,23 @@ class MemoryNodeManager:
             )
         extracted_info = self._extract_memory_fact_from_raw_segments(
             raw_segments,
+            preceding_context_segments=preceding_segments,
             prompt_language=prompt_language,
         )
         facts = list(extracted_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
         with self._db.transaction():
-            save_entity_info = self._store_extracted_memory_entities_into_db(
-                participants=[],
-                facts=facts,
-            )
             save_fact_info = self._store_extracted_memory_facts_into_db(
                 episode_id=None,
                 facts=facts,
                 tags=tags,
                 episode_context_topics=None,
-                entity_info=save_entity_info,
             )
             topic_report = self._db.upsert_memory_topic_items(
                 save_fact_info.get("topic_item_updates") or []
             )
         report = {
             "status": "ok",
-            "new_episode_count": 0,
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
             "entity_claim_signal_fact_count": int(
@@ -1286,26 +1285,8 @@ class MemoryNodeManager:
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
-        self._log_info("memory_store", "finish", report)
+        self._log_info("memory_fact_extraction", "finish", report)
         return report
-
-    def _store_extracted_memory_entities_into_db(
-        self,
-        *,
-        participants: List[str],
-        facts: List[Dict[str, Any]],
-    ) -> Dict[str, int]:
-        """Persist only fact-grounded entities and explicit participants."""
-        entity_names = self._episode_entity_names(
-            participants=participants,
-            facts=facts,
-        )
-        mapping = self._db.add_entity_names(entity_names)
-        return {
-            str(entity_name): int(entity_id)
-            for entity_name, entity_id in mapping.items()
-            if str(entity_name).strip() and str(entity_id).strip().isdigit()
-        }
 
     def _upsert_memory_recall_document(
         self,
@@ -1432,7 +1413,7 @@ class MemoryNodeManager:
         for index, fact in enumerate(facts, 1):
             metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
             self._log_info(
-                "memory_store",
+                "memory_fact_extraction",
                 "extract_fact_signals",
                 {
                     "fact_index": index,
@@ -1462,11 +1443,13 @@ class MemoryNodeManager:
         self,
         raw_segments: List[Dict[str, Any]],
         *,
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         prompt_language: str,
     ) -> Dict[str, Any]:
         """Extract narrative facts with the unified fact prompt."""
         data = self._extract_memory_fact_with_llm(
             raw_segments,
+            preceding_context_segments=preceding_context_segments,
             prompt_language=prompt_language,
         )
         if data and data.get("facts"):
@@ -1556,16 +1539,21 @@ class MemoryNodeManager:
                     if item.get("fact_root_topic")
                 ])[:3]
                 or self._topic_candidates(summary)[:3]
-            )
+        )
         participants = self._parse_participants_from_raw_segments(segment_list)
-        entity_names = self._episode_entity_names(
-            participants=participants,
-            facts=fact_list,
-        )
-        episode_entity_ids = self._entity_ids_from_names_and_facts(
-            names=entity_names,
-            facts=fact_list,
-        )
+        episode_entity_ids: List[int] = []
+        for fact in fact_list:
+            for value in fact.get("entity_ids") or []:
+                try:
+                    entity_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if entity_id and entity_id not in episode_entity_ids:
+                    episode_entity_ids.append(entity_id)
+                if len(episode_entity_ids) >= 64:
+                    break
+            if len(episode_entity_ids) >= 64:
+                break
         start = _compact_whitespace(segment_list[0].get("started_at") or "") or _now_text()
         end = (
             _compact_whitespace(segment_list[-1].get("ended_at") or "")
@@ -1598,6 +1586,7 @@ class MemoryNodeManager:
         self,
         segments: List[Dict[str, Any]],
         *,
+        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
         prompt_language: str,
     ) -> Optional[Dict[str, Any]]:
         prompt_template = (
@@ -1623,16 +1612,55 @@ class MemoryNodeManager:
                     prompt_language=prompt_language,
                 ),
             )
+            .replace(
+                "{preceding_context}",
+                self._build_memory_segments_for_prompt(
+                    list(preceding_context_segments or []),
+                    prompt_language=prompt_language,
+                ) or ("(none)" if prompt_language == "en" else "（无）"),
+            )
         )
         for attempt in range(2):
             result = self._call_llm(prompt)
+            response_text = str(result or "")
+            response_chars = len(response_text)
+            if not response_text.strip():
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "empty_response",
+                    "response_chars": response_chars,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+                if attempt == 0:
+                    self._logger.debug("Unified memory LLM extraction failed, retrying")
+                continue
             parsed = self._parse_json_object_from_llm_text(result or "")
-            if parsed is not None:
+            if parsed is None:
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "invalid_json_object",
+                    "response_chars": response_chars,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+            else:
+                normalization_diagnostics: Dict[str, Any] = {}
                 normalized = self._normalize_memory_fact_extraction_llm_output(
                     parsed,
                     segments,
                     prompt_language=prompt_language,
+                    diagnostics=normalization_diagnostics,
                 )
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "parsed",
+                    "response_chars": response_chars,
+                    "response_keys": sorted(str(key) for key in parsed.keys()),
+                    **normalization_diagnostics,
+                })
                 if normalized is not None:
                     return normalized
             if attempt == 0:
@@ -1658,7 +1686,7 @@ class MemoryNodeManager:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
             "stream": False,
-            "max_tokens": 2048,
+            "max_tokens": 4096,
         }
         if self._llm_json_mode:
             payload["response_format"] = {"type": "json_object"}
@@ -1726,27 +1754,86 @@ class MemoryNodeManager:
         raw_segments: List[Dict[str, Any]],
         *,
         prompt_language: str,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
+        diagnostics = diagnostics if diagnostics is not None else {}
         raw_facts = data.get("facts")
         if not isinstance(raw_facts, list):
+            diagnostics.update({
+                "normalization_status": "invalid_facts_field",
+                "facts_field_type": type(raw_facts).__name__,
+                "raw_fact_count": None,
+                "normalized_fact_count": 0,
+                "dropped_fact_counts": {},
+                "fact_candidates": [],
+            })
             return None
         facts: List[Dict[str, Any]] = []
+        dropped_fact_counts: Dict[str, int] = {}
+        candidate_diagnostics: List[Dict[str, Any]] = []
+
+        def record_drop(reason: str) -> None:
+            dropped_fact_counts[reason] = dropped_fact_counts.get(reason, 0) + 1
+
+        def record_candidate(
+            *,
+            index: int,
+            raw_fact: Any,
+            result: str,
+            priority: Optional[int] = None,
+        ) -> None:
+            if len(candidate_diagnostics) >= 12:
+                return
+            raw_payload = raw_fact if isinstance(raw_fact, dict) else {}
+            candidate_diagnostics.append({
+                "index": index,
+                "result": result,
+                "priority": priority,
+                "text": self._format_log_text(
+                    raw_payload.get("text") or raw_payload.get("summary") or "",
+                    limit=300,
+                ),
+                "fact_type": _compact_whitespace(raw_payload.get("fact_type") or ""),
+            })
+
         dialogue_time_key = _to_timestamp_text(
             raw_segments[0].get("started_at") if raw_segments else ""
         ) or _now_text()
-        for raw_fact in raw_facts:
+        for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
+                record_drop("non_object_fact")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_non_object_fact",
+                )
                 continue
             text = _compact_whitespace(raw_fact.get("text") or raw_fact.get("summary") or "")
             if not text:
+                record_drop("missing_text")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_missing_text",
+                )
                 continue
             priority = self._normalize_priority(raw_fact.get("priority", 70))
             if priority < 60:
+                record_drop("priority_below_runtime_minimum")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_priority_below_runtime_minimum",
+                    priority=priority,
+                )
                 continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
                 keywords = self._keywords(text, limit=18)
-            entities = self._normalize_entity_names(raw_fact.get("entities"))
+            entity_descriptors = self._normalize_entity_descriptors(
+                raw_fact.get("entities"),
+            )
+            entities = [item["name"] for item in entity_descriptors]
             if not entities:
                 entities = self._entities(text)
             primary_entity = self._normalize_primary_entity(
@@ -1757,14 +1844,32 @@ class MemoryNodeManager:
                 primary_entity_name = primary_entity["name"]
                 if primary_entity_name not in entities:
                     entities = [primary_entity_name, *entities]
+                self._merge_entity_descriptor(
+                    entity_descriptors,
+                    primary_entity,
+                )
             primary_entity_name = _compact_whitespace(
                 (primary_entity or {}).get("name") or ""
             ).lower()
             if primary_entity_name in {"assistant", "agent", "the assistant", "助手"} \
                     and self._is_low_value_assistant_closing(text):
+                record_drop("low_value_assistant_closing")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_low_value_assistant_closing",
+                    priority=priority,
+                )
                 continue
             if primary_entity_name in {"user", "the user", "用户"} \
                     and self._is_low_value_user_acknowledgement(text):
+                record_drop("low_value_user_acknowledgement")
+                record_candidate(
+                    index=index,
+                    raw_fact=raw_fact,
+                    result="dropped_low_value_user_acknowledgement",
+                    priority=priority,
+                )
                 continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
             fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
@@ -1775,7 +1880,6 @@ class MemoryNodeManager:
             )
             entity_claim_signal = self._normalize_entity_claim_signal(
                 raw_fact.get("entity_claim_signal"),
-                fallback_entity=primary_entity,
             )
             future_commitment_signals = self._normalize_future_commitment_signals(
                 raw_fact.get("future_commitment_signals"),
@@ -1789,6 +1893,7 @@ class MemoryNodeManager:
                 "dialogue_time_key": dialogue_time_key,
                 "keywords": keywords,
                 "entities": entities,
+                "entity_descriptors": entity_descriptors,
                 "primary_entity": primary_entity,
                 "entity_claim_signal": entity_claim_signal,
                 "future_commitment_signals": future_commitment_signals,
@@ -1803,6 +1908,24 @@ class MemoryNodeManager:
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
                 },
             })
+            record_candidate(
+                index=index,
+                raw_fact=raw_fact,
+                result="accepted",
+                priority=priority,
+            )
+        diagnostics.update({
+            "normalization_status": "ok",
+            "facts_field_type": "list",
+            "raw_fact_count": len(raw_facts),
+            "normalized_fact_count": len(facts),
+            "dropped_fact_counts": dropped_fact_counts,
+            "fact_candidates": candidate_diagnostics,
+            "omitted_fact_candidate_diagnostics": max(
+                0,
+                len(raw_facts) - len(candidate_diagnostics),
+            ),
+        })
         return {"facts": facts}
 
     def _normalize_fact_topic_fields(
@@ -1829,7 +1952,6 @@ class MemoryNodeManager:
         self,
         value: Any,
         *,
-        fallback_entity: Optional[Dict[str, str]] = None,
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
@@ -1883,18 +2005,16 @@ class MemoryNodeManager:
             ):
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
-            entity = raw.get("entity") or raw.get("primary_entity") or fallback_entity
+            entity = raw.get("entity")
             if isinstance(entity, dict):
                 entity_name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
-                entity_type = _compact_whitespace(entity.get("type") or "CONCEPT").upper()
+                entity_type = self._normalize_entity_type(entity.get("type"))
             else:
                 entity_name = _compact_whitespace(entity)
-                entity_type = "CONCEPT"
-            entity_payload = (
-                {"name": entity_name, "type": entity_type}
-                if entity_name
-                else None
-            )
+                entity_type = "OTHER"
+            if not entity_name:
+                continue
+            entity_payload = {"name": entity_name, "type": entity_type}
             key = (
                 signal_kind,
                 claim_type_hint,
@@ -1911,8 +2031,7 @@ class MemoryNodeManager:
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
             }
-            if entity_payload:
-                item["entity"] = entity_payload
+            item["entity"] = entity_payload
             normalized.append(item)
             if len(normalized) >= max_items:
                 break
@@ -2079,83 +2198,62 @@ class MemoryNodeManager:
         if len(values) > limit:
             del values[limit:]
 
-    def _entity_ids_for_names(self, names: Sequence[Any], *, limit: int = 64) -> List[int]:
-        normalized: List[str] = []
-        for name in names or []:
-            self._append_unique_text(normalized, name, limit=limit)
-        mapping = self._db.add_entity_names(normalized)
-        ids: List[int] = []
-        for name in normalized:
-            entity_id = mapping.get(name)
-            if entity_id and entity_id not in ids:
-                ids.append(entity_id)
-        return ids
+    @classmethod
+    def _merge_entity_descriptor(
+        cls,
+        descriptors: List[Dict[str, str]],
+        value: Any,
+    ) -> None:
+        """Merge one typed entity without downgrading a concrete type."""
+        if not isinstance(value, dict):
+            return
+        name = _compact_whitespace(value.get("name") or value.get("text") or "")
+        if not cls._is_valid_entity_name(name):
+            return
+        entity_type = cls._normalize_entity_type(value.get("type"))
+        for descriptor in descriptors:
+            if _compact_whitespace(descriptor.get("name") or "") != name:
+                continue
+            if descriptor.get("type") == "OTHER" and entity_type != "OTHER":
+                descriptor["type"] = entity_type
+            return
+        descriptors.append({"name": name, "type": entity_type})
 
-    def _entity_ids_from_names_and_facts(
-        self,
-        *,
-        names: Sequence[Any],
-        facts: Sequence[Dict[str, Any]],
-        limit: int = 64,
-    ) -> List[int]:
-        ids: List[int] = []
-        for fact in facts or []:
-            for value in fact.get("entity_ids") or []:
-                try:
-                    entity_id = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if entity_id and entity_id not in ids:
-                    ids.append(entity_id)
-                if len(ids) >= limit:
-                    return ids
-        for entity_id in self._entity_ids_for_names(names, limit=limit):
-            if entity_id not in ids:
-                ids.append(entity_id)
-            if len(ids) >= limit:
-                break
-        return ids
-
-    def _fact_entity_names(
-        self,
+    @classmethod
+    def _fact_entity_descriptors(
+        cls,
         fact: Dict[str, Any],
         *,
         entities: Optional[Sequence[str]] = None,
-    ) -> List[str]:
-        names: List[str] = []
-        normalized_entities = (
+    ) -> List[Dict[str, str]]:
+        """Return typed entity descriptors while retaining name-only fallback."""
+        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
+        descriptor_source = fact.get("entity_descriptors")
+        if descriptor_source is None:
+            descriptor_source = metadata.get("entity_descriptors")
+        descriptors = cls._normalize_entity_descriptors(
+            descriptor_source if descriptor_source is not None else fact.get("entities"),
+            limit=32,
+        )
+        names = (
             list(entities)
             if entities is not None
-            else self._normalize_entity_names(fact.get("entities"), limit=32)
+            else cls._normalize_entity_names(fact.get("entities"), limit=32)
         )
-        for entity in normalized_entities:
-            self._append_unique_text(names, entity)
+        for name in names:
+            cls._merge_entity_descriptor(
+                descriptors,
+                {"name": name, "type": "OTHER"},
+            )
         primary = fact.get("primary_entity")
         if isinstance(primary, dict):
-            self._append_unique_text(names, primary.get("name") or primary.get("text"))
-        else:
-            self._append_unique_text(names, primary)
-        return names
-
-    def _episode_entity_names(
-        self,
-        *,
-        participants: Sequence[str],
-        facts: Sequence[Dict[str, Any]],
-    ) -> List[str]:
-        """Return the episode entity set from structured fact evidence only.
-
-        Episode summaries and raw source segments are natural-language views,
-        not entity sources: extracting names from either bypasses fact-level
-        entity filtering and can create fragmented or incidental nodes.
-        """
-        names: List[str] = []
-        for participant in participants or []:
-            self._append_unique_text(names, participant)
-        for fact in facts or []:
-            for entity in self._fact_entity_names(fact):
-                self._append_unique_text(names, entity)
-        return names
+            cls._merge_entity_descriptor(descriptors, primary)
+        elif primary:
+            cls._merge_entity_descriptor(
+                descriptors,
+                {"name": primary, "type": "OTHER"},
+            )
+        return descriptors
 
     def _build_memory_segments_for_prompt(
         self,
@@ -2530,7 +2628,6 @@ class MemoryNodeManager:
         facts: List[Dict[str, Any]],
         tags: List[str],
         episode_context_topics: Optional[Sequence[str]] = None,
-        entity_info: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         topic_item_updates: List[Dict[str, Any]] = []
@@ -2538,12 +2635,6 @@ class MemoryNodeManager:
         future_commitment_signal_mapping_updates: List[Dict[str, Any]] = []
         entity_claim_signal_fact_ids: List[int] = []
         future_commitment_signal_fact_ids: List[int] = []
-        normalized_entity_info = {
-            str(entity_name): int(entity_id)
-            for entity_name, entity_id in (entity_info or {}).items()
-            if str(entity_name).strip() and str(entity_id).strip().isdigit()
-        }
-        episode_context_entities = list(normalized_entity_info.keys())
         for fact in facts:
             keywords = self._normalize_string_list(
                 fact.get("keywords"),
@@ -2551,7 +2642,8 @@ class MemoryNodeManager:
             )
             if not keywords:
                 keywords = self._keywords(fact.get("summary") or "", limit=18)
-            entities = self._normalize_entity_names(fact.get("entities"))
+            fact_entities = list(fact.get("entities") or [])
+            entity_descriptors = list(fact.get("entity_descriptors") or [])
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
             fallback_topics = self._topic_candidates(fact["summary"])
@@ -2565,24 +2657,24 @@ class MemoryNodeManager:
                 fact.get("fact_aspect_topic")
                 or fact_root_topic
             ) or fact_root_topic
-            fact_entities = self._fact_entity_names(fact, entities=entities)
+            entity_mapping = self._db.upsert_entity_nodes(entity_descriptors)
             entity_ids = [
-                normalized_entity_info[entity_name]
+                entity_mapping[entity_name]
                 for entity_name in fact_entities
-                if entity_name in normalized_entity_info
+                if entity_name in entity_mapping
             ]
             fact_metadata = {
                 **metadata,
                 "tags": tags,
+                "entity_descriptors": entity_descriptors,
                 "episode_context_topics": list(episode_context_topics or []),
-                "episode_context_entities": list(episode_context_entities or []),
             }
             fact_id = self._db.insert_fact(
                 episode_id=episode_id,
                 fact_type=fact["fact_type"],
                 summary=fact["summary"],
                 keywords=keywords,
-                entities=entities,
+                entities=fact_entities,
                 entity_ids=entity_ids,
                 fact_root_topic=fact_root_topic,
                 fact_aspect_topic=fact_aspect_topic,
@@ -2596,7 +2688,7 @@ class MemoryNodeManager:
                 fact_id=fact_id,
                 summary=fact["summary"],
                 keywords=keywords,
-                entities=entities,
+                entities=fact_entities,
                 entity_ids=entity_ids,
                 fact_root_topic=fact_root_topic,
                 fact_aspect_topic=fact_aspect_topic,
@@ -2861,18 +2953,25 @@ class MemoryNodeManager:
                 for fact in group_facts
                 if str(fact.get("id") or "").strip().isdigit()
             }
-            entity_ids = self._intent_entity_name_to_id(
-                group_facts,
-                additional_names=[
-                    signal["subject_entity"]
-                    for signal in group["signals"]
-                ],
-            )
-            entity_ids[self._world_owner_entity_name] = world_owner_id
+            entity_ids_by_name: Dict[str, int] = {}
+            for fact in group_facts_by_id.values():
+                for raw_name, raw_entity_id in zip(
+                    fact.get("entities") or [],
+                    fact.get("entity_ids") or [],
+                ):
+                    entity_name = _compact_whitespace(raw_name)
+                    if not entity_name or entity_name in entity_ids_by_name:
+                        continue
+                    try:
+                        entity_id = int(raw_entity_id)
+                    except (TypeError, ValueError):
+                        continue
+                    if entity_id > 0:
+                        entity_ids_by_name[entity_name] = entity_id
             candidates = self._normalize_intent_candidates(
                 parsed,
                 facts_by_id=group_facts_by_id,
-                entity_ids=entity_ids,
+                entity_ids=entity_ids_by_name,
                 world_owner_id=world_owner_id,
             )
             report["candidate_count"] += len(candidates)
@@ -3149,22 +3248,6 @@ class MemoryNodeManager:
             "keywords": fact.get("keywords") or [],
             "topics": [fact.get("fact_root_topic") or "", fact.get("fact_aspect_topic") or ""],
         }
-
-    def _intent_entity_name_to_id(
-        self,
-        facts: Sequence[Dict[str, Any]],
-        *,
-        additional_names: Sequence[Any] = (),
-    ) -> Dict[str, int]:
-        names: List[str] = [self._world_owner_entity_name]
-        for fact in facts:
-            names.extend(self._normalize_entity_names(fact.get("entities")))
-            primary = fact.get("primary_entity")
-            if isinstance(primary, dict):
-                names.append(_compact_whitespace(primary.get("name") or ""))
-        names.extend(_compact_whitespace(name) for name in additional_names)
-        mapping = self._db.add_entity_names([name for name in names if name])
-        return {str(name): int(entity_id) for name, entity_id in mapping.items()}
 
     def _normalize_intent_candidates(
         self,
@@ -3699,14 +3782,6 @@ class MemoryNodeManager:
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
         }
-
-    def _claim_entity_name_to_id(self, facts: Sequence[Dict[str, Any]]) -> Dict[str, int]:
-        names = [
-            name
-            for fact in facts
-            for name in self._normalize_entity_names(fact.get("entities") or [], limit=24)
-        ]
-        return self._db.add_entity_names(names)
 
     def _sync_entity_claim_recall_documents(
         self,
@@ -4282,15 +4357,31 @@ class MemoryNodeManager:
             report["completed"] = False
             report["error"] = "invalid_llm_claim_response"
             return report
-        entity_ids = self._claim_entity_name_to_id(facts)
         facts_by_id = {
             int(fact["id"]): fact for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         }
+        entity_ids_by_name: Dict[str, int] = {}
+        for fact in facts_by_id.values():
+            for raw_name, raw_entity_id in zip(
+                fact.get("entities") or [],
+                fact.get("entity_ids") or [],
+            ):
+                entity_name = _compact_whitespace(raw_name)
+                if not entity_name or entity_name in entity_ids_by_name:
+                    continue
+                try:
+                    entity_id = int(raw_entity_id)
+                except (TypeError, ValueError):
+                    continue
+                if entity_id > 0:
+                    entity_ids_by_name[entity_name] = entity_id
         candidates: List[Dict[str, Any]] = []
         for raw_claim in parsed["claims"][:32]:
             claim = self._normalize_explicit_entity_claim(
-                raw_claim, facts_by_id=facts_by_id, entity_ids=entity_ids,
+                raw_claim,
+                facts_by_id=facts_by_id,
+                entity_ids=entity_ids_by_name,
             )
             if not claim:
                 continue
@@ -4884,10 +4975,8 @@ class MemoryNodeManager:
     ) -> List[Dict[str, Any]]:
         """Project one fact's induction-eligible signals into exact group keys."""
         updates: List[Dict[str, Any]] = []
-        fallback_entity = fact.get("primary_entity")
         raw_signals = self._normalize_entity_claim_signal(
             fact.get("entity_claim_signal"),
-            fallback_entity=fallback_entity,
         )
         for signal in raw_signals:
             claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
@@ -4897,8 +4986,20 @@ class MemoryNodeManager:
             if signal_kind not in {"explicit_assertion", "pattern_observation"}:
                 continue
             names = self._entities_for_entity_claim_signal(signal, fact)
-            entity_mapping = self._db.add_entity_names(names)
-            if not names or names[0] not in entity_mapping:
+            if not names:
+                continue
+            entity_name = names[0]
+            signal_entity = signal.get("entity")
+            entity_type = (
+                self._normalize_entity_type(signal_entity.get("type"))
+                if isinstance(signal_entity, dict)
+                else "OTHER"
+            )
+            entity_mapping = self._db.upsert_entity_nodes([{
+                "name": entity_name,
+                "type": entity_type,
+            }])
+            if entity_name not in entity_mapping:
                 continue
             claim_anchor = _compact_whitespace(signal.get("claim_anchor") or "")
             if not claim_anchor:
@@ -4909,11 +5010,11 @@ class MemoryNodeManager:
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
-                    f"{int(entity_mapping[names[0]])}|{claim_type_hint}|"
+                    f"{int(entity_mapping[entity_name])}|{claim_type_hint}|"
                     f"{claim_anchor_key}"
                 ),
-                "subject": names[0],
-                "subject_entity_id": int(entity_mapping[names[0]]),
+                "subject": entity_name,
+                "subject_entity_id": int(entity_mapping[entity_name]),
                 "claim_type_hint": claim_type_hint,
                 "signal_kind": signal_kind,
                 "claim_anchor": claim_anchor,
@@ -4936,10 +5037,19 @@ class MemoryNodeManager:
             fact.get("future_commitment_signals"),
             fallback_entity=fact.get("primary_entity"),
         )
+        fact_entities_by_name = {
+            str(descriptor["name"]).lower(): descriptor
+            for descriptor in self._fact_entity_descriptors(fact)
+            if _compact_whitespace(descriptor.get("name") or "")
+        }
         for signal in raw_signals:
             subject_name = _compact_whitespace(signal.get("subject_entity") or "")
-            entity_mapping = self._db.add_entity_names([subject_name])
-            if not subject_name or subject_name not in entity_mapping:
+            entity_descriptor = fact_entities_by_name.get(subject_name.lower())
+            if entity_descriptor is None:
+                continue
+            subject_name = str(entity_descriptor["name"])
+            entity_mapping = self._db.upsert_entity_nodes([entity_descriptor])
+            if subject_name not in entity_mapping:
                 continue
             future_commitment_anchor = _compact_whitespace(
                 signal.get("future_commitment_anchor") or ""
@@ -5458,47 +5568,19 @@ class MemoryNodeManager:
         signal: Dict[str, Any],
         fact: Dict[str, Any],
     ) -> List[str]:
-        entity = signal.get("entity") or signal.get("primary_entity")
+        """Return the signal entity only when it is a fact entity."""
+        entity = signal.get("entity")
         if isinstance(entity, dict):
             name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
         else:
             name = _compact_whitespace(entity)
-        if name:
-            return [name]
-        return self._entities_for_entity_claim_fact(fact)
-
-    def _entities_for_entity_claim_fact(
-        self,
-        fact: Dict[str, Any],
-    ) -> List[str]:
-        metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        primary_entity = fact.get("primary_entity")
-        if isinstance(primary_entity, dict):
-            primary_name = _compact_whitespace(
-                primary_entity.get("name") or primary_entity.get("text") or ""
-            )
-        else:
-            primary_name = _compact_whitespace(primary_entity)
-        if primary_name:
-            return [primary_name]
-
-        entities = [
-            _compact_whitespace(value)
-            for value in (fact.get("entities") or [])
-            if _compact_whitespace(value)
-        ]
-        out: List[str] = []
-        seen: set[str] = set()
-        for entity in entities:
-            clean = _compact_whitespace(entity)
-            if not clean:
-                continue
-            key = clean.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(clean)
-        return out[:1]
+        if not name:
+            return []
+        for fact_entity in fact.get("entities") or []:
+            canonical_name = _compact_whitespace(fact_entity)
+            if canonical_name and canonical_name.lower() == name.lower():
+                return [canonical_name]
+        return []
 
     def _should_route_fact_to_future_commitment_update(self, fact: Dict[str, Any]) -> bool:
         """Return whether a fact merits semantic review by the intent task.
@@ -9853,6 +9935,50 @@ class MemoryNodeManager:
         return out
 
     @staticmethod
+    def _normalize_entity_type(value: Any) -> str:
+        entity_type = _compact_whitespace(value or "OTHER").upper()
+        allowed_types = {
+            "PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT",
+            "TECHNOLOGY", "CONCEPT", "TOPIC", "PREFERENCE", "OTHER",
+        }
+        return entity_type if entity_type in allowed_types else "OTHER"
+
+    @classmethod
+    def _normalize_entity_descriptors(
+        cls,
+        value: Any,
+        *,
+        limit: int = 16,
+    ) -> List[Dict[str, str]]:
+        """Normalize prompt entity objects without discarding their types."""
+        if isinstance(value, str):
+            raw = re.split(r"[,，;；\n]+", value)
+        elif isinstance(value, list):
+            raw = value
+        else:
+            raw = []
+        descriptors: List[Dict[str, str]] = []
+        for item in raw:
+            if isinstance(item, dict):
+                candidate = {
+                    "name": _compact_whitespace(
+                        item.get("name") or item.get("text") or "",
+                    ),
+                    "type": cls._normalize_entity_type(item.get("type")),
+                }
+            else:
+                candidate = {
+                    "name": _compact_whitespace(item),
+                    "type": "OTHER",
+                }
+            if not cls._is_valid_entity_name(candidate["name"]):
+                continue
+            cls._merge_entity_descriptor(descriptors, candidate)
+            if len(descriptors) >= limit:
+                break
+        return descriptors
+
+    @staticmethod
     def _is_valid_entity_name(value: Any) -> bool:
         """Validate entity anchors using the shared extraction guidance."""
         text = _compact_whitespace(value).strip("'\".,:;!?，。！？、；：（）()[]{}")
@@ -9909,12 +10035,7 @@ class MemoryNodeManager:
                 name = _compact_whitespace(entities[0])
         if not name:
             return None
-        allowed_types = {
-            "PERSON", "ORGANIZATION", "LOCATION", "PRODUCT", "PROJECT",
-            "TECHNOLOGY", "CONCEPT", "TOPIC", "PREFERENCE", "OTHER",
-        }
-        if entity_type not in allowed_types:
-            entity_type = "CONCEPT"
+        entity_type = cls._normalize_entity_type(entity_type)
         return {"name": name, "type": entity_type}
 
     def _recall_stage2_candidate_limits(

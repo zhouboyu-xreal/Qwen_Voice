@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--db-name", default="memory.db")
+    parser.add_argument(
+        "--segment-limit",
+        type=int,
+        default=0,
+        help="Maximum number of time-ordered TextGrid segments to process; 0 means all.",
+    )
     parser.add_argument("--session-start", default="", help="ISO timestamp used as audio time zero.")
     parser.add_argument("--max-pending-memory-input-units", type=int, default=0)
     parser.add_argument("--max-pending-memory-input-tokens", type=int, default=0)
@@ -129,10 +135,21 @@ def main() -> None:
     segments = load_textgrid_segments(textgrid_path)
     if not segments:
         raise RuntimeError(f"No non-empty intervals found in TextGrid: {textgrid_path}")
+    if args.segment_limit < 0:
+        raise ValueError("--segment-limit must be greater than or equal to 0")
+    source_segment_count = len(segments)
+    if args.segment_limit > 0:
+        segments = segments[:args.segment_limit]
 
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(output_dir / "run.log", args.log_level)
+    logging.info(
+        "Selected TextGrid segments=%s source_segments=%s segment_limit=%s",
+        len(segments),
+        source_segment_count,
+        args.segment_limit,
+    )
     memory_log_path = output_dir / "memory_manager.log"
     memory_logger, memory_log_handler = configure_memory_logger(
         memory_log_path,
@@ -197,7 +214,7 @@ def main() -> None:
     ) and not runtime.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
-    store_operation_report = operation_reporter.operation_report("memory_store")
+    store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
     entity_claim_result = (
         operation_reporter.latest_report("memory_entity_claim_update")
         or entity_claim_submit
@@ -220,7 +237,9 @@ def main() -> None:
         "db_path": str(db_path),
         "transcript_path": str(transcript_path),
         "memory_log_path": str(memory_log_path),
+        "source_segment_count": source_segment_count,
         "segment_count": len(memory_segments),
+        "segment_limit": args.segment_limit,
         "queued_memory_store_count": queued_memory_store_count,
         "stored_memory_store_count": store_operation_report["succeeded"],
         "store_operation_report": store_operation_report,

@@ -4,7 +4,7 @@
 This script implements the Online Semantic Segmentation method described in
 LycheeMemory V2. It reads CLongEval JSONL records, parses dated user/assistant
 conversation pairs, embeds each exchange, and decides semantic segment
-boundaries with surprise, cohesion-drop, length-pressure, and turn-count
+boundaries with surprise, cohesion-drop, and length-pressure
 signals. It is intentionally standalone and does not modify the existing
 CLongEval memory runner.
 """
@@ -116,11 +116,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--absolute-surprise-weight", type=float)
     parser.add_argument("--cohesion-drop-weight", type=float)
     parser.add_argument("--length-weight", type=float)
-    parser.add_argument("--turn-count-weight", type=float)
-    parser.add_argument("--max-pending-turns", type=int)
+    parser.add_argument("--max-pending-units", type=int)
     parser.add_argument("--max-pending-tokens", type=int)
     parser.add_argument("--min-pending-tokens", type=int)
-    parser.add_argument("--min-pending-turns", type=int)
+    parser.add_argument("--min-pending-units", type=int)
     parser.add_argument("--min-segment-override-probability", type=float)
     parser.add_argument("--max-time-gap-seconds", type=float)
     parser.add_argument(
@@ -340,11 +339,10 @@ def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerCo
         "absolute_surprise_weight": args.absolute_surprise_weight,
         "cohesion_drop_weight": args.cohesion_drop_weight,
         "length_weight": args.length_weight,
-        "turn_count_weight": args.turn_count_weight,
-        "max_pending_units": args.max_pending_turns,
+        "max_pending_units": args.max_pending_units,
         "max_pending_tokens": args.max_pending_tokens,
         "min_pending_tokens": args.min_pending_tokens,
-        "min_pending_units": args.min_pending_turns,
+        "min_pending_units": args.min_pending_units,
         "min_segment_override_probability": args.min_segment_override_probability,
         "max_time_gap_seconds": args.max_time_gap_seconds,
     }
@@ -363,12 +361,10 @@ def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerCo
         absolute_surprise_weight=float(number("absolute_surprise_weight", 0.8)),
         cohesion_drop_weight=float(number("cohesion_drop_weight", 0.8)),
         length_weight=float(number("length_weight", 0.40)),
-        turn_count_weight=float(number("turn_count_weight", 0.40)),
-        max_pending_turns=max(1, int(number("max_pending_units", 40))),
+        max_pending_units=max(1, int(number("max_pending_units", 40))),
         max_pending_tokens=max(1, int(number("max_pending_tokens", 1000))),
-        max_pending_chars=max(0, int(number("max_pending_chars", 0))),
         min_pending_tokens=max(1, int(number("min_pending_tokens", 200))),
-        min_pending_turns=max(1, int(number("min_pending_units", 4))),
+        min_pending_units=max(1, int(number("min_pending_units", 4))),
         min_segment_override_probability=float(
             number("min_segment_override_probability", 0.90)
         ),

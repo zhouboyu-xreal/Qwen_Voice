@@ -661,7 +661,7 @@ def process_context_group(
         counts = db_counts(db)
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
-        store_operation_report = operation_counts.get("memory_store") or {}
+        store_operation_report = operation_counts.get("memory_fact_extraction") or {}
         entity_claim_operation_report = (
             operation_counts.get("memory_entity_claim_update") or {}
         )
