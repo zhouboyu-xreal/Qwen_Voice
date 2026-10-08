@@ -459,7 +459,7 @@ def prepare_runtime(
         "memory_context_manager",
         {},
     )
-    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
+    segmentation_config = memory_input_config.setdefault("fact_extraction_trigger", {})
     if args.max_pending_interaction_turns is not None:
         segmentation_config["max_pending_units"] = args.max_pending_interaction_turns
     if args.max_pending_interaction_tokens is not None:

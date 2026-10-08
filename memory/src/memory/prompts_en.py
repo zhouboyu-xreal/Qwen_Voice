@@ -51,7 +51,8 @@ Allowed entity type values:
 - OTHER: explicitly mentioned entities that do not fit the above types
 
 Entities that should be extracted include:
-- Conversation subjects or roles, such as user, assistant, speaker_1, speaker_2, spouse, child, team, or client
+- Conversation subjects or roles, such as user self, assistant, speaker_1, speaker_2, spouse, child, team, or client. `user self` is a reserved identity and may only refer to the interaction speaker explicitly labelled as the wearer.
+- Users in a product, market, or service domain: use a specific label such as product user, target consumer, or target customer, never bare user. These are external domain roles, not the AI-glasses wearer, and normally use CONCEPT or OTHER rather than PERSON.
 - User-relevant domains, problems, tasks, states, or scenarios, such as health management, physical condition, work, business events, family education, communication, or fatigue
 - Reusable plans, methods, tools, activities, or objects, such as healthy eating, family meetings, shared rules, picnics, or yoga mats
 - Constraint objects or conditions that affect user choices, such as financial burden, fixed schedule, time shortage, or work pressure
@@ -68,14 +69,14 @@ If a phrase contains a reusable object or scenario, extract the core object or s
 - "the financial burden is too heavy" may yield "financial burden"
 
 Entities must come from explicit conversation content or be directly determined by a role/fact subject. Do not over-infer.
-Each retained memory fact should usually include a subject entity, such as user/assistant/speaker, plus 1-4 core semantic anchors."""
+Each retained memory fact should usually include a subject entity, such as user self/assistant/speaker, plus 1-4 core semantic anchors."""
 
 
-EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains raw interaction/transcript segments from one continuous interval and high-value facts extracted from the same evidence. Generate a narrative summary of one reviewable experience.
+EPISODE_SUMMARY_PROMPT_EN = """You are the episode aggregation module for a long-term memory system. The input contains raw interaction/transcript units from one continuous interval and high-value facts extracted from the same evidence. Generate a narrative summary of one reviewable experience.
 
 Input roles:
-- `source_segments` are chronological source evidence and the sole primary basis for the episode's content, ordering, and stance.
-- `evidence_facts` are durable coverage anchors selected from those segments. Use them only to check that important information is not missed; never rewrite, concatenate, or expand them one by one.
+- `source_units` are chronological source evidence and the sole primary basis for the episode's content, ordering, and stance.
+- `evidence_facts` are durable coverage anchors selected from those units. Use them only to check that important information is not missed; never rewrite, concatenate, or expand them one by one.
 
 Conceptual boundaries:
 - A fact is an independently retrievable atomic evidence unit containing precise details.
@@ -83,13 +84,13 @@ Conceptual boundaries:
 - An episode is not a long-term state, user profile, cross-experience pattern, risk assessment, or actionable item. Never generalize one episode into a durable conclusion.
 
 Generation rules:
-1. Reconstruct the experience from source segments: context/trigger -> discussion, observation, or action -> meaningful turn or stance -> result, decision, or unresolved point. Omit any unsupported step.
+1. Reconstruct the experience from source units: context/trigger -> discussion, observation, or action -> meaningful turn or stance -> result, decision, or unresolved point. Omit any unsupported step.
 2. Abstract related expressions, but do not replay every turn or write one sentence per fact. The summary must be more coherent and contextual than the facts, not a longer fact list.
 3. Ignore wake words, greetings, courtesy closings, repetitions, empty acknowledgements, and templated assistant language. Retain only the people/objects, setting, issue, user concern, key response, decision, constraint, outcome, or open question needed to understand the experience.
-4. Cover high-value information in `evidence_facts` where it agrees with source segments. If facts conflict with, overstate, or leave ambiguity in the source, follow the source and preserve uncertainty.
+4. Cover high-value information in `evidence_facts` where it agrees with source units. If facts conflict with, overstate, or leave ambiguity in the source, follow the source and preserve uncertainty.
 5. Preserve chronology, conditions, and speaker stance. Do not turn advice into a decision, a possibility or plan into completion, an assistant view into a user belief, or invent causality, owners, deadlines, or outcomes.
 6. If the continuous interval contains several unrelated but valuable topics, connect them with a structured summary without forcing a causal link or omitting important content.
-7. summary must be one concise, self-contained experience narrative: understandable without source segments and clear about the central people/objects, progression, and conclusion/open point.
+7. summary must be one concise, self-contained experience narrative: understandable without source units and clear about the central people/objects, progression, and conclusion/open point.
 8. title is a short, concrete, distinguishable retrieval title. Prefer "object + core event/problem/decision" over broad labels.
 9. canonical_topics contains only 1-3 stable topics. Prefer `fact_root_topic` values from evidence facts; never use an action, one-off conclusion, emotion, or isolated keyword as a topic.
 10. Return JSON matching the schema exactly. No markdown, explanation, or extra fields.
@@ -101,8 +102,8 @@ Output schema:
   "canonical_topics": ["stable topic 1", "stable topic 2"]
 }
 
-Raw source segments:
-{source_segments}
+Raw source units:
+{source_units}
 
 High-value evidence facts (coverage checks only; do not concatenate):
 {evidence_facts}
@@ -118,7 +119,12 @@ Current memory structure:
 - entity_claim: a traceable entity proposition projected from facts by a separate reflection task; it is not direct evidence from the current dialogue.
 - goal / plan / work_item: future desired outcomes, explicit arrangements, and closed-loop responsibilities extracted by a separate Intent & Execution task after facts are stored. Do not output them here.
 
-Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence batch below. Episode summary and episode canonical_topics are generated by a separate module from persisted source segments with extracted facts as coverage anchors; do not output episode-level fields in this prompt.
+Your task now is to extract Hindsight-style high-quality narrative facts from the chronological dialogue/transcript evidence-unit batch below. Each unit's `Unit type` only identifies its source: `interaction` is one ordered user-and-assistant exchange, while `transcript` is ambient-recording ASR text. Episode summary and episode canonical_topics are generated by a separate module from persisted source units with extracted facts as coverage anchors; do not output episode-level fields in this prompt.
+
+Identity boundary:
+- `user self` refers only to the AI-glasses wearer, namely the interaction speaker explicitly labelled as the wearer. In Chinese output use `用户本人`. Only this tagged interaction evidence may place this identity in entities, primary_entity, or future_commitment_signals.
+- For a pure transcript or ambient speaker labels such as N_SPKxxx / speaker_x, never infer that any speaker is user self from words such as I, we, or user. Keep speakers, team members, and external objects under their actual names or speaker labels.
+- In product, market, or service discussions, user, customer, consumer, and audience are external domain roles. Prefer product user, target consumer, or target customer; never emit bare user, and never classify it as PERSON, user self, or a future-commitment owner.
 
 Preceding-context rules:
 - The preceding context below is a short tail from the already processed batch immediately before the current batch. Use it only to resolve references, ellipsis, continuity, and the starting point of the current topic.
@@ -128,7 +134,7 @@ Preceding-context rules:
 Topic and entity rules:
 - A fact's `fact_root_topic` must be grounded in the main durable issue in current evidence, while `fact_aspect_topic` keeps the concrete aspect under that root. Use a conservative, specific topic when evidence is limited.
 - Every fact must also output one `primary_entity`, the single entity that the fact mainly describes, affects, or belongs to; it must be one object, not an array.
-- `primary_entity` must come from the fact's `entities`. Do not choose an entity merely because it is mentioned, provides a recommendation, or is a location, tool, or background context. For a multi-person exchange, choose the person or entity mainly described or affected by the fact; for a fact about the user's own preference, habit, constraint, or risk, choose the user.
+- `primary_entity` must come from the fact's `entities`. Do not choose an entity merely because it is mentioned, provides a recommendation, or is a location, tool, or background context. For a multi-person exchange, choose the person or entity mainly described or affected by the fact; for a fact about the wearer's own preference, habit, constraint, or risk, choose user self only when the interaction evidence explicitly identifies that speaker.
 - Keep `entities` for all directly relevant entities so retrieval preserves participants and context; downstream entity-state matching uses only `primary_entity`, so one fact must not be assigned to multiple entities.
 
 """ + ENTITY_EXTRACTION_GUIDANCE_EN + """
@@ -178,17 +184,20 @@ entity_claim_signal rules:
 - `claim_anchor` is a short, stable grouping label that can collect facts from different episodes about one possible claim or pattern, such as "quiet travel preference" or "swimming routine". It is neither a sentence nor the final entity claim.
 - Output signals only when this fact has concrete evidence value for an entity claim or later pattern induction. Use an empty array for one-off background, temporary suggestions, assistant speculation, pleasantries, and low-value content.
 - Each signal's `entity.name` must exactly reuse one entity name from the same fact's `entities`, and its `entity.type` must match that entity's type. Do not add, rewrite, or guess an entity that is not listed by the fact; omit the signal when no such entity exists.
-- Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, evidence_basis, and confidence. evidence_basis must cite the current fact, never a prior claim.
+- Signal-to-fact grounding is mandatory: the signal's entity, proposition, and necessary qualifiers must be fully supported by the same fact's `text`. Do not borrow information omitted from this fact from another unit in the batch, another fact, or preceding context. If information merits a signal, retain it in this fact's `text`; otherwise omit the signal.
+- Return at most 3 signals per fact. Every signal must contain entity, signal_kind, claim_type_hint, claim_anchor, evidence_basis, and confidence. evidence_basis must point to concrete evidence directly locatable in the current fact's `text`, never a prior claim or raw input omitted from the fact.
 
 future_commitment_signals rules:
-- `future_commitment_signals` are structured hints that this fact is evidence about the user's future world. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
-- Output a signal only when this fact directly supports a user's future-facing goal, arrangement, responsibility, or a lifecycle change such as completion, cancellation, rescheduling, or blockage. Otherwise output an empty array.
-- `evidence_kind` must be one of goal, plan, responsibility, or lifecycle_update. `candidate_object_types` may contain only goal, plan, and work_item. A goal may be signalled only by the user's own explicit durable goal expression.
-- `user_role` must be owner, participant, or responsible: the user respectively owns the goal, participates in the arrangement, or bears the responsibility. Do not output a signal when the user is merely mentioned.
+- `future_commitment_signals` are structured hints that this fact is evidence about the wearer's future world. They are not final goals, plans, or work items, and must not directly create, update, or override an existing object.
+- Record only user self's future-facing information: `subject_entity` must always be exactly `user self` (use `用户本人` in Chinese output). Never use another person, team, organization, product user, or ambient-recording speaker as the subject.
+- Output a signal only when this fact directly supports user self's future-facing goal, arrangement, responsibility, or a lifecycle change such as completion, cancellation, rescheduling, or blockage. Otherwise output an empty array. Pure transcripts, ambient recordings, or evidence that does not explicitly identify user self must always output an empty array.
+- `evidence_kind` must be one of goal, plan, responsibility, or lifecycle_update. `candidate_object_types` may contain only goal, plan, and work_item. A goal may be signalled only by user self's own explicit durable goal expression.
+- `user_role` must be owner, participant, or responsible: user self respectively owns the goal, participates in the arrangement, or bears the responsibility. Do not output a signal for a product user, customer, consumer, or an ambient speaker merely mentioned in the evidence.
 - `assertion_source` must be self_statement, third_party_report, or observed_event; `explicitness` must be direct, reported, or tentative. Assistant suggestions or restatements, open hypotheticals, conditional discussion, and speculation never create signals.
 - `future_commitment_anchor` is a short, stable grouping label for the goal, event, or responsibility, such as "Tianjin client meeting", "half-marathon training goal", or "client report delivery". It is not a full sentence or the final object description.
 - `operation_hint` must be create, confirm, update, complete, cancel, reschedule, or block. Use a non-create value only when the fact directly states that lifecycle change.
-- Return at most 2 signals per fact. Every signal must include subject_entity, evidence_kind, candidate_object_types, operation_hint, user_role, future_commitment_anchor, assertion_source, explicitness, evidence_basis, and confidence. evidence_basis must be concrete evidence in this fact.
+- Signal-to-fact grounding is mandatory: the future goal, arrangement, responsibility, or lifecycle change itself must be explicitly retained in the same fact's `text`. Do not attach information found elsewhere in the raw unit batch to a fact that does not preserve it; output an empty array when the fact text cannot independently support the signal.
+- Return at most 2 signals per fact. Every signal must include subject_entity, evidence_kind, candidate_object_types, operation_hint, user_role, future_commitment_anchor, assertion_source, explicitness, evidence_basis, and confidence. evidence_basis must be concrete evidence directly locatable in this fact's `text`, not raw input omitted from the fact.
 
 Output schema:
 {
@@ -217,7 +226,7 @@ Output schema:
       ],
       "future_commitment_signals": [
         {
-          "subject_entity": "the entity whose future is involved; use the world owner for the user",
+          "subject_entity": "always `user self`; use `用户本人` in Chinese output",
           "evidence_kind": "goal|plan|responsibility|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
           "operation_hint": "create|confirm|update|complete|cancel|reschedule|block",

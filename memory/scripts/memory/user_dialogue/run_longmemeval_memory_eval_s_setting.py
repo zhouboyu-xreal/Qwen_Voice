@@ -338,8 +338,7 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
     args.memory_prompt_language = (
         args.memory_prompt_language
         or str(
-            runtime_config.get("memory_prompt_language_mode")
-            or manager_config.get("memory_prompt_language_mode")
+            manager_config.get("memory_prompt_language_mode")
             or manager_config.get("prompt_language_mode")
             or "source"
         )
@@ -662,7 +661,7 @@ def prepare_runtime_configs(
         "memory_context_manager",
         {},
     )
-    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
+    segmentation_config = memory_input_config.setdefault("fact_extraction_trigger", {})
     configured_max_pending_turns = segmentation_config.get("max_pending_units")
     if configured_max_pending_turns in (None, ""):
         configured_max_pending_turns = segmentation_config.get("max_pending_units", 1)
@@ -696,7 +695,6 @@ def prepare_runtime_configs(
     llm_config["llm_json_mode"] = bool(args.llm_json_mode)
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
-    memory_runtime_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
     memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
     memory_manager_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis

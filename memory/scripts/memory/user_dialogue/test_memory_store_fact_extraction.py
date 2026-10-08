@@ -68,7 +68,7 @@ class StoreFactExtractionManager(MemoryNodeManager):
     def _call_llm(self, prompt: str) -> str | None:
         self._test_llm_call_count += 1
         call_kind = (
-            "fact_extraction"
+            "fact_extraction_trigger"
             if "记忆提炼模块" in prompt or "memory extraction module" in prompt
             else "state_update"
             if "state 更新模块" in prompt or "state update module" in prompt
@@ -494,7 +494,7 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
     memory_input_config = _runtime_config.get("memory_context_manager")
     if not isinstance(memory_input_config, dict):
         memory_input_config = {}
-    segmentation_config = memory_input_config.get("fact_extraction")
+    segmentation_config = memory_input_config.get("fact_extraction_trigger")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
     args.llm_model = (
@@ -680,7 +680,7 @@ def main() -> int:
         "memory_context_manager",
         {},
     )
-    segmentation_config = memory_input_config.setdefault("fact_extraction", {})
+    segmentation_config = memory_input_config.setdefault("fact_extraction_trigger", {})
     segmentation_config["max_pending_units"] = args.max_pending_interaction_turns
     segmentation_config["max_pending_tokens"] = args.max_pending_interaction_tokens
     llm_config["llm_name"] = str(args.llm_model)

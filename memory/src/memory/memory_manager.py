@@ -4,7 +4,7 @@
 The public surface mirrors the current project's `MemoryNodeManager`, but the
 internal model is deliberately unified:
 
-1. Submitted source segments are organized into `memory_episodes`.
+1. Submitted source units are organized into `memory_episodes`.
 2. Extracted evidence becomes narrative `memory_facts`.
 3. Traceable explicit and inductive propositions live in entity claims.
 4. The legacy actionable-item projection is temporarily disabled while the
@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - exercised only in minimal installs
 
 from .embedding_client import EmbeddingClient
 from .memory_database import SessionDB
+from .memory_types import MemoryUnit
 from .prompts_en import (
     DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
     ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
@@ -121,7 +122,8 @@ _ATTRIBUTE_ONLY_ENTITY_PATTERNS = (
 # treated as an entity strong anchor during recall.
 _LOW_VALUE_ENTITY_ALIASES = {
     "user": {
-        "user", "the user", "用户", "我", "我自己", "me", "myself",
+        "用户", "user", "the user", "用户本人", "user self", "user_self",
+        "我", "我自己", "me", "myself",
     },
     "assistant": {
         "assistant", "the assistant", "助手", "ai", "人工智能", "bot",
@@ -134,6 +136,16 @@ _LOW_VALUE_ENTITY_ALIASES = {
         "speaker", "说话人", "unknown", "unknown_speaker",
         "speaker_1", "speaker_2",
     },
+}
+
+# ``用户本人`` / ``user self`` identify the wearer whose personal world model
+# this database represents. They are intentionally distinct from ordinary
+# mentions of product users, customers, or consumers in ambient recordings.
+_WORLD_OWNER_ENTITY_REFERENCE_ALIASES = {
+    "用户本人", "user self", "user_self",
+}
+_AMBIGUOUS_USER_ENTITY_ALIASES = {
+    "用户", "user", "the user",
 }
 
 
@@ -461,9 +473,18 @@ class MemoryNodeManager:
             self._memory_cfg.get("enable_memory_future_commitment_update", True),
             True,
         )
-        self._world_owner_entity_name = _compact_whitespace(
-            self._memory_cfg.get("world_owner_entity_name") or "用户"
-        ) or "用户"
+        configured_world_owner_name = _compact_whitespace(
+            self._memory_cfg.get("world_owner_entity_name") or ""
+        )
+        if configured_world_owner_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+            raise ValueError(
+                "memory.world_owner_entity_name must use '用户本人', "
+                "'user self', or a concrete owner name; bare '用户' / 'user' "
+                "is ambiguous with product users and consumers."
+            )
+        self._world_owner_entity_name = (
+            configured_world_owner_name or "用户本人"
+        )
         self._entity_claim_explicit_min_confidence = self._clamp_float(
             self._memory_cfg.get("entity_claim_explicit_min_confidence"),
             0.0,
@@ -824,7 +845,7 @@ class MemoryNodeManager:
             self._embedding_client = EmbeddingClient(self._embedding_cfg)
         return True
 
-    # ── Store path: raw segments -> episode -> facts -> index cards ──────
+    # ── Store path: source units -> episode -> facts -> index cards ──────
 
     @property
     def enabled(self) -> bool:
@@ -984,7 +1005,7 @@ class MemoryNodeManager:
                 payload={
                     key: value
                     for key, value in payload.items()
-                    if key != "raw_segments"
+                    if key not in {"units", "preceding_context_units"}
                 },
             )
             self._ensure_task_worker_locked()
@@ -1059,15 +1080,14 @@ class MemoryNodeManager:
     def submit_memory_fact_extraction_task(
         self,
         *,
-        raw_segments: List[Dict[str, Any]],
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
+        units: List[MemoryUnit],
+        preceding_context_units: Optional[List[MemoryUnit]] = None,
         tags: List[str],
-        prompt_language: str,
         completion_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Queue one normalized episode for ordered background storage."""
-        if not self._memory_enabled or not raw_segments:
-            reason = "memory_disabled" if not self._memory_enabled else "no_raw_segments"
+        """Queue one typed unit batch for ordered fact extraction."""
+        if not self._memory_enabled or not units:
+            reason = "memory_disabled" if not self._memory_enabled else "no_units"
             task_id = self._operation_reporter.next_task_id("memory_fact_extraction")
             return self._reject_memory_task(
                 task_kind="memory_fact_extraction",
@@ -1077,10 +1097,9 @@ class MemoryNodeManager:
         return self._submit_memory_task(
             task_kind="memory_fact_extraction",
             payload={
-                "raw_segments": raw_segments,
-                "preceding_context_segments": list(preceding_context_segments or []),
+                "units": list(units),
+                "preceding_context_units": list(preceding_context_units or []),
                 "tags": tags,
-                "prompt_language": prompt_language,
             },
             completion_context=completion_context,
         )
@@ -1089,7 +1108,6 @@ class MemoryNodeManager:
         self,
         *,
         tags: List[str],
-        prompt_language: str,
     ) -> Dict[str, Any]:
         """Queue episode summarization after preceding fact-store tasks."""
         if not self._memory_enabled:
@@ -1101,7 +1119,6 @@ class MemoryNodeManager:
             task_kind="memory_episode_summary",
             payload={
                 "tags": list(tags or []),
-                "prompt_language": prompt_language,
             },
         )
 
@@ -1109,25 +1126,23 @@ class MemoryNodeManager:
         self,
         *,
         tags: List[str],
-        prompt_language: str,
     ) -> Dict[str, Any]:
-        source_segments = self._db.get_unassigned_memory_source_segments(
+        source_units = self._db.get_unassigned_memory_source_segments(
             limit=240,
         )
-        if not source_segments:
+        if not source_units:
             return {
                 "status": "empty",
-                "reason": "no_unassigned_source_segments",
+                "reason": "no_unassigned_source_units",
                 "new_episode_count": 0,
                 "fact_count": 0,
-                "source_segment_count": 0,
+                "source_unit_count": 0,
             }
         source_started_at = _compact_whitespace(
-            source_segments[0].get("started_at") or ""
+            source_units[0].start_time
         )
         source_ended_at = _compact_whitespace(
-            source_segments[-1].get("ended_at")
-            or source_segments[-1].get("started_at")
+            source_units[-1].end_time
             or source_started_at
         )
         facts = self._db.get_unassigned_memory_facts_in_time_window(
@@ -1135,10 +1150,9 @@ class MemoryNodeManager:
             ended_at=source_ended_at,
             limit=80,
         )
-        episode_info = self.generate_episode_from_source_segments(
-            source_segments=source_segments,
+        episode_info = self._generate_episode_from_source_units(
+            source_units=source_units,
             facts=facts,
-            prompt_language=prompt_language,
         )
         if episode_info.get("status") != "ok":
             return episode_info
@@ -1155,8 +1169,8 @@ class MemoryNodeManager:
                 metadata={
                     "tags": list(tags or []),
                     "fact_count": len(facts),
-                    "source_segment_count": len(source_segments),
-                    "generated_from_source_segments": True,
+                    "source_unit_count": len(source_units),
+                    "generated_from_source_units": True,
                     "evidence_fact_ids": list(episode_info.get("fact_ids") or []),
                 },
             )
@@ -1183,18 +1197,18 @@ class MemoryNodeManager:
             attached = self._db.update_facts_episode_id(
                 fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
             )
-            attached_source_segment_rows = self._db.update_memory_source_segments_episode_id(
-                source_segment_ids=episode_info.get("source_segment_ids") or [],
+            attached_source_unit_rows = self._db.update_memory_source_segments_episode_id(
+                source_segment_ids=episode_info.get("source_unit_row_ids") or [],
                 episode_id=episode_id,
             )
         episode_info.update({
             "episode_id": episode_id,
             "fact_count": attached,
             # Source evidence is expanded from batch rows before episode
-            # generation, so expose the logical segment count rather than
+            # generation, so expose the logical unit count rather than
             # the number of physical persistence rows attached here.
-            "source_segment_count": len(source_segments),
-            "source_segment_row_count": attached_source_segment_rows,
+            "source_unit_count": len(source_units),
+            "source_unit_row_count": attached_source_unit_rows,
             "new_episode_count": 1,
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
@@ -1202,8 +1216,8 @@ class MemoryNodeManager:
         self._log_info("memory_fact_extraction", "episode_summary_generated", {
             "episode_id": episode_id,
             "fact_count": attached,
-            "source_segment_count": len(source_segments),
-            "source_segment_row_count": attached_source_segment_rows,
+            "source_unit_count": len(source_units),
+            "source_unit_row_count": attached_source_unit_rows,
             "title": episode_info.get("title") or "",
             "topic_items_created": episode_info.get("topic_items_created", 0),
             "topic_items_updated": episode_info.get("topic_items_updated", 0),
@@ -1213,44 +1227,34 @@ class MemoryNodeManager:
     def _process_memory_fact_extraction_task(
         self,
         *,
-        raw_segments: List[Dict[str, Any]],
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
+        units: List[MemoryUnit],
+        preceding_context_units: Optional[List[MemoryUnit]] = None,
         tags: List[str],
-        prompt_language: str,
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
-        preceding_segments = list(preceding_context_segments or [])
-        self._log_info("memory_fact_extraction", "start", {
-            "source_segment_count": len(raw_segments),
-            "preceding_context_segment_count": len(preceding_segments),
-            "raw_segments": self._build_memory_segments_for_prompt(
-                raw_segments,
-                prompt_language=prompt_language,
-            ),
-        })
-        if not raw_segments:
+        preceding_units = list(preceding_context_units or [])
+        if not units:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
             self._log_info("memory_fact_extraction", "finish", {
                 "status": "skipped",
-                "reason": "no_raw_segments",
+                "reason": "no_units",
                 "total_elapsed_ms": elapsed_ms,
             })
             return {
                 "status": "skipped",
-                "reason": "no_raw_segments",
+                "reason": "no_units",
                 "new_fact_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
         with self._db.transaction():
-            source_segment_ids = self._db.insert_memory_source_segments(
-                segments=raw_segments,
+            source_unit_row_ids = self._db.insert_memory_source_segments(
+                units=units,
             )
-        extracted_info = self._extract_memory_fact_from_raw_segments(
-            raw_segments,
-            preceding_context_segments=preceding_segments,
-            prompt_language=prompt_language,
+        fact_info = self._extract_memory_fact_from_units(
+            units,
+            preceding_context_units=preceding_units,
         )
-        facts = list(extracted_info.get("facts") or [])
+        facts = list(fact_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
         with self._db.transaction():
             save_fact_info = self._store_extracted_memory_facts_into_db(
@@ -1278,15 +1282,27 @@ class MemoryNodeManager:
             "future_commitment_signal_count": int(
                 save_fact_info.get("future_commitment_signal_count") or 0
             ),
-            "source_segment_ids": source_segment_ids,
-            "source_segment_count": len(raw_segments),
-            "source_segment_row_count": len(source_segment_ids),
+            "source_unit_row_ids": source_unit_row_ids,
+            "source_unit_count": len(units),
+            "source_unit_row_count": len(source_unit_row_ids),
             "topic_items_created": int(topic_report.get("created_count", 0) or 0),
             "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
             "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
         }
         self._log_info("memory_fact_extraction", "finish", report)
         return report
+
+    @staticmethod
+    def _valid_memory_units(
+        units: Sequence[MemoryUnit],
+    ) -> List[MemoryUnit]:
+        """Keep task units with usable text, without rebuilding their order."""
+        return [
+            unit
+            for unit in units or ()
+            if isinstance(unit, MemoryUnit)
+            and _compact_whitespace(unit.text)
+        ]
 
     def _upsert_memory_recall_document(
         self,
@@ -1382,7 +1398,7 @@ class MemoryNodeManager:
         started_at: str,
         ended_at: str,
     ) -> int:
-        """Project one experience-level summary without exposing raw segments."""
+        """Project one experience-level summary without exposing raw units."""
         return self._upsert_memory_recall_document(
             object_type="episode",
             object_id=episode_id,
@@ -1439,163 +1455,37 @@ class MemoryNodeManager:
                 },
             )
 
-    def _extract_memory_fact_from_raw_segments(
+    def _extract_memory_fact_from_units(
         self,
-        raw_segments: List[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         *,
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
-        prompt_language: str,
+        preceding_context_units: Optional[Sequence[MemoryUnit]] = None,
     ) -> Dict[str, Any]:
         """Extract narrative facts with the unified fact prompt."""
-        data = self._extract_memory_fact_with_llm(
-            raw_segments,
-            preceding_context_segments=preceding_context_segments,
-            prompt_language=prompt_language,
+        current_units = self._valid_memory_units(units)
+        preceding_units = self._valid_memory_units(preceding_context_units or [])
+        prompt_language = self._resolve_prompt_language_from_memory_units(
+            [*current_units, *preceding_units],
         )
-        if data and data.get("facts"):
-            return data
-        return {"facts": []}
-
-    def generate_episode_from_source_segments(
-        self,
-        *,
-        source_segments: Sequence[Dict[str, Any]],
-        facts: Sequence[Dict[str, Any]],
-        prompt_language: str = "zh",
-    ) -> Dict[str, Any]:
-        """Generate an experience-level episode from source evidence.
-
-        Facts remain compact coverage anchors, but the chronological source
-        segments are the authoritative narrative material. This prevents an
-        episode from degrading into a sentence-by-sentence fact concatenation.
-        """
-        segment_list = [
-            item for item in source_segments or []
-            if isinstance(item, dict)
-            and _compact_whitespace(item.get("text") or "")
-        ]
-        if not segment_list:
-            return {
-                "status": "empty",
-                "new_episode_count": 0,
-                "fact_count": 0,
-                "source_segment_count": 0,
-            }
-        fact_list = [
-            item for item in facts or []
-            if isinstance(item, dict)
-            and _compact_whitespace(item.get("summary") or item.get("text") or "")
-        ]
-        fact_payload = [
-            {
-                "id": item.get("id"),
-                "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
-                "fact_type": item.get("fact_type") or "",
-                "fact_root_topic": item.get("fact_root_topic") or "",
-                "fact_aspect_topic": item.get("fact_aspect_topic") or "",
-                "dialogue_time_key": item.get("dialogue_time_key") or "",
-                "event_time_key": item.get("event_time_key") or "",
-            }
-            for item in fact_list
-        ]
-        source_text = self._build_memory_segments_for_prompt(
-            segment_list,
-            prompt_language=prompt_language,
-        )
-        prompt_template = (
-            EPISODE_SUMMARY_PROMPT_EN
-            if prompt_language == "en"
-            else EPISODE_SUMMARY_PROMPT_ZH
-        )
-        prompt = (
-            prompt_template
-            .replace("{source_segments}", source_text)
-            .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
-        )
-        parsed: Dict[str, Any] = {}
-        for _ in range(2):
-            parsed = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "") or {}
-            if _compact_whitespace(parsed.get("summary") or ""):
-                break
-        summary = _compact_whitespace(parsed.get("summary") or "")
-        if not summary:
-            summary = self._fallback_generate_episode_summary_from_raw_segments(segment_list)
-        title = _compact_whitespace(parsed.get("title") or "")
-        if not title:
-            title = self._fallback_generate_episode_title_from_raw_segments(segment_list)
-        source_text_for_topics = " ".join(
-            _compact_whitespace(item.get("text") or "") for item in segment_list
-        )
-        topics = self._normalize_episode_canonical_topics(
-            parsed.get("canonical_topics"),
-            fallback_text=source_text_for_topics,
-            limit=3,
-        )
-        if not topics:
-            topics = (
-                self._normalize_unique_labels([
-                    item.get("fact_root_topic")
-                    for item in fact_payload
-                    if item.get("fact_root_topic")
-                ])[:3]
-                or self._topic_candidates(summary)[:3]
-        )
-        participants = self._parse_participants_from_raw_segments(segment_list)
-        episode_entity_ids: List[int] = []
-        for fact in fact_list:
-            for value in fact.get("entity_ids") or []:
-                try:
-                    entity_id = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if entity_id and entity_id not in episode_entity_ids:
-                    episode_entity_ids.append(entity_id)
-                if len(episode_entity_ids) >= 64:
-                    break
-            if len(episode_entity_ids) >= 64:
-                break
-        start = _compact_whitespace(segment_list[0].get("started_at") or "") or _now_text()
-        end = (
-            _compact_whitespace(segment_list[-1].get("ended_at") or "")
-            or _compact_whitespace(segment_list[-1].get("started_at") or "")
-            or start
-        )
-        return {
-            "status": "ok",
-            "new_episode_count": 0,
-            "title": title,
-            "summary": summary,
-            "canonical_topics": topics,
-            "participants": participants,
-            "entity_ids": episode_entity_ids,
-            "fact_ids": [
-                int(item["id"])
-                for item in fact_list
-                if str(item.get("id", "")).isdigit()
-            ],
-            "source_segment_ids": list(dict.fromkeys(
-                int(item["id"])
-                for item in segment_list
-                if str(item.get("id", "")).isdigit()
-            )),
-            "started_at": start,
-            "ended_at": end,
-        }
-
-    def _extract_memory_fact_with_llm(
-        self,
-        segments: List[Dict[str, Any]],
-        *,
-        preceding_context_segments: Optional[List[Dict[str, Any]]] = None,
-        prompt_language: str,
-    ) -> Optional[Dict[str, Any]]:
+        self._log_info("memory_fact_extraction", "start", {
+            "source_unit_count": len(current_units),
+            "preceding_context_unit_count": len(preceding_units),
+            "current_units": self._build_memory_units_for_prompt(
+                current_units,
+                prompt_language=prompt_language,
+            ),
+            "preceding_context_units": self._build_memory_units_for_prompt(
+                preceding_units,
+                prompt_language=prompt_language,
+            ),
+        })
         prompt_template = (
             UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
         memory_topic_item_context = (
-            self._collect_memory_topic_item_context(segments=segments)
+            self._collect_memory_topic_item_context(units=current_units)
             if prompt_language != "en"
             else {"canonical_topics": [], "aspect_topics": []}
         )
@@ -1607,15 +1497,15 @@ class MemoryNodeManager:
             )
             .replace(
                 "{dialogue_batch}",
-                self._build_memory_segments_for_prompt(
-                    segments,
+                self._build_memory_units_for_prompt(
+                    current_units,
                     prompt_language=prompt_language,
                 ),
             )
             .replace(
                 "{preceding_context}",
-                self._build_memory_segments_for_prompt(
-                    list(preceding_context_segments or []),
+                self._build_memory_units_for_prompt(
+                    preceding_units,
                     prompt_language=prompt_language,
                 ) or ("(none)" if prompt_language == "en" else "（无）"),
             )
@@ -1650,7 +1540,7 @@ class MemoryNodeManager:
                 normalization_diagnostics: Dict[str, Any] = {}
                 normalized = self._normalize_memory_fact_extraction_llm_output(
                     parsed,
-                    segments,
+                    current_units,
                     prompt_language=prompt_language,
                     diagnostics=normalization_diagnostics,
                 )
@@ -1665,7 +1555,132 @@ class MemoryNodeManager:
                     return normalized
             if attempt == 0:
                 self._logger.debug("Unified memory LLM extraction failed, retrying")
-        return None
+        return {"facts": []}
+
+    def _generate_episode_from_source_units(
+        self,
+        *,
+        source_units: Sequence[MemoryUnit],
+        facts: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Generate an experience-level episode from source evidence.
+
+        Facts remain compact coverage anchors, but the chronological source
+        units are the authoritative narrative material. This prevents an
+        episode from degrading into a sentence-by-sentence fact concatenation.
+        """
+        unit_list = self._valid_memory_units(source_units)
+        if not unit_list:
+            return {
+                "status": "empty",
+                "new_episode_count": 0,
+                "fact_count": 0,
+                "source_unit_count": 0,
+            }
+        prompt_language = self._resolve_prompt_language_from_memory_units(
+            unit_list,
+        )
+        fact_list = [
+            item for item in facts or []
+            if isinstance(item, dict)
+            and _compact_whitespace(item.get("summary") or item.get("text") or "")
+        ]
+        fact_payload = [
+            {
+                "id": item.get("id"),
+                "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
+                "fact_type": item.get("fact_type") or "",
+                "fact_root_topic": item.get("fact_root_topic") or "",
+                "fact_aspect_topic": item.get("fact_aspect_topic") or "",
+                "dialogue_time_key": item.get("dialogue_time_key") or "",
+                "event_time_key": item.get("event_time_key") or "",
+            }
+            for item in fact_list
+        ]
+        source_text = self._build_memory_units_for_prompt(
+            unit_list,
+            prompt_language=prompt_language,
+        )
+        prompt_template = (
+            EPISODE_SUMMARY_PROMPT_EN
+            if prompt_language == "en"
+            else EPISODE_SUMMARY_PROMPT_ZH
+        )
+        prompt = (
+            prompt_template
+            .replace("{source_units}", source_text)
+            .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
+        )
+        parsed: Dict[str, Any] = {}
+        for _ in range(2):
+            parsed = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "") or {}
+            if _compact_whitespace(parsed.get("summary") or ""):
+                break
+        summary = _compact_whitespace(parsed.get("summary") or "")
+        if not summary:
+            summary = self._fallback_generate_episode_summary_from_units(unit_list)
+        title = _compact_whitespace(parsed.get("title") or "")
+        if not title:
+            title = self._fallback_generate_episode_title_from_units(unit_list)
+        source_text_for_topics = " ".join(
+            _compact_whitespace(item.text) for item in unit_list
+        )
+        topics = self._normalize_episode_canonical_topics(
+            parsed.get("canonical_topics"),
+            fallback_text=source_text_for_topics,
+            limit=3,
+        )
+        if not topics:
+            topics = (
+                self._normalize_unique_labels([
+                    item.get("fact_root_topic")
+                    for item in fact_payload
+                    if item.get("fact_root_topic")
+                ])[:3]
+                or self._topic_candidates(summary)[:3]
+        )
+        participants = self._parse_participants_from_units(unit_list)
+        episode_entity_ids: List[int] = []
+        for fact in fact_list:
+            for value in fact.get("entity_ids") or []:
+                try:
+                    entity_id = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if entity_id and entity_id not in episode_entity_ids:
+                    episode_entity_ids.append(entity_id)
+                if len(episode_entity_ids) >= 64:
+                    break
+            if len(episode_entity_ids) >= 64:
+                break
+        start = _compact_whitespace(
+            unit_list[0].start_time,
+        ) or _now_text()
+        end = (
+            _compact_whitespace(unit_list[-1].end_time)
+            or start
+        )
+        return {
+            "status": "ok",
+            "new_episode_count": 0,
+            "title": title,
+            "summary": summary,
+            "canonical_topics": topics,
+            "participants": participants,
+            "entity_ids": episode_entity_ids,
+            "fact_ids": [
+                int(item["id"])
+                for item in fact_list
+                if str(item.get("id", "")).isdigit()
+            ],
+            "source_unit_row_ids": list(dict.fromkeys(
+                int(item.source_unit_row_id)
+                for item in unit_list
+                if item.source_unit_row_id is not None
+            )),
+            "started_at": start,
+            "ended_at": end,
+        }
 
     def _call_llm(self, prompt: str) -> Optional[str]:
         if (
@@ -1751,7 +1766,7 @@ class MemoryNodeManager:
     def _normalize_memory_fact_extraction_llm_output(
         self,
         data: Dict[str, Any],
-        raw_segments: List[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         *,
         prompt_language: str,
         diagnostics: Optional[Dict[str, Any]] = None,
@@ -1797,7 +1812,7 @@ class MemoryNodeManager:
             })
 
         dialogue_time_key = _to_timestamp_text(
-            raw_segments[0].get("started_at") if raw_segments else ""
+            units[0].start_time if units else ""
         ) or _now_text()
         for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
@@ -1830,22 +1845,45 @@ class MemoryNodeManager:
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
                 keywords = self._keywords(text, limit=18)
-            entity_descriptors = self._normalize_entity_descriptors(
+            allows_world_owner_reference = self._units_include_world_owner(
+                units,
+            )
+            entity_descriptors = self._normalize_fact_entity_descriptors(
                 raw_fact.get("entities"),
+                allows_world_owner_reference=allows_world_owner_reference,
             )
             entities = [item["name"] for item in entity_descriptors]
             if not entities:
-                entities = self._entities(text)
-            primary_entity = self._normalize_primary_entity(
+                entity_descriptors = self._normalize_fact_entity_descriptors(
+                    self._entities(text),
+                    allows_world_owner_reference=allows_world_owner_reference,
+                )
+                entities = [item["name"] for item in entity_descriptors]
+            primary_candidates = self._normalize_fact_entity_descriptors(
                 raw_fact.get("primary_entity"),
-                entities=entities,
+                allows_world_owner_reference=allows_world_owner_reference,
             )
-            if primary_entity:
-                primary_entity_name = primary_entity["name"]
-                if primary_entity_name not in entities:
-                    entities = [primary_entity_name, *entities]
+            if primary_candidates and not any(
+                descriptor["name"] == primary_candidates[0]["name"]
+                for descriptor in entity_descriptors
+            ):
                 self._merge_entity_descriptor(
                     entity_descriptors,
+                    primary_candidates[0],
+                )
+                entities = [item["name"] for item in entity_descriptors]
+            primary_entity = (
+                primary_candidates[0]
+                if primary_candidates
+                else (entity_descriptors[0] if entity_descriptors else None)
+            )
+            if primary_entity is not None:
+                primary_entity = next(
+                    (
+                        descriptor
+                        for descriptor in entity_descriptors
+                        if descriptor["name"] == primary_entity["name"]
+                    ),
                     primary_entity,
                 )
             primary_entity_name = _compact_whitespace(
@@ -1861,7 +1899,7 @@ class MemoryNodeManager:
                     priority=priority,
                 )
                 continue
-            if primary_entity_name in {"user", "the user", "用户"} \
+            if self._is_world_owner_entity_reference(primary_entity_name) \
                     and self._is_low_value_user_acknowledgement(text):
                 record_drop("low_value_user_acknowledgement")
                 record_candidate(
@@ -1884,6 +1922,7 @@ class MemoryNodeManager:
             future_commitment_signals = self._normalize_future_commitment_signals(
                 raw_fact.get("future_commitment_signals"),
                 fallback_entity=primary_entity,
+                allows_world_owner_reference=allows_world_owner_reference,
             )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
@@ -1906,6 +1945,7 @@ class MemoryNodeManager:
                     "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
+                    "has_world_owner_interaction": allows_world_owner_reference,
                 },
             })
             record_candidate(
@@ -2043,6 +2083,7 @@ class MemoryNodeManager:
         *,
         fallback_entity: Optional[Dict[str, str]] = None,
         limit: Optional[int] = None,
+        allows_world_owner_reference: bool = False,
     ) -> List[Dict[str, Any]]:
         """Normalize fact-level evidence for the prospective world model."""
         if not isinstance(value, list):
@@ -2115,8 +2156,12 @@ class MemoryNodeManager:
                 )
             else:
                 subject_name = _compact_whitespace(subject)
-            if subject_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            if self._is_world_owner_entity_reference(subject_name):
+                if not allows_world_owner_reference:
+                    continue
                 subject_name = self._world_owner_entity_name
+            elif subject_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+                continue
             future_commitment_anchor = _compact_whitespace(
                 raw.get("future_commitment_anchor") or raw.get("intent_anchor") or ""
             )[:240]
@@ -2149,6 +2194,57 @@ class MemoryNodeManager:
                 break
         return normalized
 
+    @staticmethod
+    def _is_world_owner_entity_reference(value: Any) -> bool:
+        return _compact_whitespace(value).lower() in {
+            alias.lower() for alias in _WORLD_OWNER_ENTITY_REFERENCE_ALIASES
+        }
+
+    @staticmethod
+    def _units_include_world_owner(units: Sequence[MemoryUnit]) -> bool:
+        """Return whether this fact task contains the tagged wearer side."""
+        return any(
+            isinstance(unit, MemoryUnit)
+            and unit.unit_type == "interaction"
+            and any(
+                _compact_whitespace(speaker) == "用户本人"
+                for speaker in unit.speakers or []
+            )
+            for unit in units or ()
+        )
+
+    def _normalize_fact_entity_descriptors(
+        self,
+        value: Any,
+        *,
+        allows_world_owner_reference: bool,
+        limit: int = 16,
+    ) -> List[Dict[str, str]]:
+        """Apply source-aware identity boundaries to extracted entities.
+
+        A bare ``用户`` is ambiguous: in ambient audio it generally denotes a
+        product user or customer, not the wearer. Only the reserved
+        ``用户本人`` / ``user self`` reference from a tagged interaction may
+        resolve to this database's world owner.
+        """
+        descriptors = self._normalize_entity_descriptors(value, limit=limit)
+        normalized: List[Dict[str, str]] = []
+        for descriptor in descriptors:
+            name = _compact_whitespace(descriptor.get("name") or "")
+            if not name or name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+                continue
+            if self._is_world_owner_entity_reference(name):
+                if not allows_world_owner_reference:
+                    continue
+                descriptor = {
+                    "name": self._world_owner_entity_name,
+                    "type": "PERSON",
+                }
+            self._merge_entity_descriptor(normalized, descriptor)
+            if len(normalized) >= limit:
+                break
+        return normalized
+
     def _build_dialogue_batch_for_prompt(
         self,
         turns: List[Dict[str, Any]],
@@ -2157,7 +2253,7 @@ class MemoryNodeManager:
     ) -> str:
         is_en = prompt_language == "en"
         time_label = "Conversation timestamp" if is_en else "对话发生时间"
-        user_label = "User" if is_en else "用户"
+        user_label = "user self" if is_en else "用户本人"
         assistant_label = "Assistant" if is_en else "助手"
         blocks: List[str] = []
         for index, turn in enumerate(turns, 1):
@@ -2172,18 +2268,19 @@ class MemoryNodeManager:
         return "\n\n".join(blocks)
 
     @staticmethod
-    def _parse_participants_from_raw_segments(raw_segments: List[Dict[str, Any]]) -> List[str]:
+    def _parse_participants_from_units(units: Sequence[MemoryUnit]) -> List[str]:
         participants: List[str] = []
         seen: set[str] = set()
-        for segment in raw_segments:
-            speaker = _compact_whitespace(segment.get("speaker") or "")
-            if not speaker:
-                continue
-            key = speaker.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            participants.append(speaker)
+        for unit in units or []:
+            for value in unit.speakers or []:
+                speaker = _compact_whitespace(value)
+                if not speaker:
+                    continue
+                key = speaker.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                participants.append(speaker)
         return participants or ["unknown_speaker"]
 
     @staticmethod
@@ -2255,29 +2352,51 @@ class MemoryNodeManager:
             )
         return descriptors
 
-    def _build_memory_segments_for_prompt(
+    def _build_memory_units_for_prompt(
         self,
-        segments: List[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         *,
         prompt_language: str,
     ) -> str:
         is_en = prompt_language == "en"
         time_label = "Time" if is_en else "时间"
+        unit_type_label = "Unit type" if is_en else "单元类型"
         speaker_label = "Speaker" if is_en else "说话人"
         text_label = "Text" if is_en else "文本"
         blocks: List[str] = []
-        for index, segment in enumerate(segments, 1):
-            started_at = segment.get("started_at") or ""
-            ended_at = segment.get("ended_at") or started_at
-            time_text = started_at if started_at == ended_at else f"{started_at} - {ended_at}"
-            blocks.append(
-                "\n".join([
-                    f"[Segment {index}]",
+        for index, unit in enumerate(units, 1):
+            entry_blocks: List[str] = []
+            for entry_index, text in enumerate(unit.texts or [], 1):
+                started_at = (
+                    unit.started_ats[entry_index - 1]
+                    if entry_index <= len(unit.started_ats)
+                    else ""
+                ) or ""
+                ended_at = (
+                    unit.ended_ats[entry_index - 1]
+                    if entry_index <= len(unit.ended_ats)
+                    else started_at
+                ) or started_at
+                time_text = (
+                    started_at
+                    if started_at == ended_at
+                    else f"{started_at} - {ended_at}"
+                )
+                speaker = (
+                    unit.speakers[entry_index - 1]
+                    if entry_index <= len(unit.speakers)
+                    else ""
+                )
+                entry_blocks.append("\n".join([
                     f"{time_label}: {time_text}",
-                    f"{speaker_label}: {segment.get('speaker') or ''}",
-                    f"{text_label}: {segment.get('text') or ''}",
-                ])
-            )
+                    f"{speaker_label}: {speaker}",
+                    f"{text_label}: {text}",
+                ]))
+            blocks.append("\n".join([
+                f"[Unit {index}]",
+                f"{unit_type_label}: {unit.unit_type or 'transcript'}",
+                *entry_blocks,
+            ]))
         return "\n\n".join(blocks)
 
     def _is_indexable_memory_topic(self, value: Any) -> bool:
@@ -2346,15 +2465,15 @@ class MemoryNodeManager:
     def _collect_memory_topic_item_context(
         self,
         *,
-        segments: Sequence[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
         canonical_limit: int = 12,
         aspect_limit: int = 12,
     ) -> Dict[str, List[str]]:
         """Return only topic names lexically related to the incoming evidence."""
         query_text = " ".join(
-            _compact_whitespace(segment.get("text") or "")
-            for segment in segments or ()
-            if isinstance(segment, dict)
+            _compact_whitespace(unit.text)
+            for unit in units or ()
+            if isinstance(unit, MemoryUnit)
         )
         query_terms = self._lexical_search_terms_for_text(
             query_text,
@@ -2555,6 +2674,18 @@ class MemoryNodeManager:
             return "zh"
         return "en" if str(fallback).lower().startswith("en") else "zh"
 
+    def _resolve_prompt_language_from_memory_units(
+        self,
+        units: Sequence[MemoryUnit],
+    ) -> str:
+        """Resolve one LLM task's prompt language from its actual source text."""
+        text = "\n".join(
+            _compact_whitespace(unit.text)
+            for unit in units
+            if isinstance(unit, MemoryUnit)
+        )
+        return self._resolve_prompt_language_from_text(text)
+
     def _episode_title(self, turns: List[Dict[str, Any]]) -> str:
         for turn in turns:
             text = turn.get("user_message") or turn.get("assistant_response") or ""
@@ -2571,22 +2702,31 @@ class MemoryNodeManager:
                 chunks.append(f"Assistant: {turn['assistant_response'][:600]}")
         return "\n".join(chunks)
 
-    def _fallback_generate_episode_title_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
-        for segment in raw_segments:
-            text = segment.get("text") or ""
+    def _fallback_generate_episode_title_from_units(self, units: Sequence[MemoryUnit]) -> str:
+        for unit in units:
+            text = unit.text or ""
             if text:
                 return _compact_whitespace(text)[:96]
         return "memory episode"
 
-    def _fallback_generate_episode_summary_from_raw_segments(self, raw_segments: List[Dict[str, Any]]) -> str:
+    def _fallback_generate_episode_summary_from_units(self, units: Sequence[MemoryUnit]) -> str:
         chunks: List[str] = []
-        for segment in raw_segments[:10]:
-            speaker = segment.get("speaker") or "speaker"
-            text = _compact_whitespace(segment.get("text") or "")
-            if not text:
-                continue
-            started_at = segment.get("started_at") or ""
-            chunks.append(f"{started_at} {speaker}: {text[:600]}")
+        for unit in list(units)[:10]:
+            for index, text in enumerate(unit.texts or []):
+                clean_text = _compact_whitespace(text)
+                if not clean_text:
+                    continue
+                speaker = (
+                    unit.speakers[index]
+                    if index < len(unit.speakers)
+                    else "speaker"
+                )
+                started_at = (
+                    unit.started_ats[index]
+                    if index < len(unit.started_ats)
+                    else ""
+                ) or ""
+                chunks.append(f"{started_at} {speaker}: {clean_text[:600]}")
         return "\n".join(chunks)
 
     def _is_low_value_assistant_closing(self, text: str) -> bool:
@@ -2918,8 +3058,13 @@ class MemoryNodeManager:
                 INTENT_EXTRACTION_PROMPT_EN
                 if language == "en" else INTENT_EXTRACTION_PROMPT_ZH
             )
+            world_owner_prompt_name = (
+                "user self"
+                if language == "en"
+                else self._world_owner_entity_name
+            )
             raw = self._call_llm(
-                prompt_template.replace("{world_owner_name}", self._world_owner_entity_name)
+                prompt_template.replace("{world_owner_name}", world_owner_prompt_name)
                 .replace("{reference_timestamp}", str(reference_timestamp))
                 .replace("{facts}", json.dumps(
                     self._future_commitment_group_fact_prompt_views(group),
@@ -3301,6 +3446,16 @@ class MemoryNodeManager:
         summary = _compact_whitespace(raw.get("summary") or "")[:480]
         if not summary or not evidence_ids:
             return None
+        allows_world_owner_reference = any(
+            isinstance(facts_by_id[fact_id].get("metadata"), dict)
+            and bool(
+                facts_by_id[fact_id]["metadata"].get(
+                    "has_world_owner_interaction"
+                )
+            )
+            for fact_id in evidence_ids
+            if isinstance(facts_by_id.get(fact_id, {}).get("metadata"), dict)
+        )
         canonical_key = self._generate_topic_name_key(raw.get("canonical_key") or summary)
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
         lifecycle_evidence = str(raw.get("lifecycle_evidence") or "none").strip().lower()
@@ -3320,14 +3475,21 @@ class MemoryNodeManager:
         }
         def entity_id(value: Any, *, fallback: int = 0) -> int:
             name = _compact_whitespace(value or "")
-            if name.lower() in {"我", "本人", "用户", "user", "the user"}:
-                return world_owner_id
+            if self._is_world_owner_entity_reference(name):
+                return world_owner_id if allows_world_owner_reference else 0
             return int(entity_ids.get(name) or fallback)
         if object_type == "goal":
-            owner_name = _compact_whitespace(raw.get("owner_entity") or self._world_owner_entity_name)
-            if owner_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            owner_name = _compact_whitespace(raw.get("owner_entity") or "")
+            if self._is_world_owner_entity_reference(owner_name):
+                if not allows_world_owner_reference:
+                    return None
                 owner_name = self._world_owner_entity_name
-            owner_id = entity_id(owner_name, fallback=world_owner_id)
+            elif not owner_name and allows_world_owner_reference:
+                owner_name = self._world_owner_entity_name
+            owner_id = entity_id(
+                owner_name,
+                fallback=(world_owner_id if allows_world_owner_reference else 0),
+            )
             desired_outcome = _compact_whitespace(raw.get("desired_outcome") or "")[:480]
             if not owner_id or not desired_outcome:
                 return None
@@ -3335,10 +3497,17 @@ class MemoryNodeManager:
                 success_criteria=_compact_whitespace(raw.get("success_criteria") or "")[:480],
                 target_at=_compact_whitespace(raw.get("target_at") or "")[:80])
         elif object_type == "plan":
-            actor_name = _compact_whitespace(raw.get("actor_entity") or self._world_owner_entity_name)
-            if actor_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            actor_name = _compact_whitespace(raw.get("actor_entity") or "")
+            if self._is_world_owner_entity_reference(actor_name):
+                if not allows_world_owner_reference:
+                    return None
                 actor_name = self._world_owner_entity_name
-            actor_id = entity_id(actor_name, fallback=world_owner_id)
+            elif not actor_name and allows_world_owner_reference:
+                actor_name = self._world_owner_entity_name
+            actor_id = entity_id(
+                actor_name,
+                fallback=(world_owner_id if allows_world_owner_reference else 0),
+            )
             event = _compact_whitespace(raw.get("event_or_activity") or "")[:320]
             if not actor_id or not event:
                 return None
@@ -3358,7 +3527,9 @@ class MemoryNodeManager:
                 participant_names=self._normalize_string_list(raw.get("participants"), limit=12))
         else:
             responsible_name = _compact_whitespace(raw.get("responsible_entity") or "")
-            if responsible_name.lower() in {"我", "本人", "用户", "user", "the user"}:
+            if self._is_world_owner_entity_reference(responsible_name):
+                if not allows_world_owner_reference:
+                    return None
                 responsible_name = self._world_owner_entity_name
             responsible_id = entity_id(responsible_name)
             action_text = _compact_whitespace(raw.get("action_text") or "")[:480]
@@ -5036,6 +5207,10 @@ class MemoryNodeManager:
         raw_signals = self._normalize_future_commitment_signals(
             fact.get("future_commitment_signals"),
             fallback_entity=fact.get("primary_entity"),
+            allows_world_owner_reference=(
+                isinstance(fact.get("metadata"), dict)
+                and bool(fact["metadata"].get("has_world_owner_interaction"))
+            ),
         )
         fact_entities_by_name = {
             str(descriptor["name"]).lower(): descriptor
@@ -6173,7 +6348,6 @@ class MemoryNodeManager:
         query: str,
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
-        prompt_language: str = "zh",
     ) -> Dict[str, Any]:
         """Run recall immediately against the latest committed memory snapshot."""
         # Recall is read-only and must not wait for the store/entity-claim worker's
@@ -6185,7 +6359,6 @@ class MemoryNodeManager:
                 tags=tags,
                 time_end=time_end,
                 recall_mode=self._recall_mode,
-                prompt_language=prompt_language,
                 database=reader_db,
             )
 
@@ -6195,11 +6368,11 @@ class MemoryNodeManager:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
         recall_mode: str = "normal",
-        prompt_language: str = "zh",
         database: Optional[SessionDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_mode = str(recall_mode or "normal").strip().lower()
         started_at = time.monotonic()
+        prompt_language = self._resolve_prompt_language_from_text(query)
         if not self._memory_enabled or not str(query or "").strip():
             recall_report = {
                 "memory_context": "",
@@ -9459,8 +9632,8 @@ class MemoryNodeManager:
     def _recall_entity_lookup_aliases(query: Any) -> List[str]:
         """Return canonical role entities implied by first/second-person text.
 
-        Memory entities use stable role names (``用户``/``助手`` or
-        ``user``/``assistant``), while recall questions naturally use
+        Memory entities use stable role names (``用户本人``/``助手`` or
+        ``user self``/``assistant``), while recall questions naturally use
         pronouns such as ``我`` and ``你``. These aliases are only used to
         query the entity-node index; the original query remains unchanged for
         time parsing, lexical search, scoring, and LLM analysis.
@@ -9475,7 +9648,7 @@ class MemoryNodeManager:
         if re.search(r"我(?!们)", text) or re.search(
             r"\b(?:i|me|my|mine|myself)\b", text, re.IGNORECASE
         ):
-            aliases.append("用户" if is_chinese else "user")
+            aliases.extend(["用户本人", "user self"])
         if re.search(r"你(?!们)", text) or re.search(
             r"\b(?:you|your|yours|yourself)\b", text, re.IGNORECASE
         ):
@@ -10014,29 +10187,6 @@ class MemoryNodeManager:
         if not chinese_chars and len(text.split()) > 5:
             return False
         return len(text) > 1
-
-    @classmethod
-    def _normalize_primary_entity(
-        cls,
-        value: Any,
-        *,
-        entities: Sequence[str],
-    ) -> Optional[Dict[str, str]]:
-        """Normalize the single entity used for entity-state assignment."""
-        name = ""
-        entity_type = "CONCEPT"
-        if isinstance(value, dict):
-            name = _compact_whitespace(value.get("name") or value.get("text") or "")
-            entity_type = _compact_whitespace(value.get("type") or "CONCEPT").upper()
-        else:
-            name = _compact_whitespace(value)
-        if not name:
-            if entities:
-                name = _compact_whitespace(entities[0])
-        if not name:
-            return None
-        entity_type = cls._normalize_entity_type(entity_type)
-        return {"name": name, "type": entity_type}
 
     def _recall_stage2_candidate_limits(
         self,

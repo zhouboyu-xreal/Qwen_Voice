@@ -32,6 +32,7 @@ for import_root in (SRC_ROOT, REPO_ROOT):
 
 from memory.config import split_memory_config
 from memory.embedding_client import EmbeddingClient
+from memory.memory_context_manager import build_memory_context_manager_config
 from memory.memory_runtime import (
     OnlineSegmentExchange,
     MemoryContextMangerConfig,
@@ -326,7 +327,7 @@ def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerCo
     memory_input_config = runtime_config.get("memory_context_manager")
     if not isinstance(memory_input_config, dict):
         memory_input_config = {}
-    segmentation_config = memory_input_config.get("fact_extraction")
+    segmentation_config = memory_input_config.get("fact_extraction_trigger")
     if not isinstance(segmentation_config, dict):
         segmentation_config = {}
     values = dict(segmentation_config)
@@ -348,39 +349,12 @@ def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerCo
     }
     values.update({key: value for key, value in overrides.items() if value is not None})
 
-    def number(key: str, default: Any) -> Any:
-        value = values.get(key)
-        return default if value in (None, "") else value
-
-    return MemoryContextMangerConfig(
-        threshold=float(number("threshold", 0.60)),
-        bias=float(number("bias", -1.10)),
-        surprise_history_window=max(1, int(number("surprise_history_window", 64))),
-        min_surprise_history=max(0, int(number("min_surprise_history", 5))),
-        robust_surprise_weight=float(number("robust_surprise_weight", 0.8)),
-        absolute_surprise_weight=float(number("absolute_surprise_weight", 0.8)),
-        cohesion_drop_weight=float(number("cohesion_drop_weight", 0.8)),
-        length_weight=float(number("length_weight", 0.40)),
-        max_pending_units=max(1, int(number("max_pending_units", 40))),
-        max_pending_tokens=max(1, int(number("max_pending_tokens", 1000))),
-        min_pending_tokens=max(1, int(number("min_pending_tokens", 200))),
-        min_pending_units=max(1, int(number("min_pending_units", 4))),
-        min_segment_override_probability=float(
-            number("min_segment_override_probability", 0.90)
-        ),
-        max_time_gap_seconds=float(number("max_time_gap_seconds", -1.0)),
-        enforce_min_pending_tokens=bool(
-            values.get("enforce_min_pending_tokens", True)
-        ),
-        rolling_window_enabled=bool(values.get("rolling_window_enabled", False)),
-        rolling_window_tail_units=max(
-            0,
-            int(number("rolling_window_tail_units", 0)),
-        ),
-        min_boundary_scoring_incoming_tokens=max(
-            0,
-            int(number("min_boundary_scoring_incoming_tokens", 0)),
-        ),
+    return build_memory_context_manager_config(
+        {
+            "memory_context_manager": {
+                "fact_extraction_trigger": values,
+            },
+        },
     )
 
 

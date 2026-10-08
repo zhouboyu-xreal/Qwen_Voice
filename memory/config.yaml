@@ -141,7 +141,6 @@ memory_mcp_server:
   queue_timeout: 30.0
 
 memory_runtime:
-  memory_prompt_language_mode: zh
   memory_output_language_mode: zh
   transcript_unit_aggregation:
     segment_merge_max_gap_seconds: 1.0
@@ -151,7 +150,7 @@ memory_runtime:
     short_fragment_max_tokens: 8
 
   memory_context_manager:
-    fact_extraction:
+    fact_extraction_trigger:
       # Semantic boundaries close chapters. Fact extraction waits until
       # multiple closed chapters provide a sufficiently complete context.
       min_sealed_chapters: 2
@@ -181,7 +180,7 @@ memory_runtime:
       absolute_surprise_weight: 0.8
       cohesion_drop_weight: 0.8
       length_weight: 0.4
-    episode_summary:
+    episode_summary_trigger:
       max_duration_seconds: 1800.0
       max_tokens: 6000
       min_tokens_for_duration: 1000

@@ -47,14 +47,15 @@ ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 - TECHNOLOGY(技术): 技术栈、框架、库、工具、API 或系统
 - CONCEPT(概念): 抽象概念、方法论、理论或可复用想法
 - TOPIC(主题): 讨论的话题领域
-- PREFERENCE(偏好): 用户的偏好、喜好、习惯或厌恶
+- PREFERENCE(偏好): 用户本人的偏好、喜好、习惯或厌恶
 - OTHER(其他): 明确提到但不适合上述类型的实体
 
 应该抽取的实体包括：
-- 对话主体或角色：用户、助手、speaker_1、speaker_2、妻子、孩子、团队、客户等
-- 用户长期相关的领域、问题、任务、状态或场景：健康管理、身体状态、工作、商务活动、应酬、家庭教育、夫妻沟通、疲劳感等
+- 对话主体或角色：用户本人、助手、speaker_1、speaker_2、妻子、孩子、团队、客户等。其中“用户本人”是保留身份名，只能用于 interaction 中明确标记为“用户本人”的说话方。
+- 产品、市场或服务语境中的使用者：应使用“产品用户”“目标消费者”“目标客户”等具体名称，不要使用裸“用户”；它们是外部领域角色，不是 AI 眼镜佩戴者本人，通常应标为 CONCEPT 或 OTHER，而不是 PERSON。
+- 用户本人长期相关的领域、问题、任务、状态或场景：健康管理、身体状态、工作、商务活动、应酬、家庭教育、夫妻沟通、疲劳感等
 - 可复用的方案、方法、工具、活动或对象：健康饮食、家庭会议、统一规则、野餐、瑜伽垫等
-- 明确影响用户选择的约束对象或条件：经济负担、固定作息、时间不足、工作压力等
+- 明确影响用户本人选择的约束对象或条件：经济负担、固定作息、时间不足、工作压力等
 
 不要抽取普通时间表达作为实体，例如：今天、昨天、上周、最近三天、2026-05-07、10:30、三个月。
 时间应作为 fact 的时间元数据处理，不进入 entity graph。
@@ -68,14 +69,14 @@ ENTITY_EXTRACTION_GUIDANCE_ZH = """实体提取规则:
 - “经济负担太重”可抽取“经济负担”
 
 实体应来自对话中明确出现或由角色/事实主体直接确定的内容，不要过度推断。
-每条长期记忆 fact 通常至少包含主体实体（如 用户/助手/speaker）和 1-4 个核心语义锚点。"""
+每条长期记忆 fact 通常至少包含主体实体（如 用户本人/助手/speaker）和 1-4 个核心语义锚点。"""
 
 
-EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块。输入是一段连续时间内的原始交互/转写片段，以及从同一片段中提炼出的高价值 facts。你的任务是生成一段可回顾经历的叙事摘要。
+EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块。输入是一段连续时间内的原始交互/转写 unit，以及从同一批 unit 中提炼出的高价值 facts。你的任务是生成一段可回顾经历的叙事摘要。
 
 输入角色：
-- `source_segments` 是按时间排列的原始证据，是 episode 内容、先后关系和语气的唯一主要依据。
-- `evidence_facts` 是从这些片段中筛出的长期价值锚点，只用于核对重要信息是否被遗漏；绝不能逐条改写、拼接或扩写它们。
+- `source_units` 是按时间排列的原始证据，是 episode 内容、先后关系和语气的唯一主要依据。
+- `evidence_facts` 是从这些 unit 中筛出的长期价值锚点，只用于核对重要信息是否被遗漏；绝不能逐条改写、拼接或扩写它们。
 
 概念边界：
 - fact 是可独立召回的原子证据，保留可精确引用的事实细节。
@@ -83,13 +84,13 @@ EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块�
 - episode 不是长期 state、用户画像、跨经历规律、风险评估或待办事项；不要将一次经历推广成长期结论。
 
 生成规则：
-1. 先从原始片段恢复这段经历的主线：背景/触发 → 讨论、观察或行动 → 关键转折/态度 → 结果、决定或未决点。没有证据的环节直接省略。
+1. 先从原始 unit 恢复这段经历的主线：背景/触发 → 讨论、观察或行动 → 关键转折/态度 → 结果、决定或未决点。没有证据的环节直接省略。
 2. 可以概括多个相关表达，但不要按说话轮次复述，也不要把每条 fact 各写一句。summary 必须比 facts 更连贯、更具上下文，而不是更长的事实清单。
 3. 忽略唤醒词、寒暄、礼貌收尾、重复确认、无信息量的短回应和助手的模板化表述。只保留理解这次经历所需的对象、场景、问题、用户关切、关键回应、决定、约束、结果或开放问题。
-4. `evidence_facts` 中的高价值信息如与原始片段一致，应尽量在合适的叙事位置覆盖；如两者存在冲突、歧义或 facts 过度概括，以原始片段为准，并保留不确定性。
+4. `evidence_facts` 中的高价值信息如与原始 unit 一致，应尽量在合适的叙事位置覆盖；如两者存在冲突、歧义或 facts 过度概括，以原始 unit 为准，并保留不确定性。
 5. 保留时间顺序、条件和立场。不能把建议写成决定、把可能/计划写成完成、把助手的观点写成用户的信念，也不能编造因果、责任人、截止时间或结果。
 6. 若同一连续区间存在多个互不相关但有价值的话题，可用一段有层次的概括串联，但不要为了单一主题删除重要内容或虚构关联。
-7. summary 必须是一段简洁、自包含的经历摘要；读者不看 source segments 也能理解核心人物/对象、发生过程和结论/未决点。
+7. summary 必须是一段简洁、自包含的经历摘要；读者不看 source units 也能理解核心人物/对象、发生过程和结论/未决点。
 8. title 是检索标题：简短、具体、可区分，优先“对象 + 核心事件/问题/决定”，不要使用泛主题标题。
 9. canonical_topics 只输出 1-3 个稳定主题。优先复用 evidence_facts 中的 `fact_root_topic`；不要将动作、一次性结论、情绪或零散关键词当作主题。
 10. 只返回符合格式的 JSON，不要 markdown、解释文字或额外字段。
@@ -101,8 +102,8 @@ EPISODE_SUMMARY_PROMPT_ZH = """你是长期记忆系统的 episode 聚合模块�
   "canonical_topics": ["稳定主题1", "稳定主题2"]
 }
 
-原始 source segments：
-{source_segments}
+原始 source units：
+{source_units}
 
 高价值 evidence facts（仅用于覆盖核对，不要逐条拼接）：
 {evidence_facts}
@@ -118,7 +119,12 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 - entity_claim：由独立 reflection 模块从 facts 中形成的、可回溯证据的实体主张；它不是当前对话的直接证据。
 - goal / plan / work_item：由独立 Intent & Execution 模块从已落库 facts 提取的未来目标、明确安排和可闭环责任事项；本 prompt 不输出这些对象。
 
-你现在需要从下面按时间顺序排列的对话/转写证据批次中提取 Hindsight 风格的高质量 narrative facts。episode summary、episode canonical_topics 将由独立模块根据持久化的原始片段及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
+你现在需要从下面按时间顺序排列的对话/转写证据 unit 批次中提取 Hindsight 风格的高质量 narrative facts。每个 unit 的 `单元类型` 仅用于说明来源：`interaction` 是一轮按顺序保留的用户与助手对话，`transcript` 是环境录音 ASR 转写。episode summary、episode canonical_topics 将由独立模块根据持久化的原始 unit 及已生成 facts 负责，不要在本 prompt 中输出 episode 级字段。
+
+身份边界：
+- “用户本人”仅指 AI 眼镜佩戴者，即 interaction 中说话人明确标为“用户本人”的一方；英文输出时使用 `user self`。只有该类 interaction 证据可以将其写入 entities、primary_entity 或 future_commitment_signals。
+- 对纯 transcript 或说话人为 N_SPKxxx / speaker_x 的环境录音，不得因为“我”“我们”“用户”等词推断任何说话人是用户本人；环境录音中的发言者、团队成员和外部对象都应按其实际名称或 speaker 标签记录。
+- 产品、市场、服务讨论中的“用户、客户、消费者、受众”指外部领域角色。优先输出“产品用户”“目标消费者”“目标客户”等具体实体；绝不输出裸“用户”，也不得将其标为 PERSON、用户本人或 future commitment 的 owner。
 
 前置上下文使用规则：
 - 下方的“前置上下文”仅来自紧邻当前批次之前的一小段已处理内容，只用于理解代词、省略、承接关系和当前话题的起点。
@@ -127,17 +133,17 @@ UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH = """你是 AI 眼镜长期记忆系统的�
 
 写入资格门槛（先判断，未通过时直接输出空 `facts`；不要为了覆盖输入而生成 fact）：
 - 默认输出 0 条 fact。只有同时满足“证据可靠”和“未来可用”时才输出；可被流畅概括不等于值得长期记忆。
-- fact 的核心内容必须由用户的语义完整、指代明确的表达，或当前批次中可验证的执行结果支撑。助手的猜测、补全、泛化介绍、安慰、追问、复述和推荐，不能单独证明用户的偏好、身份、情绪、计划、能力或事实。
+- fact 的核心内容必须由 interaction 中用户本人的语义完整、指代明确表达，或 transcript 中可识别说话人的完整表达，或当前批次中可验证的执行结果支撑。助手的猜测、补全、泛化介绍、安慰、追问、复述和推荐，不能单独证明用户本人或其他说话人的偏好、身份、情绪、计划、能力或事实。
 - “这个/那个/他/她/对/嗯/不去/这就是”等指代不明、语义不完整的短句，只有在当前批次后续的用户表达明确消歧时才能作为证据；不能根据助手的猜测或回答补全其含义。
 - 不要把“助手没有理解”“用户没有补充”“问题尚未澄清”本身写成 `open_question` 或其他 fact；除非用户明确要求后续跟进某个对象明确、仍未解决的问题。
-- 优先保留：用户明确的稳定身份、偏好、习惯、关系或约束；带具体对象及时间/地点的个人事件或计划；明确决定、承诺、长期指令；用户确认的项目结果、风险或重要问题。
-- 可以保留用户明确表达的持续兴趣、困难或目标，但只记录用户事实。助手给出的建议、教程、解释或方案，只有被用户明确接受、选择、执行或成为后续讨论的约束时才可写入。
+- 优先保留：用户本人明确的稳定身份、偏好、习惯、关系或约束；或环境录音中可归属说话人/团队的明确决定、承诺、项目结果、风险或重要问题；以及带具体对象及时间/地点的个人事件或计划。
+- 可以保留用户本人或环境录音中可识别主体明确表达的持续兴趣、困难或目标，但只记录有证据的主体事实。助手给出的建议、教程、解释或方案，只有被用户本人明确接受、选择、执行或成为后续讨论的约束时才可写入。
 - 丢弃：唤醒词和寒暄、礼貌确认、浏览或展示过程、重复确认、泛知识讲解、一次模糊提问、未被采纳的建议、纯对话修复、无后续价值的感叹，以及不能独立解释的 ASR 碎片。
 - 不要输出被丢弃内容的解释、占位 fact 或低优先级 fact；只返回通过门槛的 facts。
 
 topic 和实体使用规则：
 - fact 的 `fact_root_topic` 必须由当前证据中的主要稳定议题产生；`fact_aspect_topic` 应保留该 fact 在根主题下的具体讨论方面。没有充分依据时使用当前证据中的保守、具体 topic。
-- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。对于用户自己的偏好、习惯、约束或风险，优先将“用户”作为 primary_entity；对于助手自己的动作或建议，优先将“助手”作为 primary_entity。
+- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。只有 interaction 中“用户本人”明确表达的偏好、习惯、约束或风险，才可将“用户本人”作为 primary_entity；对于助手自己的动作或建议，优先将“助手”作为 primary_entity。
 
 memory_topic_items 使用规则：
 - `memory_topic_items` 仅是可复用的命名候选，不是当前事实证据，也不承担主题状态更新。不得根据其中的名称补全当前对话未明确支持的对象、进展、结论或关系。
@@ -191,16 +197,19 @@ entity_claim_signal 输出规则：
 - `claim_anchor` 是简短、稳定的聚合标签，用于把不同 episode 中可能描述同一主张或规律的 facts 收拢，例如“安静旅行偏好”“游泳活动习惯”。它不是完整句子，也不是最终 entity claim。
 - 只有当前 fact 对某个实体主张或未来规律归纳有实际证据价值时才输出。普通一次性背景、临时建议、助手猜测、寒暄和低价值信息输出空数组。
 - 每个 signal 的 `entity.name` 必须原样复用同一 fact 的 `entities` 中某一个实体名称，`entity.type` 也必须与该实体一致。不得为 signal 新增、改写或猜测 fact 未列出的实体；无法对应时不输出该 signal。
-- 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact 的具体证据，不要引用历史 claim。
+- 信号与 fact 必须严格一致：signal 的实体、主张及其必要限定信息必须由同一 fact 的 `text` 完整支持。不得从同一批次中的其他 unit、其他 fact 或前置上下文借用未写入该 fact 的信息；若某项信息值得输出 signal，先将其写入该 fact 的 `text`，否则不输出该 signal。
+- 每条 fact 最多输出 3 个 signal。每个 signal 必须包含 entity、signal_kind、claim_type_hint、claim_anchor、evidence_basis、confidence；其中 evidence_basis 必须引用当前 fact `text` 中可直接定位的具体证据，不要引用历史 claim 或未被该 fact 保留的原始输入。
 
 future_commitment_signals 输出规则：
 - `future_commitment_signals` 是当前 fact 对用户未来世界的证据提示，不是最终 goal、plan 或 work_item，也不能直接决定创建、更新或覆盖已有对象。
-- 仅在当前 fact 提供用户未来导向的目标、安排、责任，或这些对象的完成、取消、改期、阻塞等生命周期变化的直接证据时输出；其余情况输出空数组。
-- `evidence_kind` 只能是 `goal`、`plan`、`responsibility`、`lifecycle_update`。`candidate_object_types` 只能包含 goal、plan、work_item；goal 只允许来自用户本人明确表达的持续性目标。
-- `user_role` 只能是 owner、participant、responsible，表示用户分别是目标拥有者、安排参与者或责任承担者。用户只是被顺带提及时不得输出 signal。
+- 只记录“用户本人”的未来导向信息：`subject_entity` 必须固定填写“用户本人”（英文输出填写 `user self`），不得填写任何其他人、团队、组织、产品用户或环境录音 speaker。
+- 仅在当前 fact 提供用户本人未来导向的目标、安排、责任，或这些对象的完成、取消、改期、阻塞等生命周期变化的直接证据时输出；其余情况输出空数组。纯 transcript、环境录音或未明确标记用户本人的证据一律输出空数组。
+- `evidence_kind` 只能是 `goal`、`plan`、`responsibility`、`lifecycle_update`。`candidate_object_types` 只能包含 goal、plan、work_item；goal 只允许来自“用户本人”明确表达的持续性目标。
+- `user_role` 只能是 owner、participant、responsible，表示用户本人分别是目标拥有者、安排参与者或责任承担者。产品用户、客户、消费者或环境录音中的未知说话人只是被顺带提及时不得输出 signal。
 - `assertion_source` 只能是 self_statement、third_party_report、observed_event；`explicitness` 只能是 direct、reported、tentative。助手建议、助手复述、开放假设、条件讨论和推测不得输出 signal。
 - `future_commitment_anchor` 是简短、稳定的事件/事项/目标聚合标签，例如“天津客户会议”“半马训练目标”“客户报告交付”；它不是完整句子，也不是最终对象描述。
-- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、future_commitment_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact 中可直接定位的内容。
+- 信号与 fact 必须严格一致：future goal、安排、责任或生命周期变化本身必须明确写在同一 fact 的 `text` 中。不得因为原始 unit 批次中存在相关内容，就把它挂到未保留该内容的 fact 上；无法由该 fact `text` 独立支撑时输出空数组。
+- 每条 fact 最多输出 2 个 signal。每个 signal 必须包含 subject_entity、evidence_kind、candidate_object_types、user_role、future_commitment_anchor、assertion_source、explicitness、evidence_basis、confidence；其中 evidence_basis 必须是当前 fact `text` 中可直接定位的内容，不得引用未被该 fact 保留的原始输入。
 
 输出格式：
 {
@@ -219,7 +228,7 @@ future_commitment_signals 输出规则：
       "where": "明确出现的地点、场景、平台或项目范围；没有明确证据时保持为空字符串，不要填写‘未提及’或类似说明",
       "entity_claim_signal": [
         {
-          "entity": {"name": "必须原样取自本 fact entities 的实体名", "type": "必须与该 fact entities 中同名实体的类型一致"},
+          "entity": {"name": "必须原样取自本 fact entities 的实体名" ,"type": "必须与该 fact entities 中同名实体的类型一致"},
           "signal_kind": "explicit_assertion|pattern_observation",
           "claim_type_hint": "identity_profile|affiliation|relationship|preference|constraint|behavior_pattern",
           "claim_anchor": "用于跨 fact 聚合的具体主张或规律标签",
@@ -229,7 +238,7 @@ future_commitment_signals 输出规则：
       ],
       "future_commitment_signals": [
         {
-          "subject_entity": "与用户未来相关的主体实体；用户本人填写用户",
+          "subject_entity": "固定为‘用户本人’；英文输出固定为‘user self’",
           "evidence_kind": "goal|plan|responsibility|lifecycle_update",
           "candidate_object_types": ["goal|plan|work_item"],
           "user_role": "owner|participant|responsible",

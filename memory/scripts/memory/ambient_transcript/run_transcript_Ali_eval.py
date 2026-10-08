@@ -102,7 +102,7 @@ def main() -> None:
             "memory_runtime.memory_context_manager must be a mapping",
         )
     memory_context_manager_config = memory_input_config.setdefault(
-        "fact_extraction",
+        "fact_extraction_trigger",
         {},
     )
     if not isinstance(memory_context_manager_config, dict):
@@ -197,7 +197,7 @@ def main() -> None:
         tags=["Eval_Ali", textgrid_path.stem],
     )
     final_input_flush = dict(finalization.get("input_flush") or {})
-    episode_summary_result = dict(finalization.get("episode_summary") or {})
+    episode_summary_result = dict(finalization.get("episode_summary_trigger") or {})
     entity_claim_submit = dict(
         (finalization.get("derived_tasks") or {}).get("entity_claim") or {}
     )

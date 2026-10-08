@@ -22,6 +22,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
+from .memory_types import MemoryUnit
+
 try:
     import jieba
 except ImportError:  # pragma: no cover - exercised only in minimal installs
@@ -918,65 +920,63 @@ class SessionDB:
     def insert_memory_source_segments(
         self,
         *,
-        segments: Sequence[Dict[str, Any]],
+        units: Sequence[MemoryUnit],
     ) -> List[int]:
-        """Persist one submitted source-segment batch as one physical row.
+        """Persist one submitted source-unit batch as one physical row.
 
         The table records batch lifecycle (unassigned / attached episode),
-        while ``metadata.segments`` preserves the ordered logical segments
-        needed by episode generation.  Returning a one-item list preserves
-        the existing caller contract of ``source_segment_ids``.
+        while ``metadata.units`` preserves the ordered typed units needed by
+        episode generation. Returning a one-item list preserves the existing
+        caller contract of ``source_segment_ids``.
         """
         now = local_now_text()
-        normalized_segments: List[Dict[str, Any]] = []
-        for segment in segments or []:
-            if not isinstance(segment, dict):
+        normalized_units: List[Dict[str, Any]] = []
+        for unit in units or []:
+            if not isinstance(unit, MemoryUnit):
                 continue
-            text = str(segment.get("text") or "").strip()
-            if not text:
+            entries = unit.entries()
+            if not entries:
                 continue
-            tags = [
+            tags = list(dict.fromkeys(
                 str(tag).strip()
-                for tag in (segment.get("tags") or [])
+                for tag in unit.tags or []
                 if str(tag).strip()
-            ]
-            metadata = dict(
-                segment.get("metadata")
-                if isinstance(segment.get("metadata"), dict)
-                else {}
-            )
-            for key in ("turn_index", "segment_index"):
-                if key in segment and key not in metadata:
-                    metadata[key] = segment[key]
-            started_at = str(segment.get("started_at") or "").strip()
-            ended_at = str(
-                segment.get("ended_at") or segment.get("started_at") or ""
-            ).strip()
-            normalized_segments.append({
-                "speaker": str(segment.get("speaker") or "").strip(),
-                "text": text,
-                "started_at": started_at,
-                "ended_at": ended_at,
+            ))
+            normalized_units.append({
+                "unit_type": unit.unit_type,
+                "texts": [entry["text"] for entry in entries],
+                "speakers": [entry["speaker"] for entry in entries],
+                "started_ats": [entry["started_at"] for entry in entries],
+                "ended_ats": [entry["ended_at"] for entry in entries],
+                "token_count": max(1, int(unit.token_count or 0)),
                 "tags": tags,
-                "metadata": metadata,
             })
-        if not normalized_segments:
+        if not normalized_units:
             return []
 
         batch_tags = list(dict.fromkeys(
             tag
-            for item in normalized_segments
+            for item in normalized_units
             for tag in item["tags"]
         ))
         batch_started_at = next(
-            (item["started_at"] for item in normalized_segments if item["started_at"]),
+            (
+                started_at
+                for item in normalized_units
+                for started_at in item["started_ats"]
+                if started_at
+            ),
             "",
         )
         batch_ended_at = next(
             (
-                item["ended_at"] or item["started_at"]
-                for item in reversed(normalized_segments)
-                if item["ended_at"] or item["started_at"]
+                ended_at or started_at
+                for item in reversed(normalized_units)
+                for started_at, ended_at in zip(
+                    reversed(item["started_ats"]),
+                    reversed(item["ended_ats"]),
+                )
+                if ended_at or started_at
             ),
             batch_started_at,
         )
@@ -989,16 +989,20 @@ class SessionDB:
             """,
             (
                 "\n".join(
-                    f"{item['speaker'] or 'unknown'}: {item['text']}"
-                    for item in normalized_segments
+                    f"{speaker or 'unknown'}: {text}"
+                    for unit in normalized_units
+                    for speaker, text in zip(
+                        unit["speakers"],
+                        unit["texts"],
+                    )
                 ),
                 batch_started_at,
                 batch_ended_at,
                 _json_dumps(batch_tags),
                 _json_dumps({
-                    "storage_format": "segment_batch_v1",
-                    "segment_count": len(normalized_segments),
-                    "segments": normalized_segments,
+                    "storage_format": "unit_batch_v1",
+                    "unit_count": len(normalized_units),
+                    "units": normalized_units,
                 }),
                 now,
                 now,
@@ -1011,11 +1015,11 @@ class SessionDB:
         self,
         *,
         limit: int = 240,
-    ) -> List[Dict[str, Any]]:
-        """Return logical source evidence waiting to be summarized.
+    ) -> List[MemoryUnit]:
+        """Return typed source units waiting to be summarized.
 
-        Each row is a physical batch; ``metadata.segments`` stores the
-        ordered logical segments used for episode generation.
+        Each row is a physical batch; ``metadata.units`` stores the ordered
+        logical units used for episode generation.
         """
         rows = self._conn.execute(
             """
@@ -1027,7 +1031,7 @@ class SessionDB:
             """,
             (max(1, int(limit or 240)),),
         ).fetchall()
-        source_segments: List[Dict[str, Any]] = []
+        source_units: List[MemoryUnit] = []
         for row in rows:
             batch_row = self._row_to_dict(row)
             batch_metadata = (
@@ -1035,36 +1039,68 @@ class SessionDB:
                 if isinstance(batch_row.get("metadata"), dict)
                 else {}
             )
-            batch_segments = batch_metadata.get("segments")
-            if not isinstance(batch_segments, list):
+            batch_units = batch_metadata.get("units")
+            if not isinstance(batch_units, list):
                 continue
-            for segment_index, raw_segment in enumerate(batch_segments):
-                if not isinstance(raw_segment, dict):
+            for raw_unit in batch_units:
+                if not isinstance(raw_unit, dict):
                     continue
-                text = str(raw_segment.get("text") or "").strip()
-                if not text:
+                texts = [
+                    str(value).strip()
+                    for value in raw_unit.get("texts") or []
+                    if str(value).strip()
+                ]
+                if not texts:
                     continue
-                segment_metadata = (
-                    raw_segment.get("metadata")
-                    if isinstance(raw_segment.get("metadata"), dict)
-                    else {}
-                )
-                source_segments.append({
-                    "id": batch_row["id"],
-                    "source_segment_row_id": batch_row["id"],
-                    "speaker": str(raw_segment.get("speaker") or "").strip(),
-                    "text": text,
-                    "started_at": str(raw_segment.get("started_at") or "").strip(),
-                    "ended_at": str(
-                        raw_segment.get("ended_at")
-                        or raw_segment.get("started_at")
-                        or ""
-                    ).strip(),
-                    "tags": list(raw_segment.get("tags") or []),
-                    "metadata": dict(segment_metadata),
-                    "batch_segment_index": segment_index,
-                })
-        return source_segments
+                speakers = [
+                    str(value).strip()
+                    for value in raw_unit.get("speakers") or []
+                ]
+                started_ats = [
+                    str(value).strip()
+                    for value in raw_unit.get("started_ats") or []
+                ]
+                ended_ats = [
+                    str(value).strip()
+                    for value in raw_unit.get("ended_ats") or []
+                ]
+                if len(speakers) < len(texts):
+                    speakers.extend([""] * (len(texts) - len(speakers)))
+                if len(started_ats) < len(texts):
+                    started_ats.extend([
+                        str(batch_row.get("started_at") or "").strip()
+                    ] * (len(texts) - len(started_ats)))
+                if len(ended_ats) < len(texts):
+                    ended_ats.extend([
+                        str(
+                            batch_row.get("ended_at")
+                            or batch_row.get("started_at")
+                            or ""
+                        ).strip()
+                    ] * (len(texts) - len(ended_ats)))
+                unit_type = str(raw_unit.get("unit_type") or "").strip()
+                source_units.append(MemoryUnit(
+                    texts=texts,
+                    speakers=speakers[:len(texts)],
+                    token_count=max(
+                        1,
+                        int(raw_unit.get("token_count") or 0),
+                    ),
+                    started_ats=started_ats[:len(texts)],
+                    ended_ats=ended_ats[:len(texts)],
+                    unit_type=(
+                        unit_type
+                        if unit_type in {"transcript", "interaction"}
+                        else "transcript"
+                    ),
+                    tags=[
+                        str(tag).strip()
+                        for tag in raw_unit.get("tags") or []
+                        if str(tag).strip()
+                    ],
+                    source_unit_row_id=int(batch_row["id"]),
+                ))
+        return source_units
 
     def update_memory_source_segments_episode_id(
         self,
