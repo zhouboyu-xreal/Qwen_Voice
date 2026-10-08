@@ -441,64 +441,12 @@ class VoiceRuntime:
             return None
         from .speaker_detector import SpeakerReferenceDetector
 
-        reference_dir = self.speaker_config.get("user_reference_audio_dir")
         detector = SpeakerReferenceDetector(
+            self.speaker_config,
             sample_rate=self._sample_rate(),
             device=self.runtime_config.get("device"),
-            model_id=str(
-                self.speaker_config.get(
-                    "model_id",
-                    "iic/speech_campplus_sv_zh-cn_16k-common",
-                )
-            ),
-            similarity_threshold=float(
-                self.speaker_config.get("similarity_threshold", 0.5)
-            ),
-            reference_memory_size=max(
-                1,
-                int(self.speaker_config.get("reference_memory_size", 20)),
-            ),
-            min_new_reference_segments=max(
-                1,
-                int(self.speaker_config.get("min_new_reference_segments", 2)),
-            ),
-            min_new_reference_duration_s=max(
-                0.0,
-                float(self.speaker_config.get("min_new_reference_duration_s", 3.0)),
-            ),
-            min_reference_segment_duration_s=max(
-                0.0,
-                float(
-                    self.speaker_config.get(
-                        "min_reference_segment_duration_s",
-                        1.0,
-                    )
-                ),
-            ),
-            user_similarity_threshold=self.speaker_config.get(
-                "user_similarity_threshold"
-            ),
-            user_reference_audio_dir=(
-                Path(reference_dir).expanduser() if reference_dir else None
-            ),
-            reference_embeddings_path=(
-                Path(self.speaker_config["reference_embeddings_path"]).expanduser()
-                if self.speaker_config.get("reference_embeddings_path")
-                else None
-            ),
-            speaker_assignment_method=str(
-                self.speaker_config.get("speaker_assignment_method", "reference")
-            ),
-            embedding_batch_size=max(
-                1,
-                int(self.speaker_config.get("embedding_batch_size", 16)),
-            ),
+            logger=self.logger,
         )
-        reference_audio = self.speaker_config.get("user_reference_audio")
-        if isinstance(reference_audio, list) and reference_audio:
-            detector.load_user_reference_audios(
-                [Path(item).expanduser().resolve() for item in reference_audio]
-            )
         return detector
 
     def _detect_speech_spans(

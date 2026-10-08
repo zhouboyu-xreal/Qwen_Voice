@@ -60,15 +60,19 @@ export function resolveAmbientAudioRecordingSidecarOptions(env = process.env, {
   if (!recordingRoot) {
     throw new Error('环境录制需要显式的 recordingsDirectory 或 AGENT_MEMORY_STATE_DIR')
   }
+  const resolvedStateDirectory = stateDirectory
+    ? resolve(stateDirectory)
+    : dirname(resolve(recordingRoot))
   const configuredIpcSocket = String(env.AGENT_MEMORY_IPC_SOCKET || '').trim()
   const configuredChunkSeconds = Number(env.AGENT_MEMORY_AMBIENT_RECORDING_CHUNK_SECONDS)
   return {
     command: defaultPythonCommand(env),
     sidecarPath,
     configPath: configPath ? resolve(configPath) : BUNDLED_MEMORY_CONFIG,
+    stateDirectory: resolvedStateDirectory,
     recordingsDirectory: resolve(recordingRoot),
     agentMemoryIpcSocket: resolveAgentMemoryTranscriptIpcSocketPath({
-      stateDirectory: stateDirectory || dirname(resolve(recordingRoot)),
+      stateDirectory: resolvedStateDirectory,
       configuredPath: configuredIpcSocket,
     }),
     agentMemoryOwnerId: defaultAgentMemoryOwnerId(env),
@@ -95,6 +99,7 @@ export class AmbientAudioRecordingRuntime {
     command,
     sidecarPath,
     configPath = '',
+    stateDirectory,
     recordingsDirectory,
     agentMemoryIpcSocket,
     agentMemoryOwnerId,
@@ -106,6 +111,7 @@ export class AmbientAudioRecordingRuntime {
     this.command = command || defaultPythonCommand(env)
     this.sidecarPath = String(sidecarPath || '')
     this.configPath = String(configPath || '')
+    this.stateDirectory = String(stateDirectory || '')
     this.recordingsDirectory = String(recordingsDirectory || '')
     this.agentMemoryIpcSocket = String(agentMemoryIpcSocket || '')
     this.agentMemoryOwnerId = String(agentMemoryOwnerId || '')
@@ -127,6 +133,9 @@ export class AmbientAudioRecordingRuntime {
     if (!this.recordingsDirectory) {
       throw new Error('环境录制目录未配置')
     }
+    if (!this.stateDirectory) {
+      throw new Error('Agent Memory 状态目录未配置')
+    }
     if (!this.agentMemoryIpcSocket || !this.agentMemoryOwnerId) {
       throw new Error('Agent Memory 本地 IPC 未配置')
     }
@@ -138,6 +147,7 @@ export class AmbientAudioRecordingRuntime {
     this.lastError = ''
     this.child = spawn(this.command, [
       this.sidecarPath,
+      '--state-dir', this.stateDirectory,
       '--recordings-dir', this.recordingsDirectory,
       '--chunk-duration-seconds', String(this.chunkDurationSeconds),
       '--agent-memory-ipc-socket', this.agentMemoryIpcSocket,

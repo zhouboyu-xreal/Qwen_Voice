@@ -25,6 +25,7 @@ DEFAULT_AUDIO = (
     / "test_data/ambient_transcript/Eval_Ali/Eval_Ali_far/audio_dir/R8001_M8004_MS801.wav"
 )
 DEFAULT_RESULT_ROOT = ROOT / "tmp/nonstreaming_vad_asr"
+DEFAULT_STATE_DIR = ROOT / "tmp/qwen_audio_agent_online"
 
 
 @dataclass
@@ -35,6 +36,10 @@ class NonStreamingASREvent:
     duration: float
     frame_count: int
     speech_ratio: Optional[float]
+    speaker: str
+    speaker_id: Optional[int]
+    speaker_similarity: Optional[float]
+    speaker_assignment_reason: str
     text: str
 
 
@@ -107,6 +112,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override voice_runtime.max_duration_s for this test run.",
     )
+    parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=DEFAULT_STATE_DIR,
+        help=(
+            "Speaker-identification state directory. Its default reference-audio "
+            "directory is <state-dir>/voice-reference-recordings/."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -125,6 +139,10 @@ def main() -> None:
     _, _, voice_runtime_config = split_memory_config(
         config,
         include_voice_runtime=True,
+    )
+    _configure_speaker_reference_paths(
+        voice_runtime_config,
+        state_dir=args.state_dir,
     )
     if args.max_duration_s is not None:
         voice_runtime_config["max_duration_s"] = args.max_duration_s
@@ -205,10 +223,48 @@ def _events_from_voice_report(
                 duration=round(duration, 3),
                 frame_count=max(1, round(duration * 1000.0 / frame_ms)),
                 speech_ratio=None,
+                speaker=str(segment.get("speaker") or "unknown_speaker"),
+                speaker_id=_optional_int(metadata.get("speaker_id")),
+                speaker_similarity=_optional_float(
+                    metadata.get("speaker_similarity")
+                ),
+                speaker_assignment_reason=str(
+                    metadata.get("speaker_assignment_reason") or ""
+                ),
                 text=str(segment.get("text") or ""),
             )
         )
     return events
+
+
+def _configure_speaker_reference_paths(
+    voice_runtime_config: Dict[str, Any],
+    *,
+    state_dir: Path,
+) -> None:
+    """Inject runtime-only speaker paths without editing config.yaml.
+
+    Desktop captures reference audio under Agent Memory's state directory.  The
+    test therefore uses that same layout without a second directory setting.
+    """
+    resolved_state_dir = state_dir.expanduser().resolve()
+    speaker_config = dict(voice_runtime_config.get("speaker_identification") or {})
+    speaker_config["state_dir"] = str(resolved_state_dir)
+    voice_runtime_config["speaker_identification"] = speaker_config
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_float(value: Any) -> Optional[float]:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _resolve_path(value: Any, base_dir: Path) -> Path:
@@ -229,6 +285,9 @@ def _format_asr_event(event: NonStreamingASREvent) -> str:
         f"time={event.start:8.3f}-{event.end:8.3f}s "
         f"duration={event.duration:6.3f}s "
         f"frames={event.frame_count} speech_ratio={speech_ratio} "
+        f"speaker={event.speaker} speaker_id={event.speaker_id} "
+        f"similarity={event.speaker_similarity} "
+        f"assignment={event.speaker_assignment_reason or 'n/a'} "
         f"text={event.text}"
     )
 

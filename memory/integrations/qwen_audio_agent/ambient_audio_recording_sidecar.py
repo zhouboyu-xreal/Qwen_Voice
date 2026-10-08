@@ -519,6 +519,12 @@ def _write(payload: Dict[str, Any]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--state-dir",
+        required=True,
+        type=Path,
+        help="Agent Memory runtime state directory.",
+    )
     parser.add_argument("--config", default=REPO_ROOT / "config.yaml", type=Path)
     parser.add_argument("--recordings-dir", required=True, type=Path)
     parser.add_argument("--chunk-duration-seconds", type=float, default=600.0)
@@ -546,11 +552,18 @@ def main() -> int:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
+    state_dir = args.state_dir.expanduser().resolve()
+    state_dir.mkdir(parents=True, exist_ok=True)
     config = _load_config(args.config.expanduser().resolve())
     _runtime_config, _manager_config, voice_config = split_memory_config(
         config,
         include_voice_runtime=True,
     )
+    speaker_config = voice_config.get("speaker_identification")
+    if not isinstance(speaker_config, dict):
+        speaker_config = {}
+        voice_config["speaker_identification"] = speaker_config
+    speaker_config["state_dir"] = str(state_dir)
     service = AmbientAudioRecordingService(
         voice_config=voice_config,
         recordings_dir=args.recordings_dir,
@@ -562,7 +575,9 @@ def main() -> int:
         logger=logger,
     )
     logger.info(
-        "ambient recording sidecar started recordings_dir=%s chunk_duration_seconds=%.3f",
+        "ambient recording sidecar started state_dir=%s recordings_dir=%s "
+        "chunk_duration_seconds=%.3f",
+        state_dir,
         args.recordings_dir,
         args.chunk_duration_seconds,
     )

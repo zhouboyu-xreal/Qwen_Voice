@@ -1,18 +1,26 @@
+from math import gcd
 from pathlib import Path
 from typing import Tuple
 
-import librosa
 import numpy as np
 import soundfile as sf
+from scipy.signal import resample_poly
 
 
 def load_audio_mono(audio_path: Path, sample_rate: int) -> Tuple[np.ndarray, int]:
     audio, original_sample_rate = sf.read(str(audio_path))
+    if original_sample_rate <= 0:
+        raise ValueError(f"audio file has an invalid sample rate: {audio_path}")
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
     audio = audio.astype(np.float32)
     if original_sample_rate != sample_rate:
-        audio = librosa.resample(audio, orig_sr=original_sample_rate, target_sr=sample_rate)
+        divisor = gcd(int(original_sample_rate), int(sample_rate))
+        audio = resample_poly(
+            audio,
+            up=int(sample_rate) // divisor,
+            down=int(original_sample_rate) // divisor,
+        ).astype(np.float32, copy=False)
     peak = np.max(np.abs(audio)) if audio.size else 0.0
     if peak > 1.0:
         audio = audio / peak
@@ -25,4 +33,3 @@ def slice_audio(audio: np.ndarray, sample_rate: int, start: float, end: float) -
     if end_index <= start_index:
         return np.zeros(0, dtype=np.float32)
     return audio[start_index:end_index]
-

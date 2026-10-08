@@ -145,21 +145,13 @@ def resolve_voice_runtime_paths(
         return resolved_config
 
     resolved_speaker_config = dict(speaker_config)
-    for field in ("user_reference_audio_dir", "reference_embeddings_path"):
+    for field in ("state_dir", "reference_embeddings_path"):
         resolved_path = _resolve_configured_path(
             resolved_speaker_config.get(field),
             config_path,
         )
         if resolved_path is not None:
             resolved_speaker_config[field] = str(resolved_path)
-
-    reference_audios = resolved_speaker_config.get("user_reference_audio")
-    if isinstance(reference_audios, list):
-        resolved_speaker_config["user_reference_audio"] = [
-            str(path)
-            for value in reference_audios
-            if (path := _resolve_configured_path(value, config_path)) is not None
-        ]
 
     resolved_config["speaker_identification"] = resolved_speaker_config
     return resolved_config

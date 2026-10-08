@@ -1,13 +1,13 @@
 import sys
 import tempfile
 import json
+import logging
 import os
 import numpy as np
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-import soundfile as sf
 import torch
 from sklearn.cluster import AgglomerativeClustering
 
@@ -32,12 +32,6 @@ def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
     keep = min(left_vector.size, right_vector.size)
     return float(np.dot(left_vector[:keep], right_vector[:keep]))
 
-DEFAULT_USER_REFERENCE_AUDIO_DIR = (
-    Path(__file__).resolve().parents[2] / "assets/user_reference_audio_files"
-)
-DEFAULT_REFERENCE_EMBEDDINGS_PATH = (
-    Path(__file__).resolve().parents[2] / "tmp/mcp/speaker_reference_embeddings.npz"
-)
 SUPPORTED_REFERENCE_AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
 
 
@@ -82,32 +76,74 @@ class SpeakerAssignment:
     reason: str
 
 
-@dataclass
-class SpeakerVerificationResult:
-    is_user: bool
-    similarity: Optional[float]
-    threshold: float
-    reference_count: int
-    reason: str
-
-
 class SpeakerReferenceDetector:
     def __init__(
         self,
+        speaker_config: Dict[str, Any],
+        *,
         sample_rate: int,
         device: Optional[str],
-        model_id: str,
-        similarity_threshold: float,
-        reference_memory_size: int,
-        min_new_reference_segments: int = 2,
-        min_new_reference_duration_s: float = 3.0,
-        min_reference_segment_duration_s: float = 1.0,
-        user_similarity_threshold: Optional[float] = None,
-        user_reference_audio_dir: Optional[Path] = None,
-        reference_embeddings_path: Optional[Path] = None,
-        speaker_assignment_method: str = "reference",
-        embedding_batch_size: int = 16,
+        logger: logging.Logger,
     ) -> None:
+        self.speaker_config = dict(speaker_config or {})
+        self.logger = logger
+        self.sample_rate = max(1, int(sample_rate))
+        self.model_id = str(
+            self.speaker_config.get(
+                "model_id",
+                "iic/speech_campplus_sv_zh-cn_16k-common",
+            )
+        )
+        self.similarity_threshold = float(
+            self.speaker_config.get("similarity_threshold", 0.5)
+        )
+        self.reference_memory_size = max(
+            1,
+            int(self.speaker_config.get("reference_memory_size", 20)),
+        )
+        self.min_new_reference_segments = max(
+            1,
+            int(self.speaker_config.get("min_new_reference_segments", 2)),
+        )
+        self.min_new_reference_duration_s = max(
+            0.0,
+            float(self.speaker_config.get("min_new_reference_duration_s", 3.0)),
+        )
+        self.min_reference_segment_duration_s = max(
+            0.0,
+            float(
+                self.speaker_config.get(
+                    "min_reference_segment_duration_s",
+                    1.0,
+                )
+            ),
+        )
+        self.speaker_assignment_method = str(
+            self.speaker_config.get("speaker_assignment_method", "reference")
+        )
+        if self.speaker_assignment_method not in {"reference", "agglomerative"}:
+            raise ValueError("speaker_assignment_method must be reference or agglomerative.")
+        self.embedding_batch_size = max(
+            1,
+            int(self.speaker_config.get("embedding_batch_size", 16)),
+        )
+        configured_user_similarity_threshold = self.speaker_config.get(
+            "user_similarity_threshold"
+        )
+        self.user_similarity_threshold = (
+            self.similarity_threshold
+            if configured_user_similarity_threshold is None
+            else float(configured_user_similarity_threshold)
+        )
+        state_dir_value = self.speaker_config.get("state_dir")
+        self.state_dir = (
+            Path(state_dir_value).expanduser().resolve()
+            if state_dir_value
+            else None
+        )
+        reference_embeddings_path = self.speaker_config.get(
+            "reference_embeddings_path"
+        )
         try:
             from funasr import AutoModel
         except ImportError as exc:
@@ -116,89 +152,89 @@ class SpeakerReferenceDetector:
                 "Install dependencies with: pip install -r requirements.txt"
             ) from exc
 
-        kwargs = {"model": model_id}
+        kwargs = {"model": self.model_id}
         if device and device != "cpu":
             kwargs["device"] = device
         self.model = AutoModel(**kwargs)
-        self.model_id = model_id
-        self.sample_rate = sample_rate
-        self.similarity_threshold = similarity_threshold
-        self.reference_memory_size = max(1, reference_memory_size)
-        self.min_new_reference_segments = max(1, min_new_reference_segments)
-        self.min_new_reference_duration_s = max(0.0, min_new_reference_duration_s)
-        self.min_reference_segment_duration_s = max(
-            0.0,
-            min_reference_segment_duration_s,
-        )
-        if speaker_assignment_method not in {"reference", "agglomerative"}:
-            raise ValueError("speaker_assignment_method must be reference or agglomerative.")
-        self.speaker_assignment_method = speaker_assignment_method
-        self.embedding_batch_size = max(1, int(embedding_batch_size))
-        self.user_similarity_threshold = (
-            similarity_threshold
-            if user_similarity_threshold is None
-            else user_similarity_threshold
-        )
         self.reference_embeddings: List[SpeakerReference] = []
         self.user_reference_embeddings: List[np.ndarray] = []
         self.user_reference_audio_dir = (
-            user_reference_audio_dir.expanduser().resolve()
-            if user_reference_audio_dir is not None
-            else DEFAULT_USER_REFERENCE_AUDIO_DIR
+            self.state_dir / "voice-reference-recordings"
+            if self.state_dir is not None
+            else None
         )
         self.reference_embeddings_path = (
-            reference_embeddings_path.expanduser().resolve()
-            if reference_embeddings_path is not None
-            else DEFAULT_REFERENCE_EMBEDDINGS_PATH
+            Path(reference_embeddings_path).expanduser().resolve()
+            if reference_embeddings_path
+            else (
+                self.state_dir / "speaker_reference_embeddings.npz"
+                if self.state_dir is not None
+                else None
+            )
         )
         self.next_speaker_id = 1
         self._load_reference_embeddings()
-        self.reload_user_reference_audios()
+        self.load_user_reference_audios()
 
-    def load_user_reference_audios(self, audio_paths: List[Path]) -> None:
-        self.user_reference_embeddings = [
-            self._encode_audio(self._load_reference_audio(path))
-            for path in audio_paths
-        ]
+    def load_user_reference_audios(self) -> None:
+        """Prepare in-memory user-profile embeddings from durable recordings.
 
-    def reload_user_reference_audios(self, extra_audio_paths: Optional[List[Path]] = None) -> int:
+        Reference recordings are intentionally stored at their original device
+        sample rate.  CAMPPlus runs at ``self.sample_rate`` (normally 16 kHz),
+        so each file is decoded, mixed to mono, and resampled before batching.
+        A malformed or overly short file must not prevent the ambient ASR
+        runtime from becoming usable.
+        """
         audio_paths = self._user_reference_audio_files()
-        if extra_audio_paths:
-            audio_paths.extend(path.expanduser().resolve() for path in extra_audio_paths)
-        self.load_user_reference_audios(audio_paths)
-        return len(self.user_reference_embeddings)
+        accepted_audios: List[np.ndarray] = []
+        accepted_paths: List[Path] = []
+        skipped_count = 0
+        accepted_duration_s = 0.0
+        for path in audio_paths:
+            try:
+                audio = self._load_reference_audio(path)
+            except (OSError, RuntimeError, ValueError):
+                skipped_count += 1
+                continue
+            duration_s = len(audio) / self.sample_rate if self.sample_rate else 0.0
+            if duration_s < self.min_reference_segment_duration_s:
+                skipped_count += 1
+                continue
+            accepted_audios.append(audio)
+            accepted_paths.append(path)
+            accepted_duration_s += duration_s
 
-    def judge_user_speaker_embedding(self, audio: np.ndarray) -> SpeakerVerificationResult:
-        if not self.user_reference_embeddings:
-            return SpeakerVerificationResult(
-                is_user=True,
-                similarity=None,
-                threshold=self.user_similarity_threshold,
-                reference_count=0,
-                reason="no_user_reference",
-            )
-        audio = self._segment_audio(audio)
-        if audio.size == 0:
-            return SpeakerVerificationResult(
-                is_user=False,
-                similarity=None,
-                threshold=self.user_similarity_threshold,
-                reference_count=len(self.user_reference_embeddings),
-                reason="empty_audio",
-            )
-        embedding = self._encode_audio(audio)
-        similarities = [
-            _cosine_similarity(reference_embedding, embedding)
-            for reference_embedding in self.user_reference_embeddings
+        embeddings: List[np.ndarray] = []
+        if accepted_audios:
+            try:
+                embeddings = self._encode_audio_batch(accepted_audios)
+            except (RuntimeError, ValueError, TypeError) as exc:
+                self.logger.warning(
+                    "user reference embedding initialization failed directory=%s files=%s error=%s",
+                    self.user_reference_audio_dir,
+                    len(accepted_audios),
+                    exc,
+                )
+                skipped_count += len(accepted_paths)
+                accepted_audios = []
+                accepted_paths = []
+                accepted_duration_s = 0.0
+
+        self.user_reference_embeddings = [
+            _l2_normalize(embedding)
+            for embedding in embeddings
+            if np.asarray(embedding).size
+            and float(np.linalg.norm(np.asarray(embedding, dtype=np.float32))) > 0.0
         ]
-        best_similarity = max(similarities)
-        is_user = best_similarity >= self.user_similarity_threshold
-        return SpeakerVerificationResult(
-            is_user=is_user,
-            similarity=round(best_similarity, 4),
-            threshold=self.user_similarity_threshold,
-            reference_count=len(self.user_reference_embeddings),
-            reason="matched_user" if is_user else "rejected_non_user",
+        self.logger.info(
+            "user reference embeddings ready directory=%s discovered=%s accepted=%s "
+            "embeddings=%s duration_s=%.3f skipped=%s",
+            self.user_reference_audio_dir,
+            len(audio_paths),
+            len(accepted_audios),
+            len(self.user_reference_embeddings),
+            accepted_duration_s,
+            skipped_count,
         )
 
     def identify_batch_segments_speaker(self, audio_segments: List[np.ndarray]) -> List[SpeakerAssignment]:
@@ -211,6 +247,10 @@ class SpeakerReferenceDetector:
 
         for audio_segment in audio_segments:
             embedding = self._encode_audio(self._segment_audio(audio_segment))
+            user_assignment = self._assign_embedding_to_user_reference(embedding)
+            if user_assignment is not None:
+                all_speaker_assignments.append(user_assignment)
+                continue
             reference_eligible = self._reference_segment_is_eligible(
                 self._segment_duration_s(audio_segment)
             )
@@ -307,7 +347,7 @@ class SpeakerReferenceDetector:
             cluster_segments = [audio_segments[index] for index in cluster_indexes]
             cluster_segment_embeddings = [embeddings[index] for index in cluster_indexes]
             cluster_mean_embedding = _l2_normalize(np.mean(np.vstack(cluster_segment_embeddings), axis=0))
-            user_assignment = self._assign_cluster_to_user_reference(cluster_mean_embedding)
+            user_assignment = self._assign_embedding_to_user_reference(cluster_mean_embedding)
             if user_assignment is not None:
                 assignment = user_assignment
             else:
@@ -324,14 +364,14 @@ class SpeakerReferenceDetector:
         self._save_reference_embeddings()
         return [assignment for assignment in assignments if assignment is not None]
 
-    def _assign_cluster_to_user_reference(
+    def _assign_embedding_to_user_reference(
         self,
-        cluster_mean_embedding: np.ndarray,
+        embedding: np.ndarray,
     ) -> Optional[SpeakerAssignment]:
         if not self.user_reference_embeddings:
             return None
         similarities = [
-            _cosine_similarity(reference_embedding, cluster_mean_embedding)
+            _cosine_similarity(reference_embedding, embedding)
             for reference_embedding in self.user_reference_embeddings
         ]
         best_similarity = max(similarities)
@@ -482,6 +522,8 @@ class SpeakerReferenceDetector:
         return len(self._segment_audio(audio_segment)) / self.sample_rate
 
     def _user_reference_audio_files(self) -> List[Path]:
+        if self.user_reference_audio_dir is None:
+            return []
         self.user_reference_audio_dir.mkdir(parents=True, exist_ok=True)
         return sorted(
             path
@@ -517,7 +559,7 @@ class SpeakerReferenceDetector:
 
     def _load_reference_embeddings(self) -> None:
         path = self.reference_embeddings_path
-        if not path.is_file():
+        if path is None or not path.is_file():
             return
 
         try:
@@ -584,6 +626,8 @@ class SpeakerReferenceDetector:
             return
 
         path = self.reference_embeddings_path
+        if path is None:
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         arrays: Dict[str, np.ndarray] = {}
         speakers = []
@@ -693,12 +737,10 @@ class SpeakerReferenceDetector:
         return self._encode_audio_batch([audio])[0]
 
     def _load_reference_audio(self, path: Path) -> np.ndarray:
-        audio, sample_rate = sf.read(str(path), dtype="float32", always_2d=False)
-        if sample_rate != self.sample_rate:
-            raise ValueError(
-                f"Reference speaker audio must be {self.sample_rate} Hz, "
-                f"got {sample_rate} Hz: {path}"
-            )
-        if audio.ndim > 1:
-            audio = np.mean(audio, axis=1)
-        return np.asarray(audio, dtype=np.float32)
+        from .audio import load_audio_mono
+
+        audio, _sample_rate = load_audio_mono(path, self.sample_rate)
+        normalized = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if not normalized.size or not np.isfinite(normalized).all():
+            raise ValueError(f"reference audio is empty or invalid: {path}")
+        return normalized

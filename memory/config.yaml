@@ -46,12 +46,10 @@ voice_runtime:
     similarity_threshold: 0.5
     # Maximum number of recent high-confidence embeddings retained per speaker.
     reference_memory_size: 20
-    reference_embeddings_path: tmp/mcp/speaker_reference_embeddings.npz
     min_reference_segment_duration_s: 1.0
     min_new_reference_segments: 2
     min_new_reference_duration_s: 2.0
     user_similarity_threshold: null
-    user_reference_audio: []
     speaker_assignment_method: agglomerative
     embedding_batch_size: 16
   
