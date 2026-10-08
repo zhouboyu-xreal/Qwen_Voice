@@ -213,6 +213,7 @@ export default function App() {
   }))
   const [waitingForVoice, setWaitingForVoice] = useState(false)
   const [ambientRecordingState, setAmbientRecordingState] = useState('inactive')
+  const [voiceReferenceRecordingState, setVoiceReferenceRecordingState] = useState('inactive')
   const [messages, setMessages] = useState([])
   const [activity, setActivity] = useState(t('正在检查后台 Agent'))
   const [frontend, setFrontend] = useState({ label: 'Realtime Agent' })
@@ -853,6 +854,12 @@ export default function App() {
     onAmbientRecordingAudio: (audio, sampleRate) => {
       window.qwenAudioAgentDesktop?.appendAmbientRecordingAudio(audio, sampleRate)
     },
+    voiceReferenceRecording: (
+      desktopOrbMode && voiceReferenceRecordingState === 'recording'
+    ),
+    onVoiceReferenceRecordingAudio: (audio, sampleRate) => {
+      window.qwenAudioAgentDesktop?.appendVoiceReferenceRecordingAudio(audio, sampleRate)
+    },
   })
   gatewayCommandsRef.current = voice
   useEffect(() => {
@@ -866,6 +873,35 @@ export default function App() {
       if (next === 'recording') setActivity(t('正在录制环境音频'))
       if (next === 'error' && state?.message) setActivity(state.message)
     })
+  }, [])
+
+  useEffect(() => {
+    if (!desktopOrbMode) return undefined
+    return window.qwenAudioAgentDesktop?.onVoiceReferenceRecordingState?.(state => {
+      const next = ['recording', 'finalizing', 'error'].includes(state?.state)
+        ? state.state
+        : 'inactive'
+      setVoiceReferenceRecordingState(next)
+      if (next === 'recording') {
+        // This is a dedicated local capture. A previous voice turn must not
+        // receive the user's reference-reading audio.
+        setWaitingForVoice(false)
+        setVoiceEnabled(false)
+        gatewayCommandsRef.current?.interrupt()
+      }
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!desktopOrbMode) return undefined
+    return window.qwenAudioAgentDesktop?.onVoiceReferenceRecordingFlushRequest?.(
+      ({ recordingId } = {}) => {
+        gatewayCommandsRef.current?.flushVoiceReferenceRecordingAudio()
+        window.qwenAudioAgentDesktop?.confirmVoiceReferenceRecordingAudioFlushed(
+          recordingId,
+        )
+      },
+    )
   }, [])
   const lifecycleTransition = (
     desktopOrbMode && desktopLifecycle !== 'active'

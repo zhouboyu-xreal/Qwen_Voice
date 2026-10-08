@@ -480,6 +480,40 @@ select {
   line-height: 16px;
 }
 
+.voice-reference-recording-card {
+  margin-top: 16px;
+}
+
+.voice-reference-recording-control {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.voice-reference-recording-control b {
+  display: block;
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+}
+
+.voice-reference-recording-control p,
+.voice-reference-recording-hint {
+  margin: 2px 0 0;
+  color: var(--text-auxiliary);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+}
+
+.voice-reference-recording-hint {
+  margin: 0;
+  padding: 0 16px 12px calc(var(--label-width) + 32px);
+}
+
 .provider-attribution {
   padding: 12px 16px;
   border-top: 1px solid var(--divider);

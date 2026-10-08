@@ -255,6 +255,25 @@
                 </p>
               </div>
             </div>
+            <div class="settings-card voice-reference-recording-card">
+              <div class="setting-row">
+                <span class="setting-label">本人声音采集</span>
+                <div class="voice-reference-recording-control">
+                  <div>
+                    <b id="voice-reference-recording-status">未采集</b>
+                    <p>仅离线保存，用于后续在环境录音中识别用户本人。</p>
+                  </div>
+                  <button
+                    id="voice-reference-recording-toggle"
+                    class="link-button"
+                    type="button"
+                  >开始采集</button>
+                </div>
+              </div>
+              <p class="voice-reference-recording-hint">
+                请在安静环境中连续朗读约 30–60 秒。采集期间不会发送给实时模型、不会转写，也不会写入记忆系统。
+              </p>
+            </div>
           </section>
 
           <section

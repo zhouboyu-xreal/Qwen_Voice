@@ -70,6 +70,38 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
       listener,
     )
   },
+  startVoiceReferenceRecording: () => ipcRenderer.invoke(
+    'qwen-audio-agent:voice-reference-recording-start',
+  ),
+  appendVoiceReferenceRecordingAudio: (audio, sampleRate) => ipcRenderer.send(
+    'qwen-audio-agent:voice-reference-recording-audio',
+    { audio, sampleRate },
+  ),
+  stopVoiceReferenceRecording: () => ipcRenderer.invoke(
+    'qwen-audio-agent:voice-reference-recording-stop',
+  ),
+  onVoiceReferenceRecordingState: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const listener = (_event, state) => callback(state || {})
+    ipcRenderer.on('qwen-audio-agent:voice-reference-recording-state', listener)
+    return () => ipcRenderer.removeListener(
+      'qwen-audio-agent:voice-reference-recording-state',
+      listener,
+    )
+  },
+  onVoiceReferenceRecordingFlushRequest: callback => {
+    if (typeof callback !== 'function') return () => {}
+    const listener = (_event, payload) => callback(payload || {})
+    ipcRenderer.on('qwen-audio-agent:voice-reference-recording-flush-request', listener)
+    return () => ipcRenderer.removeListener(
+      'qwen-audio-agent:voice-reference-recording-flush-request',
+      listener,
+    )
+  },
+  confirmVoiceReferenceRecordingAudioFlushed: recordingId => ipcRenderer.send(
+    'qwen-audio-agent:voice-reference-recording-audio-flushed',
+    { recordingId },
+  ),
   lifecycleReady: () => ipcRenderer.send('qwen-audio-agent:lifecycle-ready'),
   loadLifecycle: () => ipcRenderer.invoke('qwen-audio-agent:lifecycle-load'),
   pauseWakeShortcut: () => ipcRenderer.invoke(

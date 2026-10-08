@@ -11,6 +11,7 @@ test('all desktop assets, caches, credentials and logs belong to Electron userDa
     directory,
     skinsDirectory: resolve(directory, 'skins'),
     wakeWordModelDirectory: resolve(directory, 'cache/models/wake-word'),
+    voiceReferenceVadModelDirectory: resolve(directory, 'cache/models/voice-reference-vad'),
     pathCacheFile: resolve(directory, 'cache/login-shell-path.json'),
     logDirectory: resolve(directory, 'logs'),
     credentialsPath: resolve(directory, 'gateway-credentials.json'),

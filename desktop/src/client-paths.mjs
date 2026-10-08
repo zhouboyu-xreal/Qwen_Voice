@@ -9,6 +9,7 @@ export function desktopClientPaths(userDataDirectory) {
     directory,
     skinsDirectory: resolve(directory, 'skins'),
     wakeWordModelDirectory: resolve(directory, 'cache/models/wake-word'),
+    voiceReferenceVadModelDirectory: resolve(directory, 'cache/models/voice-reference-vad'),
     pathCacheFile: resolve(directory, 'cache/login-shell-path.json'),
     logDirectory: resolve(directory, 'logs'),
     credentialsPath: resolve(directory, 'gateway-credentials.json'),

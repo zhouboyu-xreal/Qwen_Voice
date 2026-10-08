@@ -84,6 +84,12 @@ const openLogs = document.querySelector('#open-logs')
 const submit = form.querySelector('button[type="submit"]')
 const settingsTabs = [...document.querySelectorAll('[data-settings-tab]')]
 const settingsPanels = [...document.querySelectorAll('[data-settings-panel]')]
+const voiceReferenceRecordingStatus = document.querySelector(
+  '#voice-reference-recording-status',
+)
+const voiceReferenceRecordingToggle = document.querySelector(
+  '#voice-reference-recording-toggle',
+)
 
 let translate = desktopTranslator('auto', navigator.language)
 const t = (text, params) => translate(text, params)
@@ -108,10 +114,89 @@ let refreshingRuntime = false
 let updaterState = null
 let startupError = null
 let recordingWakeShortcut = false
+let voiceReferenceRecordingState = 'inactive'
+let voiceReferenceRecordingDetails = {}
+let voiceReferenceRecordingInFlight = false
 let realtimeVoiceDrafts = createRealtimeVoiceDrafts()
 const defaultWakeShortcut = 'CommandOrControl+Shift+Space'
 const defaultRealtimeBaseUrl = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime'
 const macPlatform = /Mac|iPhone|iPad/.test(navigator.platform)
+
+function formattedRecordingDuration(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds) || 0))
+  if (value < 60) return t('{seconds} 秒', { seconds: value })
+  return t('{minutes} 分 {seconds} 秒', {
+    minutes: Math.floor(value / 60),
+    seconds: value % 60,
+  })
+}
+
+function renderVoiceReferenceRecording() {
+  if (!voiceReferenceRecordingStatus || !voiceReferenceRecordingToggle) return
+  const details = voiceReferenceRecordingDetails
+  const status = {
+    starting: t('正在准备语音检测…'),
+    recording: t('正在采集…'),
+    finalizing: t('正在保存…'),
+    error: t('采集失败'),
+  }[voiceReferenceRecordingState] || (
+    details.fileName
+      ? t('已保存（{duration}）', {
+        duration: formattedRecordingDuration(details.durationSeconds),
+      })
+      : t('未采集')
+  )
+  voiceReferenceRecordingStatus.textContent = status
+  voiceReferenceRecordingToggle.textContent = voiceReferenceRecordingState === 'recording'
+    ? t('停止并保存')
+    : t('开始采集')
+  voiceReferenceRecordingToggle.disabled = voiceReferenceRecordingInFlight
+    || ['finalizing'].includes(voiceReferenceRecordingState)
+}
+
+async function toggleVoiceReferenceRecording() {
+  const desktop = window.qwenAudioAgentDesktop
+  if (!desktop || voiceReferenceRecordingInFlight) return
+  voiceReferenceRecordingInFlight = true
+  renderVoiceReferenceRecording()
+  try {
+    if (voiceReferenceRecordingState === 'recording') {
+      voiceReferenceRecordingState = 'finalizing'
+      renderVoiceReferenceRecording()
+      await desktop.stopVoiceReferenceRecording()
+    } else if (!['inactive', 'error'].includes(voiceReferenceRecordingState)) {
+      return
+    } else {
+      voiceReferenceRecordingState = 'starting'
+      renderVoiceReferenceRecording()
+      await desktop.startVoiceReferenceRecording()
+    }
+  } catch (error) {
+    voiceReferenceRecordingState = 'error'
+    voiceReferenceRecordingDetails = {
+      message: error?.message || t('本人声音采集失败'),
+    }
+    showMessage(voiceReferenceRecordingDetails.message, 'error')
+  } finally {
+    voiceReferenceRecordingInFlight = false
+    renderVoiceReferenceRecording()
+  }
+}
+
+voiceReferenceRecordingToggle?.addEventListener('click', () => {
+  void toggleVoiceReferenceRecording()
+})
+
+window.qwenAudioAgentDesktop.onVoiceReferenceRecordingState?.(state => {
+  voiceReferenceRecordingState = ['recording', 'finalizing', 'error'].includes(state?.state)
+    ? state.state
+    : 'inactive'
+  voiceReferenceRecordingDetails = state || {}
+  if (voiceReferenceRecordingState === 'error' && state?.message) {
+    showMessage(state.message, 'error')
+  }
+  renderVoiceReferenceRecording()
+})
 
 function renderRealtimeModelOptions(selectedModel) {
   const profiles = listDashScopeRealtimeModelProfiles()
@@ -1078,6 +1163,7 @@ function render() {
   wakeWordEnabled.checked = settings.wakeWordEnabled || false
   desktopLanguage.value = settings.language || 'auto'
   applyLanguage(desktopLanguage.value)
+  renderVoiceReferenceRecording()
   recordingWakeShortcut = false
   renderWakeShortcut()
   dashscopeApiKey.value = settings.dashscopeApiKey || ''

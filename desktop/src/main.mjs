@@ -103,6 +103,12 @@ import {
   ambientAudioRecordingEnabled,
   resolveAmbientAudioRecordingSidecarOptions,
 } from '../../shared/voice/ambient-audio-recording-runtime.mjs'
+import {
+  VoiceReferenceRecordingRuntime,
+} from '../../shared/voice/voice-reference-recording-runtime.mjs'
+import {
+  createVoiceReferenceVad,
+} from './voice-reference/vad-runtime.mjs'
 
 // Gateway paths belong to the Gateway; Electron's userData holds only client
 // preferences, credentials, presentation assets and local caches.
@@ -216,6 +222,9 @@ let desktopAmbientRecordingRuntime = null
 let desktopAmbientRecordingId = ''
 let desktopAmbientRecordingStopping = false
 let desktopAmbientRecordingDrainTimer = null
+let desktopVoiceReferenceRecordingRuntime = null
+let desktopVoiceReferenceRecordingId = ''
+let desktopVoiceReferenceFlushRequest = null
 
 const desktopPresence = new DesktopPresence({
   getWindow: () => mainWindow,
@@ -337,6 +346,20 @@ function publishAmbientRecordingState(state, details = {}) {
   })
 }
 
+function publishVoiceReferenceRecordingState(state, details = {}) {
+  const payload = {
+    state,
+    recordingId: details.recordingId || desktopVoiceReferenceRecordingId,
+    ...details,
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('qwen-audio-agent:voice-reference-recording-state', payload)
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('qwen-audio-agent:voice-reference-recording-state', payload)
+  }
+}
+
 function ambientRecordingDirectory(environment) {
   const memoryStateDirectory = String(
     environment.AGENT_MEMORY_STATE_DIR || '',
@@ -349,6 +372,123 @@ function ambientRecordingDirectory(environment) {
     throw new Error('无法确定 Agent Memory 的本地状态目录')
   }
   return resolve(gatewayStateDirectory, 'memory/agent-memory/ambient-recordings')
+}
+
+function voiceReferenceRecordingDirectory(environment) {
+  const memoryStateDirectory = String(
+    environment.AGENT_MEMORY_STATE_DIR || '',
+  ).trim()
+  if (memoryStateDirectory) {
+    return resolve(memoryStateDirectory, 'voice-reference-recordings')
+  }
+  const gatewayStateDirectory = String(environment.QWAUDIO_STATE_DIR || '').trim()
+  if (!gatewayStateDirectory) {
+    throw new Error('无法确定本人声音采集的本地状态目录')
+  }
+  return resolve(gatewayStateDirectory, 'memory/agent-memory/voice-reference-recordings')
+}
+
+function requestVoiceReferenceAudioFlush(recordingId, { timeoutMs = 1_500 } = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return Promise.resolve(false)
+  if (desktopVoiceReferenceFlushRequest) {
+    return desktopVoiceReferenceFlushRequest.promise
+  }
+  let resolveFlush
+  const promise = new Promise(resolveRequest => {
+    resolveFlush = resolveRequest
+  })
+  const timer = setTimeout(() => {
+    if (desktopVoiceReferenceFlushRequest?.recordingId !== recordingId) return
+    desktopVoiceReferenceFlushRequest = null
+    resolveFlush(false)
+  }, timeoutMs)
+  timer.unref?.()
+  desktopVoiceReferenceFlushRequest = {
+    recordingId,
+    promise,
+    resolve: acknowledged => {
+      clearTimeout(timer)
+      desktopVoiceReferenceFlushRequest = null
+      resolveFlush(acknowledged)
+    },
+  }
+  mainWindow.webContents.send('qwen-audio-agent:voice-reference-recording-flush-request', {
+    recordingId,
+  })
+  return promise
+}
+
+async function startDesktopVoiceReferenceRecording() {
+  if (desktopVoiceReferenceRecordingId) {
+    return {
+      state: 'recording',
+      recordingId: desktopVoiceReferenceRecordingId,
+    }
+  }
+  if (desktopAmbientRecordingId) {
+    throw new Error('请先停止环境音频录制，再采集本人声音')
+  }
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error('语音前台尚未就绪，暂时无法采集本人声音')
+  }
+  const recordingId = randomUUID()
+  let vad = null
+  try {
+    vad = await createVoiceReferenceVad({
+      modelRoot: clientPaths.voiceReferenceVadModelDirectory,
+    })
+    const runtime = new VoiceReferenceRecordingRuntime({
+      recordingsDirectory: voiceReferenceRecordingDirectory(configuredGatewayEnvironment()),
+      vad,
+    })
+    const result = runtime.startRecording({
+      recordingId,
+      startedAt: new Date().toISOString(),
+    })
+    desktopVoiceReferenceRecordingRuntime = runtime
+    desktopVoiceReferenceRecordingId = recordingId
+    vad = null // The recording runtime owns and releases the VAD from here.
+    logger.info('desktop.voice_reference_recording.started', { recordingId })
+    publishVoiceReferenceRecordingState('recording')
+    return result
+  } catch (error) {
+    vad?.close?.()
+    logger.error('desktop.voice_reference_recording.start_failed', { recordingId, error })
+    publishVoiceReferenceRecordingState('error', {
+      recordingId,
+      message: '本人声音采集启动失败，请检查桌面日志。',
+    })
+    throw error
+  }
+}
+
+async function stopDesktopVoiceReferenceRecording({ flushRenderer = true } = {}) {
+  const runtime = desktopVoiceReferenceRecordingRuntime
+  const recordingId = desktopVoiceReferenceRecordingId
+  if (!runtime || !recordingId) return { state: 'inactive' }
+  if (flushRenderer) await requestVoiceReferenceAudioFlush(recordingId)
+  publishVoiceReferenceRecordingState('finalizing')
+  try {
+    const result = runtime.stopRecording()
+    desktopVoiceReferenceRecordingRuntime = null
+    desktopVoiceReferenceRecordingId = ''
+    logger.info('desktop.voice_reference_recording.stopped', {
+      recordingId,
+      saved: result.state === 'saved',
+      durationSeconds: result.durationSeconds || 0,
+    })
+    publishVoiceReferenceRecordingState('inactive', result)
+    return result
+  } catch (error) {
+    desktopVoiceReferenceRecordingRuntime = null
+    desktopVoiceReferenceRecordingId = ''
+    logger.error('desktop.voice_reference_recording.stop_failed', { recordingId, error })
+    publishVoiceReferenceRecordingState('error', {
+      recordingId,
+      message: '本人声音采集保存失败，请检查桌面日志。',
+    })
+    throw error
+  }
 }
 
 async function ensureDesktopAmbientRecordingRuntime() {
@@ -510,6 +650,71 @@ ipcMain.handle('qwen-audio-agent:ambient-recording-stop', async event => {
     throw new Error('ambient recording request was not sent by the Desktop window')
   }
   return stopDesktopAmbientRecording()
+})
+
+ipcMain.handle('qwen-audio-agent:voice-reference-recording-start', async event => {
+  if (!settingsWindow || settingsWindow.isDestroyed() || event.sender !== settingsWindow.webContents) {
+    throw new Error('voice reference recording request was not sent by the Settings window')
+  }
+  return startDesktopVoiceReferenceRecording()
+})
+
+ipcMain.on('qwen-audio-agent:voice-reference-recording-audio', (event, payload) => {
+  if (
+    !mainWindow
+    || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+    || !desktopVoiceReferenceRecordingRuntime
+    || !desktopVoiceReferenceRecordingId
+  ) return
+  const audio = typeof payload?.audio === 'string' ? payload.audio : ''
+  const sampleRate = Number(payload?.sampleRate)
+  if (
+    !audio
+    || audio.length > 256 * 1024
+    || !Number.isInteger(sampleRate)
+    || sampleRate < 8_000
+    || sampleRate > 192_000
+  ) return
+  try {
+    desktopVoiceReferenceRecordingRuntime.appendPcm16(
+      Buffer.from(audio, 'base64'),
+      sampleRate,
+    )
+  } catch (error) {
+    const runtime = desktopVoiceReferenceRecordingRuntime
+    const recordingId = desktopVoiceReferenceRecordingId
+    desktopVoiceReferenceRecordingRuntime = null
+    desktopVoiceReferenceRecordingId = ''
+    runtime?.discardRecording()
+    logger.error('desktop.voice_reference_recording.append_failed', {
+      recordingId,
+      error,
+    })
+    publishVoiceReferenceRecordingState('error', {
+      recordingId,
+      message: '本人声音采集写入失败，请停止后重试。',
+    })
+  }
+})
+
+ipcMain.on('qwen-audio-agent:voice-reference-recording-audio-flushed', (event, payload) => {
+  if (
+    !mainWindow
+    || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+  ) return
+  const recordingId = String(payload?.recordingId || '')
+  const pending = desktopVoiceReferenceFlushRequest
+  if (!pending || pending.recordingId !== recordingId) return
+  pending.resolve(true)
+})
+
+ipcMain.handle('qwen-audio-agent:voice-reference-recording-stop', async event => {
+  if (!settingsWindow || settingsWindow.isDestroyed() || event.sender !== settingsWindow.webContents) {
+    throw new Error('voice reference recording request was not sent by the Settings window')
+  }
+  return stopDesktopVoiceReferenceRecording()
 })
 
 const MAX_GATEWAY_CRASH_RESTARTS = 3
@@ -959,6 +1164,14 @@ function createSettingsWindow() {
     if (settingsWindow === window) {
       settingsWindow = null
       if (desktopPresence.shortcutPaused) desktopPresence.resumeShortcut()
+      // A reference capture is intentionally controlled only from Settings;
+      // never leave a microphone recording running after that control surface
+      // disappears.
+      void stopDesktopVoiceReferenceRecording().catch(error => {
+        logger.warn('desktop.voice_reference_recording.stop_on_settings_close_failed', {
+          error,
+        })
+      })
     }
   })
   void window.loadFile(settingsPage)
@@ -1668,6 +1881,10 @@ if (!app.requestSingleInstanceLock()) {
       desktopAmbientRecordingRuntime = null
       desktopAmbientRecordingId = ''
       desktopAmbientRecordingStopping = false
+      const voiceReferenceRecordingRuntime = desktopVoiceReferenceRecordingRuntime
+      const voiceReferenceRecordingId = desktopVoiceReferenceRecordingId
+      desktopVoiceReferenceRecordingRuntime = null
+      desktopVoiceReferenceRecordingId = ''
       // Seal the active WAV before Electron exits.  Long offline ASR work is
       // intentionally not awaited during shutdown: the durable WAV remains
       // available for recovery instead of blocking application exit.
@@ -1676,6 +1893,15 @@ if (!app.requestSingleInstanceLock()) {
           await ambientRecordingRuntime.stopRecording(ambientRecordingId)
         } catch (error) {
           logger.warn('desktop.ambient_recording.stop_on_shutdown_failed', { error })
+        }
+      }
+      // Reference audio never requires ASR. Seal its current WAV synchronously
+      // so the user's recording remains usable even during application exit.
+      if (voiceReferenceRecordingRuntime && voiceReferenceRecordingId) {
+        try {
+          voiceReferenceRecordingRuntime.stopRecording()
+        } catch (error) {
+          logger.warn('desktop.voice_reference_recording.stop_on_shutdown_failed', { error })
         }
       }
       const preWakeContextRuntime = desktopPreWakeContextRuntime

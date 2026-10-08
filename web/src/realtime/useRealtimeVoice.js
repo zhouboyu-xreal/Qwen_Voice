@@ -210,6 +210,8 @@ export default function useRealtimeVoice({
   onWakeWordAudio,
   ambientRecording = false,
   onAmbientRecordingAudio,
+  voiceReferenceRecording = false,
+  onVoiceReferenceRecordingAudio,
 }) {
   const [clientState, dispatchClientState] = useReducer(
     reduceGatewayClientState,
@@ -234,6 +236,9 @@ export default function useRealtimeVoice({
   const ambientRecordingAudioRef = useRef(onAmbientRecordingAudio)
   const ambientRecordingRef = useRef(ambientRecording)
   const flushAmbientAudioRef = useRef(() => {})
+  const voiceReferenceRecordingAudioRef = useRef(onVoiceReferenceRecordingAudio)
+  const voiceReferenceRecordingRef = useRef(voiceReferenceRecording)
+  const flushVoiceReferenceAudioRef = useRef(() => {})
   const wakeWordEnabledRef = useRef(wakeWordEnabled)
   const wakeWordOnlyRef = useRef(wakeWordOnly)
   const socketRef = useRef(null)
@@ -275,6 +280,8 @@ export default function useRealtimeVoice({
   wakeWordAudioRef.current = onWakeWordAudio
   ambientRecordingAudioRef.current = onAmbientRecordingAudio
   ambientRecordingRef.current = ambientRecording
+  voiceReferenceRecordingAudioRef.current = onVoiceReferenceRecordingAudio
+  voiceReferenceRecordingRef.current = voiceReferenceRecording
   wakeWordEnabledRef.current = wakeWordEnabled
   wakeWordOnlyRef.current = wakeWordOnly
   enabledRef.current = enabled
@@ -824,8 +831,8 @@ export default function useRealtimeVoice({
     pendingManualInputsRef.current = []
   }, [sessionId])
 
-  const captureEnabled = enabled || ambientRecording
-  const captureSuspended = suspended && !ambientRecording
+  const captureEnabled = enabled || ambientRecording || voiceReferenceRecording
+  const captureSuspended = suspended && !ambientRecording && !voiceReferenceRecording
 
   useEffect(() => {
     if (!captureEnabled || captureSuspended) {
@@ -891,6 +898,8 @@ export default function useRealtimeVoice({
         const inputResampler = createStreamingResampler()
         let ambientParts = []
         let ambientSampleCount = 0
+        let voiceReferenceParts = []
+        let voiceReferenceSampleCount = 0
         let inputResamplerSocket = null
         let source
         let processor
@@ -909,7 +918,28 @@ export default function useRealtimeVoice({
             ambientSampleCount = 0
             ambientRecordingAudioRef.current?.(pcmBase64(merged), context.sampleRate)
           }
+          const appendVoiceReferenceAudio = samples => {
+            if (!samples.length) return
+            voiceReferenceParts.push(samples)
+            voiceReferenceSampleCount += samples.length
+          }
+          const flushVoiceReferenceAudio = () => {
+            if (!voiceReferenceSampleCount) return
+            const merged = new Float32Array(voiceReferenceSampleCount)
+            let offset = 0
+            for (const part of voiceReferenceParts) {
+              merged.set(part, offset)
+              offset += part.length
+            }
+            voiceReferenceParts = []
+            voiceReferenceSampleCount = 0
+            voiceReferenceRecordingAudioRef.current?.(
+              pcmBase64(merged),
+              context.sampleRate,
+            )
+          }
           flushAmbientAudioRef.current = flushAmbientAudio
+          flushVoiceReferenceAudioRef.current = flushVoiceReferenceAudio
           processor.onaudioprocess = event => {
             const rawSamples = event.inputBuffer.getChannelData(0)
             if (ambientRecordingRef.current) {
@@ -920,6 +950,17 @@ export default function useRealtimeVoice({
               ambientParts.push(ambientAudio)
               ambientSampleCount += ambientAudio.length
               if (ambientSampleCount >= context.sampleRate) flushAmbientAudio()
+            }
+            if (voiceReferenceRecordingRef.current) {
+              // A voice reference is a local-only capture: never route it to
+              // wake-word detection, Realtime, or the Gateway. Preserve the
+              // browser's native PCM and sample rate for the saved WAV; the
+              // main-process VAD maintains its own 16 kHz analysis stream.
+              appendVoiceReferenceAudio(new Float32Array(rawSamples))
+              if (voiceReferenceSampleCount >= context.sampleRate) {
+                flushVoiceReferenceAudio()
+              }
+              return
             }
             const samples = microphoneSamplesDuringManualInput(
               rawSamples,
@@ -967,7 +1008,9 @@ export default function useRealtimeVoice({
             track: media.getAudioTracks()[0],
             close() {
               flushAmbientAudio()
+              flushVoiceReferenceAudio()
               flushAmbientAudioRef.current = () => {}
+              flushVoiceReferenceAudioRef.current = () => {}
               media.getTracks().forEach(track => track.stop())
               wakeWordResampler.reset()
               inputResampler.reset()
@@ -979,6 +1022,7 @@ export default function useRealtimeVoice({
         } catch (error) {
           media.getTracks().forEach(track => track.stop())
           flushAmbientAudioRef.current = () => {}
+          flushVoiceReferenceAudioRef.current = () => {}
           processor?.disconnect()
           source?.disconnect()
           throw error
@@ -1026,6 +1070,10 @@ export default function useRealtimeVoice({
   ])
 
   useEffect(() => {
+    if (!voiceReferenceRecording) flushVoiceReferenceAudioRef.current()
+  }, [voiceReferenceRecording])
+
+  useEffect(() => {
     if (!enabled || suspended || !inputReadyRef.current) return
     sendSocketEvent(microphoneControlEvent({
       enabled: true,
@@ -1035,11 +1083,11 @@ export default function useRealtimeVoice({
   }, [enabled, inputOnlyMute, sendSocketEvent, suspended, wakeWordOnly])
 
   useEffect(() => {
-    if (!suspended || ambientRecording) return
+    if (!suspended || ambientRecording || voiceReferenceRecording) return
     const audio = audioRef.current
     audioRef.current = null
     audio?.close()
-  }, [ambientRecording, suspended])
+  }, [ambientRecording, suspended, voiceReferenceRecording])
 
   useEffect(() => () => {
     audioRef.current?.close()
@@ -1166,6 +1214,7 @@ export default function useRealtimeVoice({
     wake,
     publishClientEvent,
     flushAmbientRecordingAudio: () => flushAmbientAudioRef.current(),
+    flushVoiceReferenceRecordingAudio: () => flushVoiceReferenceAudioRef.current(),
     sendInput,
     sendImageFrame,
     clearImageBuffer,
