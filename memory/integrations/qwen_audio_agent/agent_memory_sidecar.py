@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""JSONL bridge from qwen-audio-agent to :class:`MemoryRuntime`.
+"""JSONL bridge from qwen-audio-agent to :class:`PersonWorldModel`.
 
 The bridge intentionally receives completed Realtime transcripts instead of
 audio. Qwen's Realtime provider owns VAD, ASR, interruption, and final-turn
@@ -32,8 +32,8 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config
-from memory.memory_runtime import MemoryRuntime
+from config import split_memory_config
+from pwm_manager import PersonWorldModel
 
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -100,7 +100,7 @@ def _message_key(owner_id: str, session_id: str, message: Dict[str, Any]) -> str
 
 @dataclass
 class OwnerRuntime:
-    runtime: MemoryRuntime
+    pwm: PersonWorldModel
     seen_path: Path
     seen_order: List[str] = field(default_factory=list)
     seen: set[str] = field(default_factory=set)
@@ -121,7 +121,7 @@ class OwnerRuntime:
 
 
 class AgentMemoryRuntime:
-    """Own isolated MemoryRuntime instances and expose JSONL-safe methods."""
+    """Own isolated PersonWorldModel instances and expose JSONL-safe methods."""
 
     def __init__(
         self,
@@ -129,6 +129,10 @@ class AgentMemoryRuntime:
         state_dir: Path,
         memory_runtime_config: Dict[str, Any],
         memory_manager_config: Dict[str, Any],
+        user_state_config: Dict[str, Any],
+        llm_model_config: Dict[str, Any],
+        embedding_model_config: Dict[str, Any],
+        task_scheduling_config: Dict[str, Any],
         logger: logging.Logger,
     ) -> None:
         self._state_dir = state_dir.resolve()
@@ -136,12 +140,16 @@ class AgentMemoryRuntime:
         self._owner_dir.mkdir(parents=True, exist_ok=True)
         self._runtime_config = dict(memory_runtime_config)
         self._manager_config = dict(memory_manager_config)
+        self._user_state_config = dict(user_state_config)
+        self._llm_config = dict(llm_model_config)
+        self._embedding_config = dict(embedding_model_config)
+        self._task_scheduling_config = dict(task_scheduling_config)
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
         self._operation_lock = threading.RLock()
 
     def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Serialize stdio and local-IPC mutations through one runtime."""
+        """Serialize stdio and local-IPC mutations through the memory service."""
         handlers = {
             "observe": self.observe,
             "set_ambient_recording_state": self.set_ambient_recording_state,
@@ -177,14 +185,24 @@ class AgentMemoryRuntime:
                     seen_order = [str(item) for item in parsed[-_MAX_SEEN_IDS:]]
             except (OSError, ValueError, TypeError):
                 self._logger.warning("Ignoring invalid observed-message index owner=%s", key)
-        runtime = MemoryRuntime(
-            db_path=owner_dir / "memory.db",
+        manager_config = dict(self._manager_config)
+        user_state_config = dict(self._user_state_config)
+        memory_db_path = owner_dir / "memory.db"
+        manager_config["user_memory_database_path"] = str(memory_db_path)
+        user_state_config["user_model_database_path"] = str(
+            owner_dir / "user_model.db"
+        )
+        pwm = PersonWorldModel(
             memory_runtime_config=self._runtime_config,
-            memory_manager_config=self._manager_config,
+            memory_manager_config=manager_config,
+            user_state_config=user_state_config,
+            llm_model_config=self._llm_config,
+            embedding_model_config=self._embedding_config,
+            task_scheduling_config=self._task_scheduling_config,
             logger=self._logger.getChild(f"owner.{key[:12]}"),
         )
         created = OwnerRuntime(
-            runtime=runtime,
+            pwm=pwm,
             seen_path=seen_path,
             seen_order=seen_order,
             seen=set(seen_order),
@@ -238,7 +256,7 @@ class AgentMemoryRuntime:
                 continue
             turn_id = _clean(message.get("turnId"), 240)
             fallback_timestamp = _normalize_turn_timestamp(message.get("createdAt"))
-            report = holder.runtime.accept_memory_input(
+            report = holder.pwm.accept_memory_input(
                 interaction_turn={
                     "user_message": content,
                     "assistant_response": assistants.get(turn_id, ""),
@@ -328,7 +346,7 @@ class AgentMemoryRuntime:
         """Queue one durable ambient-ASR batch through the sole DB writer.
 
         The ambient audio sidecar owns WAV files and ASR only.  Keeping this
-        write path in the primary sidecar prevents two ``MemoryRuntime``
+        write path in the primary sidecar prevents two ``PersonWorldModel``
         instances from concurrently mutating one owner's SQLite database.
         """
         owner_id = _clean(params.get("ownerId"), 240)
@@ -380,7 +398,7 @@ class AgentMemoryRuntime:
             ]))
             transcript_segments.append(segment)
         if transcript_segments:
-            report = holder.runtime.accept_memory_input(
+            report = holder.pwm.accept_memory_input(
                 transcript_segments=transcript_segments,
                 tags=tags,
                 ambient_recording_enabled=ambient_recording_enabled,
@@ -412,48 +430,44 @@ class AgentMemoryRuntime:
         if not recording_id:
             raise ValueError("recordingId must be non-empty")
         holder = self._owner_runtime(owner_id)
-        finalization = holder.runtime.finalize_memory_session(
+        finalization = holder.pwm.finalize_memory_session(
             reason=f"ambient_recording_finished:{recording_id}",
             tags=["qwen-audio-agent", "ambient-recording", recording_id],
         )
         holder.active_ambient_recording_ids.discard(recording_id)
         input_flush = dict(finalization.get("input_flush") or {})
-        episode = dict(finalization.get("episode_summary_trigger") or {})
-        derived_tasks = dict(finalization.get("derived_tasks") or {})
-        entity_claim = dict(derived_tasks.get("entity_claim") or {})
-        future_commitment = dict(derived_tasks.get("future_commitment") or {})
+        user_activity = dict(finalization.get("user_activity") or {})
+        followup_dispatch = dict(finalization.get("fact_followup_dispatch") or {})
         result = {
-            "finalized": bool((episode or {}).get("queued")),
+            "finalized": bool(user_activity.get("queued")),
             "recordingId": recording_id,
             "inputFlushed": bool(input_flush.get("queued")),
-            "episodeSummaryQueued": bool((episode or {}).get("queued")),
-            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
-            "futureCommitmentQueued": bool(future_commitment.get("queued")),
+            "userActivityQueued": bool(user_activity.get("queued")),
+            "factFollowupDispatchQueued": bool(followup_dispatch.get("queued")),
+            "factFollowupDispatch": followup_dispatch,
             "activeAmbientRecordingCount": len(holder.active_ambient_recording_ids),
         }
         self._logger.info(
             "finalize_transcript_recording owner=%s recording=%s input_flushed=%s "
-            "episode_summary_queued=%s entity_claim_queued=%s future_commitment_queued=%s "
+            "user_activity_queued=%s fact_followup_dispatch_queued=%s "
             "active_ambient_recordings=%s",
             _owner_key(owner_id)[:12],
             recording_id[:80],
             result["inputFlushed"],
-            result["episodeSummaryQueued"],
-            result["entityClaimQueued"],
-            result["futureCommitmentQueued"],
+            result["userActivityQueued"],
+            result["factFollowupDispatchQueued"],
             result["activeAmbientRecordingCount"],
         )
         return result
 
     def finalize(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Flush memory input and optionally close its semantic episode.
+        """Flush memory input and optionally close its activity window.
 
         ``checkpoint`` is for a transport-level close: it may flush input but
         never treats the reconnect as a conversation boundary.
         ``session_end`` is reserved for an explicit user-created new session;
-        it submits store, episode summary, entity-claim update, and future
-        commitment in
-        that FIFO order.
+        it submits fact extraction, activity observation, and a final follow-up
+        dispatch task. The dispatch resolves remaining signals when executed.
         """
         owner_id = _clean(params.get("ownerId"), 240)
         session_id = _clean(params.get("sessionId"), 240)
@@ -464,49 +478,40 @@ class AgentMemoryRuntime:
             raise ValueError("sessionId must be non-empty for session_end")
         holder = self._owner_runtime(owner_id)
         if boundary == "session_end":
-            finalization = holder.runtime.finalize_memory_session(
+            finalization = holder.pwm.finalize_memory_session(
                 reason=f"qwen_audio_agent_session_closed:{session_id}",
                 tags=["qwen-audio-agent", "session-close"],
             )
             input_flush = dict(finalization.get("input_flush") or {})
-            episode = dict(finalization.get("episode_summary_trigger") or {})
-            derived_tasks = dict(finalization.get("derived_tasks") or {})
-            entity_claim = dict(derived_tasks.get("entity_claim") or {})
-            future_commitment = dict(
-                derived_tasks.get("future_commitment") or {}
-            )
+            user_activity = dict(finalization.get("user_activity") or {})
+            followup_dispatch = dict(finalization.get("fact_followup_dispatch") or {})
         else:
-            input_flushed = holder.runtime.flush_pending_memory_inputs()
-            input_flush = {"queued": bool(input_flushed)}
-            episode = None
-            entity_claim = None
-            future_commitment = None
+            flush_report = holder.pwm.finalize_memory_session(
+                reason="qwen_audio_agent_transport_checkpoint",
+            )
+            input_flush = dict(flush_report.get("input_flush") or {})
+            user_activity = None
+            followup_dispatch = dict(flush_report.get("fact_followup_dispatch") or {})
         result = {
-            "finalized": boundary == "session_end" and bool((episode or {}).get("queued")),
+            "finalized": boundary == "session_end" and bool((user_activity or {}).get("queued")),
             "boundary": boundary,
             "sessionId": session_id,
-            "episodeSummaryQueued": bool((episode or {}).get("queued")),
+            "userActivityQueued": bool((user_activity or {}).get("queued")),
             "inputFlushed": bool(input_flush.get("queued")),
-            "entityClaimQueued": bool((entity_claim or {}).get("queued")),
-            "futureCommitmentQueued": bool(
-                (future_commitment or {}).get("queued")
-            ),
-            "episode": episode,
-            "entityClaim": entity_claim,
-            "futureCommitment": future_commitment,
+            "factFollowupDispatchQueued": bool(followup_dispatch.get("queued")),
+            "userActivity": user_activity,
+            "factFollowupDispatch": followup_dispatch,
         }
         self._logger.info(
             "finalize owner=%s boundary=%s session=%s input_flushed=%s "
-            "episode_summary_queued=%s entity_claim_queued=%s "
-            "future_commitment_queued=%s reason=%s",
+            "user_activity_queued=%s fact_followup_dispatch_queued=%s reason=%s",
             _owner_key(owner_id)[:12],
             boundary,
             session_id[:80],
             result["inputFlushed"],
-            result["episodeSummaryQueued"],
-            result["entityClaimQueued"],
-            result["futureCommitmentQueued"],
-            (episode or {}).get("reason") or "",
+            result["userActivityQueued"],
+            result["factFollowupDispatchQueued"],
+            (user_activity or {}).get("reason") or "",
         )
         return result
 
@@ -516,7 +521,7 @@ class AgentMemoryRuntime:
             return {"status": "empty", "memory_context": ""}
         holder = self._owner_runtime(_clean(params.get("ownerId"), 240))
         tags = params.get("tags")
-        result = holder.runtime.trigger_memory_recall(
+        result = holder.pwm.trigger_memory_recall(
             query,
             tags=[_clean(tag, 120) for tag in tags] if isinstance(tags, list) else None,
             time_end=_clean(params.get("timeEnd"), 120) or None,
@@ -537,10 +542,10 @@ class AgentMemoryRuntime:
         failures = 0
         for holder in list(self._owners.values()):
             try:
-                holder.runtime.close(timeout=None)
+                holder.pwm.close(timeout=None)
             except Exception:  # pragma: no cover - close must continue per owner
                 failures += 1
-                self._logger.exception("Failed to close owner memory runtime")
+                self._logger.exception("Failed to close owner PersonWorldModel")
         self._owners.clear()
         result = {"closed": failures == 0, "failedOwners": failures}
         self._logger.info("close closed=%s failed_owners=%s", result["closed"], failures)
@@ -552,7 +557,7 @@ class _LocalTranscriptIpcServer:
 
     The socket is permissioned to the current OS user and is intentionally not
     a network listener.  It lets the audio sidecar submit a completed batch to
-    the sole ``MemoryRuntime`` process without traversing the Gateway.
+    the sole memory-service process without traversing the Gateway.
     """
 
     _ALLOWED_METHODS = {
@@ -565,11 +570,11 @@ class _LocalTranscriptIpcServer:
         self,
         *,
         path: Path,
-        runtime: AgentMemoryRuntime,
+        memory_service: AgentMemoryRuntime,
         logger: logging.Logger,
     ) -> None:
         self._path = path.expanduser().resolve()
-        self._runtime = runtime
+        self._memory_service = memory_service
         self._logger = logger
         self._socket: Optional[socket.socket] = None
         self._closed = threading.Event()
@@ -648,7 +653,7 @@ class _LocalTranscriptIpcServer:
                 if method not in self._ALLOWED_METHODS:
                     raise ValueError(f"local IPC method is not allowed: {method}")
                 params = request.get("params")
-                result = self._runtime.dispatch(
+                result = self._memory_service.dispatch(
                     method,
                     params if isinstance(params, dict) else {},
                 )
@@ -695,16 +700,27 @@ def main() -> int:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     config = _load_config(args.config.expanduser().resolve())
-    runtime_config, manager_config = split_memory_config(config)
-    runtime = AgentMemoryRuntime(
+    (
+        llm_config,
+        embedding_config,
+        runtime_config,
+        task_scheduling_config,
+        manager_config,
+        user_state_config,
+    ) = split_memory_config(config)
+    memory_service = AgentMemoryRuntime(
         state_dir=state_dir,
         memory_runtime_config=runtime_config,
         memory_manager_config=manager_config,
+        user_state_config=user_state_config,
+        llm_model_config=llm_config,
+        embedding_model_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
         logger=logger,
     )
     ipc_server = _LocalTranscriptIpcServer(
         path=(args.ipc_socket or state_dir / "agent-memory-transcript.sock"),
-        runtime=runtime,
+        memory_service=memory_service,
         logger=logger,
     )
     ipc_server.start()
@@ -719,7 +735,7 @@ def main() -> int:
             method = _clean(request.get("method"), 80)
             response = {
                 "id": request.get("id"),
-                "result": runtime.dispatch(method, request.get("params") or {}),
+                "result": memory_service.dispatch(method, request.get("params") or {}),
             }
         except Exception as exc:
             logger.exception(

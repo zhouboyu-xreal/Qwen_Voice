@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run MemoryNodeManager on the CLongEval conversation benchmark.
+"""Run PersonWorldModel on the CLongEval conversation benchmark.
 
 CLongEval conversation records are JSONL objects with this shape::
 
@@ -12,13 +12,14 @@ CLongEval conversation records are JSONL objects with this shape::
 
 The same context is often reused by several questions. This runner groups
 records by exact context, replays each context into one isolated memory DB,
-and then runs all of that context's questions against the same memory runtime.
+and then runs all of that context's questions against the same personal world model.
 It uses the project config.yaml for the shared runtime and manager settings.
 """
 
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import hashlib
 import json
 import logging
@@ -38,9 +39,10 @@ for import_root in (SRC_ROOT, REPO_ROOT, SCRIPT_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import MemoryOperationReporter
-from memory.memory_runtime import MemoryRuntime
-from memory.config import split_memory_config
+from task_scheduler import TaskOperationReporter
+from llm_client import LLMClient
+from pwm_manager import PersonWorldModel
+from config import split_memory_config
 from scripts.memory.user_dialogue.test_memory_store_fact_extraction import (
     configure_logging,
     load_project_config,
@@ -61,7 +63,8 @@ DEFAULT_INPUT = (
 DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "clongeval_conversation"
 
 DATE_HEADER_RE = re.compile(
-    r"以下是(?P<date>\d{4}年\d{1,2}月\d{1,2}日)的对话记录\s*[:：]?"
+    r"以下是(?P<date>\d{4}年\d{1,2}月\d{1,2}日)"
+    r"(?:\s*(?P<time>\d{1,2}:\d{2}(?::\d{2})?))?的对话记录\s*[:：]?"
 )
 ROLE_LINE_RE = re.compile(r"^[“”]?\s*(用户|AI|助手)\s*[:：]\s*(.*)$")
 CONTEXT_END_MARKERS = ("请记住以上全部对话记录", "问题：", "问题:")
@@ -250,9 +253,15 @@ def parse_context_days(context: str) -> List[Dict[str, Any]]:
         if not pairs:
             logging.warning("No user/assistant pairs parsed for %s", header.group("date"))
             continue
+        clock_text = header.group("time")
+        timestamp = parse_date(header.group("date"))
+        if clock_text:
+            clock = datetime.strptime(clock_text, "%H:%M:%S" if clock_text.count(":") == 2 else "%H:%M")
+            timestamp = timestamp.replace(hour=clock.hour, minute=clock.minute, second=clock.second)
         days.append({
-            "date_text": header.group("date"),
-            "date": parse_date(header.group("date")),
+            "date_text": header.group("date") + (f" {clock_text}" if clock_text else ""),
+            "date": timestamp,
+            "has_explicit_time": bool(clock_text),
             "pairs": pairs,
         })
     if not days:
@@ -312,7 +321,7 @@ def group_records_by_context(
 def db_counts(db: Any) -> Dict[str, int]:
     counts: Dict[str, int] = {}
     for table in (
-        "memory_episodes",
+        "memory_user_activity_items",
         "memory_facts",
     ):
         row = db._conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
@@ -322,7 +331,7 @@ def db_counts(db: Any) -> Dict[str, int]:
 
 def replay_context_into_memory(
     *,
-    runtime: MemoryRuntime,
+    pwm: PersonWorldModel,
     db: Any,
     days: Sequence[Dict[str, Any]],
     group_id: str,
@@ -337,10 +346,10 @@ def replay_context_into_memory(
         for pair_index, (user, assistant) in enumerate(day["pairs"]):
             pair_count += 1
             turn_timestamp = normalize_unique_timestamp(
-                day["date"] + timedelta(seconds=pair_index),
+                day["date"] + timedelta(seconds=pair_index * (120 if day.get("has_explicit_time") else 1)),
                 seen_timestamps,
             )
-            store_report = runtime.accept_memory_input(
+            store_report = pwm.accept_memory_input(
                 interaction_turn={
                     "user_message": user,
                     "assistant_response": assistant,
@@ -366,13 +375,13 @@ def replay_context_into_memory(
     # releases all remaining delayed input through the same append path.
     finalization: Dict[str, Any] = {}
     if last_turn_timestamp is not None:
-        watermark_report = runtime.update_ambient_asr_watermark(
+        watermark_report = pwm.update_ambient_asr_watermark(
             last_turn_timestamp,
         )
         ambient_watermark_updates += 1
         if watermark_report.get("queued"):
             store_batches += 1
-        finalization = runtime.finalize_memory_session(
+        finalization = pwm.finalize_memory_session(
             reason="clongeval_context_complete",
             tags=[
                 "clongeval_conversation",
@@ -424,13 +433,18 @@ def build_reader_prompt(query: str, memory_context: str) -> str:
     )
 
 
-def run_reader(manager: Any, query: str, memory_context: str, max_chars: int) -> str:
+def run_reader(
+    llm_client: LLMClient,
+    query: str,
+    memory_context: str,
+    max_chars: int,
+) -> str:
     if not memory_context.strip():
         return ""
-    raw = manager._call_llm(
+    raw = llm_client.call_llm(
         build_reader_prompt(query, truncate_text(memory_context, max_chars))
     )
-    parsed = manager._parse_json_object_from_llm_text(raw or "")
+    parsed = llm_client.parse_json_object_from_llm_text(raw or "")
     if isinstance(parsed, dict):
         return str(parsed.get("answer") or parsed.get("final_answer") or "").strip()
     return str(raw or "").strip()
@@ -438,22 +452,42 @@ def run_reader(manager: Any, query: str, memory_context: str, max_chars: int) ->
 
 def prepare_runtime(
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+    Dict[str, Any],
+]:
     resolve_llm_args(args)
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
+    (
+        llm_config,
+        embedding_config,
+        memory_runtime_config,
+        task_scheduling_config,
+        memory_manager_config,
+        user_state_config,
+    ) = split_memory_config(config)
     if args.llm_thinking is None:
         args.llm_thinking = str(llm_config.get("llm_thinking") or "disabled")
     if args.llm_json_mode is None:
         args.llm_json_mode = bool(llm_config.get("llm_json_mode", True))
-    args.recall_top_k = max(1, int(args.recall_top_k or memory_manager_config.get("recall_top_k", 8) or 8))
-    args.recall_budget = str(args.recall_budget or memory_manager_config.get("recall_budget", "mid") or "mid")
+    recall_config = memory_manager_config.setdefault("recall", {})
+    args.recall_top_k = max(
+        1,
+        int(args.recall_top_k or recall_config.get("recall_top_k", 8) or 8),
+    )
+    args.recall_budget = str(
+        args.recall_budget or recall_config.get("recall_budget", "mid") or "mid"
+    )
+    recall_config["recall_top_k"] = args.recall_top_k
+    recall_config["recall_budget"] = args.recall_budget
     if args.recall_mode is not None:
-        memory_manager_config["recall_mode"] = args.recall_mode
+        recall_config["recall_mode"] = args.recall_mode
     args.recall_mode = str(
-        memory_manager_config.get("recall_mode", "normal") or "normal"
+        recall_config.get("recall_mode", "normal") or "normal"
     ).strip().lower()
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
@@ -469,7 +503,14 @@ def prepare_runtime(
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
     llm_config["llm_timeout"] = args.llm_timeout
     memory_manager_config["enable_entity_extraction"] = False
-    return memory_runtime_config, memory_manager_config, llm_config, embedding_config
+    return (
+        memory_runtime_config,
+        memory_manager_config,
+        user_state_config,
+        llm_config,
+        embedding_config,
+        task_scheduling_config,
+    )
 
 
 def resolve_output_dir(args: argparse.Namespace) -> Path:
@@ -578,8 +619,10 @@ def process_context_group(
     group_records: Sequence[Dict[str, Any]],
     memory_runtime_config: Dict[str, Any],
     memory_manager_config: Dict[str, Any],
+    user_state_config: Dict[str, Any],
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
+    task_scheduling_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Replay, update entity claims, recall, and optionally answer one context."""
     group_id = context_group_id(context, group_index)
@@ -595,6 +638,18 @@ def process_context_group(
         if reused_existing_db
         else group_dir / "memory.db"
     )
+    # Each context gets an isolated pair of databases and independent module
+    # configs; do not mutate the shared configs used by other context groups.
+    memory_runtime_config = deepcopy(memory_runtime_config)
+    memory_manager_config = deepcopy(memory_manager_config)
+    user_state_config = deepcopy(user_state_config)
+    llm_config = deepcopy(llm_config)
+    embedding_config = deepcopy(embedding_config)
+    task_scheduling_config = deepcopy(task_scheduling_config)
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
     context_log_path = group_dir / "context.log"
     logging.info(
         "Processing context group %s/%s id=%s records=%s context_chars=%s",
@@ -608,7 +663,7 @@ def process_context_group(
     context_log_handler = add_context_log_handler(context_log_path)
     memory_logger: Optional[logging.Logger] = None
     memory_log_handler: Optional[logging.Handler] = None
-    runtime: Optional[MemoryRuntime] = None
+    pwm: Optional[PersonWorldModel] = None
     results: List[Dict[str, Any]] = []
     try:
         memory_logger, memory_log_handler = configure_memory_logger(
@@ -625,16 +680,19 @@ def process_context_group(
             reused_existing_db,
             db_path,
         )
-        operation_reporter = MemoryOperationReporter()
-        runtime = MemoryRuntime(
-            db_path=db_path,
+        operation_reporter = TaskOperationReporter()
+        pwm = PersonWorldModel(
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
+            user_state_config=user_state_config,
+            llm_model_config=llm_config,
+            embedding_model_config=embedding_config,
+            task_scheduling_config=task_scheduling_config,
             operation_reporter=operation_reporter,
             logger=memory_logger,
         )
-        db = runtime.database
-        manager = runtime.manager
+        db = pwm.database
+        manager = pwm.memory_manager
         if not args.skip_embedding_validation:
             validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, f"before_context:{group_id}")
@@ -648,31 +706,31 @@ def process_context_group(
             }
         else:
             replay_stats = replay_context_into_memory(
-                runtime=runtime,
+                pwm=pwm,
                 db=db,
                 days=days,
                 group_id=group_id,
             )
-            if not runtime.wait_for_memory_tasks():
+            if not pwm.wait_for_memory_tasks():
                 raise RuntimeError(
-                    "Timed out while draining queued memory store and derived tasks"
+                    "Timed out while draining queued memory store and follow-up tasks"
                 )
         log_memory_index_state(db, f"after_context:{group_id}")
         counts = db_counts(db)
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
         store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-        entity_claim_operation_report = (
-            operation_counts.get("memory_entity_claim_update") or {}
+        user_claim_operation_report = (
+            operation_counts.get("memory_user_claim_update") or {}
         )
         replay_stats["store_batches"] = int(store_operation_report.get("succeeded") or 0)
-        replay_stats["entity_claim_runs"] = int(
-            entity_claim_operation_report.get("submitted") or 0
+        replay_stats["user_claim_runs"] = int(
+            user_claim_operation_report.get("submitted") or 0
         )
         replay_stats["store_flushes"] = int(store_operation_report.get("submitted") or 0)
 
         for record_index, record in enumerate(group_records, 1):
-            recall_report = runtime.trigger_memory_recall(
+            recall_report = pwm.trigger_memory_recall(
                 str(record["query"]),
             )
             recall_context = str(recall_report.get("memory_context") or "")
@@ -680,7 +738,7 @@ def process_context_group(
             hypothesis = ""
             if args.run_reader:
                 hypothesis = run_reader(
-                    manager,
+                    pwm.llm_client,
                     str(record["query"]),
                     recall_context,
                     args.reader_max_context_chars,
@@ -712,14 +770,14 @@ def process_context_group(
                     or ("ok" if recall_context else "empty")
                 ),
                 "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-                "entity_claim_total_elapsed_ms": float(
-                    entity_claim_operation_report.get("total_elapsed_ms") or 0.0
+                "user_claim_total_elapsed_ms": float(
+                    user_claim_operation_report.get("total_elapsed_ms") or 0.0
                 ),
                 "recall_total_elapsed_ms": recall_total_elapsed_ms,
                 "memory_total_elapsed_ms": round(
                     float(store_operation_report.get("total_elapsed_ms") or 0.0)
                     + float(
-                        entity_claim_operation_report.get("total_elapsed_ms") or 0.0
+                        user_claim_operation_report.get("total_elapsed_ms") or 0.0
                     )
                     + recall_total_elapsed_ms,
                     2,
@@ -760,9 +818,9 @@ def process_context_group(
             "results": results,
         }
     finally:
-        if runtime is not None:
-            log_memory_index_state(runtime.database, f"finished_context:{group_id}")
-            runtime.close()
+        if pwm is not None:
+            log_memory_index_state(pwm.database, f"finished_context:{group_id}")
+            pwm.close()
         remove_memory_logger_handler(memory_logger, memory_log_handler)
         remove_context_log_handler(context_log_handler)
 
@@ -779,6 +837,8 @@ def run_context_group_worker(
         Dict[str, Any],
         Dict[str, Any],
         Dict[str, Any],
+        Dict[str, Any],
+        Dict[str, Any],
     ],
 ) -> Tuple[int, Dict[str, Any]]:
     """Process one CLongEval context in an isolated worker process."""
@@ -791,8 +851,10 @@ def run_context_group_worker(
         args,
         memory_runtime_config,
         memory_manager_config,
+        user_state_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
     ) = payload
     group_id = context_group_id(context, group_index)
     group_dir = args.output_dir / group_id
@@ -817,8 +879,10 @@ def run_context_group_worker(
         group_records=group_records,
         memory_runtime_config=memory_runtime_config,
         memory_manager_config=memory_manager_config,
+        user_state_config=user_state_config,
         llm_config=llm_config,
         embedding_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
     )
     logging.info(
         "Worker finished context group %s/%s id=%s recall_results=%s",
@@ -861,8 +925,10 @@ def main() -> int:
     (
         memory_runtime_config,
         memory_manager_config,
+        user_state_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
     ) = prepare_runtime(args)
     groups = group_records_by_context(records)
     results_path = output_dir / "clongeval_conversation_results.json"
@@ -892,8 +958,10 @@ def main() -> int:
                 args,
                 memory_runtime_config,
                 memory_manager_config,
+                user_state_config,
                 llm_config,
                 embedding_config,
+                task_scheduling_config,
             )
             for group_index, (context, group_records) in enumerate(groups, 1)
         ]
@@ -940,8 +1008,10 @@ def main() -> int:
                     group_records=group_records,
                     memory_runtime_config=memory_runtime_config,
                     memory_manager_config=memory_manager_config,
+                    user_state_config=user_state_config,
                     llm_config=llm_config,
                     embedding_config=embedding_config,
+                    task_scheduling_config=task_scheduling_config,
                 )
             except Exception as exc:
                 group_id = context_group_id(context, group_index)

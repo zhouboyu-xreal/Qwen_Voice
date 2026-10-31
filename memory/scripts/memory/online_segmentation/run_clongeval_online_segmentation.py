@@ -30,8 +30,8 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.config import split_memory_config
-from memory.embedding_client import EmbeddingClient
+from config import split_memory_config
+from embedding_client import EmbeddingClient
 from memory.memory_context_manager import build_memory_context_manager_config
 from memory.memory_runtime import (
     OnlineSegmentExchange,
@@ -323,7 +323,7 @@ def round_float(value: Optional[float], digits: int = 6) -> Optional[float]:
 
 
 def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerConfig:
-    runtime_config, _manager_config = split_memory_config(load_project_config(args.config))
+    _llm, _embedding, runtime_config, _scheduling, _manager_config, _user_state_config = split_memory_config(load_project_config(args.config))
     memory_input_config = runtime_config.get("memory_context_manager")
     if not isinstance(memory_input_config, dict):
         memory_input_config = {}
@@ -359,8 +359,7 @@ def build_segmentation_config(args: argparse.Namespace) -> MemoryContextMangerCo
 
 
 def build_embedding_config(args: argparse.Namespace) -> Dict[str, Any]:
-    _runtime_config, manager_config = split_memory_config(load_project_config(args.config))
-    embedding_config = manager_config["embedding"]
+    _llm, embedding_config, _runtime_config, _scheduling, _manager_config, _user_state_config = split_memory_config(load_project_config(args.config))
     overrides = {
         "provider": args.embedding_provider,
         "model": args.embedding_model,

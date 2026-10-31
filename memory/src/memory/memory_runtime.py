@@ -1,6 +1,6 @@
 """Runtime adapter between application input events and memory storage.
 
-``MemoryNodeManager`` owns episode persistence, entity-claim updates, and
+``MemoryNodeManager`` owns user-activity persistence, user-claim updates, and
 recall. This
 adapter owns the short-lived interaction buffer and converts frontend-shaped
 turns or transcript segments into typed Manager-facing memory units.
@@ -11,22 +11,22 @@ from __future__ import annotations
 import logging
 import json
 import re
-import threading
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .embedding_client import EmbeddingClient
-from .memory_database import SessionDB
+from embedding_client import EmbeddingClient
+from .memory_database import UserMemoryDB
 
 from .memory_manager import (
-    MemoryOperationReporter,
     MemoryNodeManager,
     _compact_whitespace,
     _now_text,
     _to_timestamp_text,
 )
+from llm_client import LLMClient
+from task_scheduler import TaskScheduler
 from .memory_context_manager import (
     MemoryContextManager,
     TranscriptUnitAssembler,
@@ -44,402 +44,44 @@ _MEMORY_INPUT_DEDUP_MIN_TEXT_CHARS = 8
 _MEMORY_INPUT_DEDUP_MAX_TIME_GAP_SECONDS = 120.0
 _MEMORY_INPUT_DEDUP_MIN_FUZZY_RATIO = 0.90
 
-
-class _DerivedMemoryTaskScheduler:
-    """Schedule claim and future-commitment projections after committed facts.
-
-    The manager owns extraction and persistence.  This runtime-local helper
-    merely coalesces successful store completions into follow-up tasks.  It
-    deliberately has no timer yet: a task is scheduled when a batch threshold
-    is reached, and session finalization always installs a FIFO drain fence.
-    """
-
-    _KIND_TO_TASK = {
-        "entity_claim": "memory_entity_claim_update",
-        "future_commitment": "memory_future_commitment_update",
-    }
-
-    def __init__(
-        self,
-        manager: MemoryNodeManager,
-        *,
-        config: Optional[Dict[str, Any]] = None,
-        logger: Optional[logging.Logger] = None,
-    ) -> None:
-        self._manager = manager
-        self._logger = logger or logging.getLogger(__name__)
-        settings = dict(config or {})
-        self._thresholds = {
-            "entity_claim": {
-                "default": {
-                    "batches": max(1, int(
-                        settings.get("entity_claim_min_signal_batches", 4) or 4
-                    )),
-                    "facts": max(1, int(
-                        settings.get("entity_claim_min_signal_facts", 8) or 8
-                    )),
-                },
-                "interaction": {
-                    "batches": max(1, int(
-                        settings.get(
-                            "interaction_entity_claim_min_signal_batches", 3
-                        ) or 3
-                    )),
-                    "facts": max(1, int(
-                        settings.get(
-                            "interaction_entity_claim_min_signal_facts", 5
-                        ) or 5
-                    )),
-                },
-            },
-            "future_commitment": {
-                "default": {
-                    "batches": max(1, int(
-                        settings.get(
-                            "future_commitment_min_signal_batches", 4
-                        ) or 4
-                    )),
-                    "facts": max(1, int(
-                        settings.get(
-                            "future_commitment_min_signal_facts", 5
-                        ) or 5
-                    )),
-                },
-                "interaction": {
-                    "batches": max(1, int(
-                        settings.get(
-                            "interaction_future_commitment_min_signal_batches", 3
-                        ) or 3
-                    )),
-                    "facts": max(1, int(
-                        settings.get(
-                            "interaction_future_commitment_min_signal_facts", 3
-                        ) or 3
-                    )),
-                },
-            },
-        }
-        self._lock = threading.RLock()
-        self._state = {
-            kind: {
-                "generation": 0,
-                "completed_generation": 0,
-                "unscheduled_signal_batches": 0,
-                "unscheduled_signal_facts": 0,
-                "unscheduled_contains_interaction": False,
-                "task_pending": False,
-            }
-            for kind in self._KIND_TO_TASK
-        }
-        self._force_pending_kinds: set[str] = set()
-        self._force_failed_kinds: set[str] = set()
-
-    def on_task_completion(self, event: Dict[str, Any]) -> None:
-        """Consume a manager completion event on the manager worker thread."""
-        task_kind = str(event.get("task_kind") or "")
-        result = event.get("result")
-        if task_kind == "memory_fact_extraction":
-            if not event.get("succeeded") or not isinstance(result, dict):
-                return
-            self._record_store_completion(
-                result,
-                completion_context=event.get("completion_context"),
-            )
-            return
-
-        completion_context = event.get("completion_context")
-        if not isinstance(completion_context, dict):
-            return
-        scheduler_context = completion_context.get("derived_task_scheduler")
-        if not isinstance(scheduler_context, dict):
-            return
-        kind = str(scheduler_context.get("kind") or "")
-        if self._KIND_TO_TASK.get(kind) != task_kind:
-            return
-        if bool(scheduler_context.get("force_drain")):
-            self._finish_force_drain(
-                kind,
-                succeeded=bool(event.get("succeeded")),
-            )
-            return
-        if not bool(scheduler_context.get("automatic")):
-            return
-        self._finish_automatic_task(kind, succeeded=bool(event.get("succeeded")))
-
-    def force_drain(self) -> Dict[str, Dict[str, Any]]:
-        """Append both projections after all previously queued memory work.
-
-        This is intentionally unconditional.  The tasks query unprocessed
-        signal mappings themselves, while the force marker suppresses an
-        otherwise redundant automatic task from store completions that occur
-        before this FIFO fence is reached.
-        """
-        with self._lock:
-            self._force_pending_kinds = set(self._KIND_TO_TASK)
-            self._force_failed_kinds.clear()
-        reports = {
-            "entity_claim": self._manager.submit_memory_entity_claim_update_task(
-                completion_context={
-                    "derived_task_scheduler": {
-                        "kind": "entity_claim",
-                        "force_drain": True,
-                    }
-                }
-            ),
-            "future_commitment": (
-                self._manager.submit_memory_future_commitment_update_task(
-                    completion_context={
-                        "derived_task_scheduler": {
-                            "kind": "future_commitment",
-                            "force_drain": True,
-                        }
-                    }
-                )
-            ),
-        }
-        with self._lock:
-            for kind, report in reports.items():
-                if not bool((report or {}).get("queued")):
-                    self._force_pending_kinds.discard(kind)
-                    self._force_failed_kinds.add(kind)
-                    self._mark_kind_needing_retry_locked(kind)
-            force_round_finished = not self._force_pending_kinds
-        if force_round_finished:
-            self._finish_force_drain()
-        return reports
-
-    def snapshot(self) -> Dict[str, Any]:
-        """Return scheduler state for diagnostics without exposing locks."""
-        with self._lock:
-            return {
-                "thresholds": {
-                    kind: dict(values) for kind, values in self._thresholds.items()
-                },
-                "force_pending_kinds": sorted(self._force_pending_kinds),
-                "force_failed_kinds": sorted(self._force_failed_kinds),
-                "tasks": {
-                    kind: dict(values) for kind, values in self._state.items()
-                },
-            }
-
-    def _record_store_completion(
-        self,
-        result: Dict[str, Any],
-        *,
-        completion_context: Any,
-    ) -> None:
-        context = (
-            dict(completion_context)
-            if isinstance(completion_context, dict)
-            else {}
-        )
-        contains_interaction = bool(context.get("contains_interaction_turn"))
-        signal_stats = {
-            "entity_claim": {
-                "signal_count": int(result.get("entity_claim_signal_count") or 0),
-                "signal_fact_count": int(
-                    result.get("entity_claim_signal_fact_count") or 0
-                ),
-            },
-            "future_commitment": {
-                "signal_count": int(
-                    result.get("future_commitment_signal_count") or 0
-                ),
-                "signal_fact_count": int(
-                    result.get("future_commitment_signal_fact_count") or 0
-                ),
-            },
-        }
-        self._logger.info(
-            "memory store completion observed facts=%s entity_claim_signals=%s "
-            "entity_claim_signal_facts=%s future_commitment_signals=%s "
-            "future_commitment_signal_facts=%s contains_interaction_turn=%s",
-            int(result.get("new_fact_count") or 0),
-            signal_stats["entity_claim"]["signal_count"],
-            signal_stats["entity_claim"]["signal_fact_count"],
-            signal_stats["future_commitment"]["signal_count"],
-            signal_stats["future_commitment"]["signal_fact_count"],
-            contains_interaction,
-        )
-        with self._lock:
-            for kind, stats in signal_stats.items():
-                if stats["signal_count"] <= 0 or stats["signal_fact_count"] <= 0:
-                    continue
-                state = self._state[kind]
-                state["generation"] += 1
-                state["unscheduled_signal_batches"] += 1
-                state["unscheduled_signal_facts"] += stats["signal_fact_count"]
-                state["unscheduled_contains_interaction"] = bool(
-                    state["unscheduled_contains_interaction"]
-                    or contains_interaction
-                )
-        self._schedule_eligible_tasks()
-
-    def _schedule_eligible_tasks(self) -> None:
-        for kind in self._KIND_TO_TASK:
-            self._schedule_kind_if_eligible(kind)
-
-    def _schedule_kind_if_eligible(self, kind: str) -> None:
-        with self._lock:
-            if self._force_pending_kinds or self._state[kind]["task_pending"]:
-                return
-            state = self._state[kind]
-            threshold_key = (
-                "interaction"
-                if state["unscheduled_contains_interaction"]
-                else "default"
-            )
-            threshold = self._thresholds[kind][threshold_key]
-            if (
-                state["unscheduled_signal_batches"] < threshold["batches"]
-                or state["unscheduled_signal_facts"] < threshold["facts"]
-            ):
-                return
-            state["task_pending"] = True
-            target_generation = int(state["generation"])
-
-        completion_context = {
-            "derived_task_scheduler": {
-                "kind": kind,
-                "automatic": True,
-                "target_generation": target_generation,
-            }
-        }
-        if kind == "entity_claim":
-            report = self._manager.submit_memory_entity_claim_update_task(
-                completion_context=completion_context,
-            )
-        else:
-            report = self._manager.submit_memory_future_commitment_update_task(
-                completion_context=completion_context,
-            )
-        if bool((report or {}).get("queued")):
-            with self._lock:
-                state = self._state[kind]
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
-            self._logger.info(
-                "memory derived task scheduled kind=%s target_generation=%s",
-                kind,
-                target_generation,
-            )
-            return
-        with self._lock:
-            self._state[kind]["task_pending"] = False
-        self._logger.warning(
-            "memory derived task rejected kind=%s reason=%s",
-            kind,
-            (report or {}).get("reason"),
-        )
-
-    def _finish_automatic_task(self, kind: str, *, succeeded: bool) -> None:
-        with self._lock:
-            state = self._state[kind]
-            state["task_pending"] = False
-            if succeeded:
-                # FIFO means all store completion events observed before this
-                # task begins are included in the task's DB query.
-                state["completed_generation"] = int(state["generation"])
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
-            else:
-                self._mark_kind_needing_retry_locked(kind)
-        if succeeded:
-            self._schedule_kind_if_eligible(kind)
-
-    def _finish_force_drain(
-        self,
-        kind: Optional[str] = None,
-        *,
-        succeeded: bool = True,
-    ) -> None:
-        """Settle one force-drain round without discarding failed evidence."""
-        with self._lock:
-            if kind:
-                self._force_pending_kinds.discard(kind)
-                if not succeeded:
-                    self._force_failed_kinds.add(kind)
-                    self._mark_kind_needing_retry_locked(kind)
-            if self._force_pending_kinds:
-                return
-            failed_kinds = set(self._force_failed_kinds)
-            self._force_failed_kinds.clear()
-            for state_kind, state in self._state.items():
-                if state_kind in failed_kinds:
-                    continue
-                state["completed_generation"] = int(state["generation"])
-                state["unscheduled_signal_batches"] = 0
-                state["unscheduled_signal_facts"] = 0
-                state["unscheduled_contains_interaction"] = False
-        if not failed_kinds:
-            self._schedule_eligible_tasks()
-        else:
-            self._logger.warning(
-                "memory derived force drain failed kinds=%s; retained pending evidence",
-                sorted(failed_kinds),
-            )
-
-    def _mark_kind_needing_retry_locked(self, kind: str) -> None:
-        """Preserve enough state for a later store completion or drain retry."""
-        state = self._state[kind]
-        threshold = self._thresholds[kind]["default"]
-        state["unscheduled_signal_batches"] = max(
-            int(state["unscheduled_signal_batches"]),
-            threshold["batches"],
-        )
-        state["unscheduled_signal_facts"] = max(
-            int(state["unscheduled_signal_facts"]),
-            threshold["facts"],
-        )
-
-
 class MemoryRuntime:
-    """Normalize application input and batch it before episode storage."""
+    """Normalize application input and batch it before user activity extraction."""
 
     def __init__(
         self,
         *,
         db_path: Path | str,
+        database: UserMemoryDB,
+        task_scheduler: TaskScheduler,
+        llm_client: LLMClient,
         memory_runtime_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
-        operation_reporter: Optional[MemoryOperationReporter] = None,
+        embedding_config: Optional[Dict[str, Any]] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        """Initialize memory storage, manager, and runtime batching.
-
-        Application-facing callers provide ``db_path`` and the two memory
-        config mappings. The runtime owns the ``SessionDB``, embedding client,
-        and standard ``MemoryNodeManager`` lifecycle.
-        """
+        """Initialize input batching around already-composed shared resources."""
         self._logger = logger or logging.getLogger(__name__)
         manager_config = dict(memory_manager_config or {})
-        configured_embedding = manager_config.get("embedding")
-        embedding_config = (
-            dict(configured_embedding)
-            if isinstance(configured_embedding, dict)
-            else {}
-        )
+        runtime_config = dict(memory_runtime_config or {})
+        if Path(db_path).expanduser().resolve() != database.db_path.expanduser().resolve():
+            raise ValueError("Injected database path does not match db_path")
+        resolved_embedding_config = dict(embedding_config or {})
 
-        database = SessionDB(Path(db_path).expanduser().resolve())
-        try:
-            manager_logger = self._logger.getChild("memory_manager")
-            manager = MemoryNodeManager(
-                database,
-                embedding_config=dict(embedding_config or {}),
-                memory_manager_config=manager_config,
-                operation_reporter=operation_reporter,
-                logger=manager_logger,
-            )
-        except Exception:
-            database.close()
-            raise
+        manager_logger = self._logger.getChild("memory_manager")
+        self._llm_client = llm_client
+        self._task_scheduler = task_scheduler
+        manager = MemoryNodeManager(
+            database,
+            embedding_config=resolved_embedding_config,
+            memory_manager_config=manager_config,
+            task_scheduler=self._task_scheduler,
+            llm_client=self._llm_client,
+            logger=manager_logger,
+        )
         self._memory_database = database
         self._memory_manager = manager
-        runtime_config = dict(memory_runtime_config or {})
         self._embedding_client = EmbeddingClient(
-            dict(embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
+            dict(resolved_embedding_config or getattr(manager, "_embedding_cfg", {}) or {}),
         )
         if hasattr(self._memory_manager, "set_embedding_client"):
             self._memory_manager.set_embedding_client(self._embedding_client)
@@ -454,58 +96,7 @@ class MemoryRuntime:
             self._embedding_client,
             memory_context_manager_config,
         )
-        self._episode_tags: List[str] = []
-        scheduler_config = runtime_config.get("derived_task_scheduling")
-        self._derived_task_scheduler = _DerivedMemoryTaskScheduler(
-            self._memory_manager,
-            config=(
-                dict(scheduler_config)
-                if isinstance(scheduler_config, dict)
-                else None
-            ),
-            logger=self._logger.getChild("derived_task_scheduler"),
-        )
-        self._manager_completion_listener = (
-            self._derived_task_scheduler.on_task_completion
-        )
-        self._memory_manager.register_task_completion_listener(
-            self._manager_completion_listener
-        )
-
-    def close(self, timeout: Optional[float] = 30.0) -> None:
-        """Drain owned tasks and release resources created by this runtime."""
-        try:
-            self.flush_pending_memory_inputs(timeout=timeout)
-        finally:
-            try:
-                shutdown_ok = self._memory_manager.shutdown_task_worker(
-                    wait=True,
-                    timeout=timeout,
-                )
-                if not shutdown_ok:
-                    # A bounded shutdown timeout must not allow the database
-                    # to close while an entity-claim transaction is still in
-                    # flight. Continue draining without a deadline so all
-                    # queued writes are committed before the connection closes.
-                    self._logger.warning(
-                        "Memory worker did not stop within timeout=%s; "
-                        "continuing to drain queued tasks before closing database",
-                        timeout,
-                    )
-                    shutdown_ok = self._memory_manager.shutdown_task_worker(
-                        wait=True,
-                        timeout=None,
-                    )
-                if not shutdown_ok:
-                    raise RuntimeError(
-                        "Memory worker stopped before completing all queued tasks"
-                    )
-            finally:
-                self._memory_manager.unregister_task_completion_listener(
-                    self._manager_completion_listener
-                )
-                if self._memory_database is not None:
-                    self._memory_database.close()
+        self._user_activity_tags: List[str] = []
 
     @property
     def manager(self) -> MemoryNodeManager:
@@ -513,11 +104,9 @@ class MemoryRuntime:
         return self._memory_manager
 
     @property
-    def database(self) -> SessionDB:
-        """Return the database used by the owned manager."""
-        if self._memory_database is not None:
-            return self._memory_database
-        return self._memory_manager._db
+    def database(self) -> UserMemoryDB:
+        """Return the shared database injected by the composition root."""
+        return self._memory_database
 
     def accept_memory_input(
         self,
@@ -567,12 +156,12 @@ class MemoryRuntime:
         self,
         value: Any,
         *,
-        evaluate_episode_summary: bool = True,
+        evaluate_user_activity: bool = True,
     ) -> Dict[str, Any]:
         """Advance ambient ASR coverage and process newly released input units."""
         self._memory_context_manager.update_ambient_asr_watermark(value)
         return self._process_awaiting_ambient_units(
-            evaluate_episode_summary=evaluate_episode_summary,
+            evaluate_user_activity=evaluate_user_activity,
         )
 
     def _accept_interaction_memory_input(
@@ -666,8 +255,8 @@ class MemoryRuntime:
                 normalized_segment["text"],
             )
 
-        self._episode_tags = sorted(
-            set(self._episode_tags).union(tags)
+        self._user_activity_tags = sorted(
+            set(self._user_activity_tags).union(tags)
         )
         queued = False
         for normalized_segment in normalized_segments:
@@ -706,7 +295,7 @@ class MemoryRuntime:
                 self._memory_context_manager.awaiting_ambient_unit_count(),
             )
             drain_report = self._process_awaiting_ambient_units(
-                evaluate_episode_summary=True,
+                evaluate_user_activity=True,
             )
             queued = bool(drain_report.get("queued")) or queued
             if not drain_report.get("accepted"):
@@ -720,32 +309,33 @@ class MemoryRuntime:
             "reason": "" if queued else "threshold_not_reached",
         }
 
-    def _trigger_memory_episode_summary(
+    def _trigger_memory_user_activity(
         self,
         *,
         reason: str = "explicit",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Queue one completed source episode after its fact-store batches.
+        """Queue activity observation for the completed source window.
 
-        Callers must first submit the episode's final store batch.  The
-        manager's FIFO queue preserves this ordering without this function
+        Callers must first submit the window's final fact batch. The
+        scheduler's FIFO queue preserves this ordering without this function
         reaching back into runtime input buffers.
         """
-        resolved_tags = list(self._episode_tags if tags is None else tags or [])
+        resolved_tags = list(self._user_activity_tags if tags is None else tags or [])
 
-        if not self._memory_context_manager.has_pending_episode_summary_units():
+        if not self._memory_context_manager.has_pending_user_activity_units():
             return {
                 "queued": False,
-                "reason": "no_pending_episode_summary_units",
+                "reason": "no_pending_user_activity_units",
                 "trigger_reason": reason,
             }
-        report = self._memory_manager.submit_memory_episode_summary_task(
-            tags=resolved_tags,
+        report = self._task_scheduler.submit(
+            "memory_user_activity_extraction",
+            {"tags": resolved_tags},
         )
         if bool(report.get("queued")):
-            self._episode_tags = []
-            self._memory_context_manager.reset_episode_summary_window()
+            self._user_activity_tags = []
+            self._memory_context_manager.reset_user_activity_window()
         report["trigger_reason"] = reason
         return report
 
@@ -754,7 +344,7 @@ class MemoryRuntime:
         unit: MemoryUnit,
         *,
         ambient_recording_enabled: bool,
-        evaluate_episode_summary: bool = True,
+        evaluate_user_activity: bool = True,
     ) -> Dict[str, Any]:
         """Append one normalized input unit to the shared semantic buffer."""
         decision = self._memory_context_manager.insert_incoming_unit(
@@ -763,13 +353,13 @@ class MemoryRuntime:
         )
         return self._handle_memory_fact_task_decision(
             decision=decision,
-            evaluate_episode_summary=evaluate_episode_summary,
+            evaluate_user_activity=evaluate_user_activity,
         )
 
     def _process_awaiting_ambient_units(
         self,
         *,
-        evaluate_episode_summary: bool,
+        evaluate_user_activity: bool,
         force: bool = False,
     ) -> Dict[str, Any]:
         """Process boundary results released after ambient ASR coverage advances."""
@@ -782,7 +372,7 @@ class MemoryRuntime:
         ):
             append_report = self._handle_memory_fact_task_decision(
                 decision=decision,
-                evaluate_episode_summary=evaluate_episode_summary,
+                evaluate_user_activity=evaluate_user_activity,
             )
             queued = bool(append_report.get("queued")) or queued
             if not append_report.get("accepted"):
@@ -803,7 +393,7 @@ class MemoryRuntime:
         self,
         *,
         decision: Any,
-        evaluate_episode_summary: bool,
+        evaluate_user_activity: bool,
     ) -> Dict[str, Any]:
         """Log one boundary and schedule fact extraction for sealed chapters."""
         self._logger.info(
@@ -828,21 +418,21 @@ class MemoryRuntime:
                 "queued": False,
                 "reason": str(store_report.get("reason") or "queue_rejected"),
             }
-        episode_summary_report = None
-        episode_decision = self._memory_context_manager.evaluate_episode_summary_trigger_decision()
-        if evaluate_episode_summary and episode_decision.should_trigger:
-            episode_summary_report = self._trigger_memory_episode_summary(
-                reason=f"episode_{episode_decision.reason}",
+        user_activity_report = None
+        activity_decision = self._memory_context_manager.evaluate_user_activity_trigger_decision()
+        if evaluate_user_activity and activity_decision.should_trigger:
+            user_activity_report = self._trigger_memory_user_activity(
+                reason=f"user_activity_{activity_decision.reason}",
             )
         return {
             "accepted": True,
             "queued": True,
             "reason": (
-                "episode_limit"
-                if bool((episode_summary_report or {}).get("queued"))
+                "user_activity_limit"
+                if bool((user_activity_report or {}).get("queued"))
                 else str(store_report.get("reason") or "")
             ),
-            "episode_summary": episode_summary_report,
+            "user_activity": user_activity_report,
         }
 
     def _log_sealed_memory_input_chapters_for_fact_task(
@@ -908,51 +498,68 @@ class MemoryRuntime:
         reason: str = "explicit_flush",
         tags: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """Finalize tail input, then append episode and derived-task fences."""
+        """Finalize tail input, then append activity and fact follow-up fences."""
         queued = False
         completed_unit = self._transcript_unit_assembler.flush()
         if completed_unit is not None:
             append_report = self._append_memory_input_unit(
                 completed_unit,
                 ambient_recording_enabled=self._transcript_ambient_recording_enabled,
-                evaluate_episode_summary=False,
+                evaluate_user_activity=False,
             )
             queued = bool(append_report.get("queued")) or queued
             if not append_report.get("accepted"):
                 return {
+                    "accepted": False,
                     "queued": queued,
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
         drain_report = self._process_awaiting_ambient_units(
-            evaluate_episode_summary=False,
+            evaluate_user_activity=False,
             force=True,
         )
         queued = bool(drain_report.get("queued")) or queued
         if not drain_report.get("accepted"):
             return {
+                "accepted": False,
                 "queued": queued,
                 "reason": str(drain_report.get("reason") or "queue_rejected"),
             }
         self._memory_context_manager.seal_pending_units(boundary_reason=reason)
         store_report = self._trigger_memory_store_task_for_sealed_memory_input()
-        episode_summary_report = self._trigger_memory_episode_summary(
+        user_activity_report = self._trigger_memory_user_activity(
             reason=reason,
             tags=tags,
         )
-        derived_task_reports = self._derived_task_scheduler.force_drain()
+        fact_followup_dispatch = self._task_scheduler.submit_flush_fact_followup_tasks()
+        submission_reports = [
+            store_report,
+            user_activity_report,
+            fact_followup_dispatch,
+        ]
+        rejected_reasons = {
+            "queue_rejected",
+            "worker_queue_full",
+            "worker_shutdown",
+            "task_handler_not_registered",
+            "memory_disabled",
+            "task_disabled",
+        }
+        accepted = not any(
+            str((task_report or {}).get("reason") or "") in rejected_reasons
+            for task_report in submission_reports
+        )
         return {
+            "accepted": accepted,
             "queued": (
                 bool(store_report.get("queued"))
                 or queued
-                or bool(episode_summary_report.get("queued"))
-                or any(
-                    bool((report or {}).get("queued"))
-                    for report in derived_task_reports.values()
-                )
+                or bool(user_activity_report.get("queued"))
+                or bool(fact_followup_dispatch.get("queued"))
             ),
             "reason": str(store_report.get("reason") or ""),
-            "episode_summary": episode_summary_report,
-            "derived_tasks": derived_task_reports,
+            "user_activity": user_activity_report,
+            "fact_followup_dispatch": fact_followup_dispatch,
         }
 
     def _trigger_memory_store_task_for_sealed_memory_input(
@@ -1008,29 +615,37 @@ class MemoryRuntime:
                 "units": self._memory_units_log_view(canonical_units),
             },
         )
-        queue_report = self._memory_manager.submit_memory_fact_extraction_task(
-            units=canonical_units,
-            preceding_context_units=preceding_context_units,
-            tags=sorted(tags),
-            completion_context=self._memory_store_completion_context(canonical_units),
+        store_completion_context = self._memory_store_completion_context(
+            canonical_units,
+        )
+        queue_report = self._task_scheduler.submit(
+            "memory_fact_extraction",
+            {
+                "units": canonical_units,
+                "preceding_context_units": preceding_context_units,
+                "tags": sorted(tags),
+            },
+            completion_context=store_completion_context,
+            report_payload={"tags": sorted(tags)},
         )
         queued = bool(queue_report.get("queued"))
         if queued:
             self._memory_context_manager.clear_sealed_chapter_buffers()
-            self._episode_tags = sorted(set(self._episode_tags).union(tags))
+            self._user_activity_tags = sorted(set(self._user_activity_tags).union(tags))
             self._memory_context_manager.record_stored_units(
                 canonical_units,
             )
             self._memory_context_manager.record_preceding_context_units(
-                canonical_units,
+                sealed_chapters[-1].units,
             )
             self._logger.info(
-                "memory episode source queued semantic_unit_count=%s "
+                "memory user activity source queued semantic_unit_count=%s "
                 "preceding_context_unit_count=%s",
                 len(canonical_units),
                 len(preceding_context_units),
             )
         return {
+            **queue_report,
             "queued": queued,
             "reason": "" if queued else str(queue_report.get("reason") or "queue_rejected"),
         }
@@ -1063,29 +678,6 @@ class MemoryRuntime:
             )
         self._logger.info("\n%s", body)
 
-    def finalize_memory_session(
-        self,
-        *,
-        reason: str = "explicit_finalize",
-        tags: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        """Append a final store → episode → derived-task FIFO fence.
-
-        This is the lifecycle operation for a frontend session close or an
-        ambient recording stop.  It deliberately does not wait for storage:
-        the manager's single FIFO worker makes every submitted projection see
-        all stores that precede it.
-        """
-        input_flush = self._flush_pending_memory_input_units(
-            reason=reason,
-            tags=tags,
-        )
-        return {
-            "input_flush": input_flush,
-            "episode_summary": dict(input_flush.get("episode_summary") or {}),
-            "derived_tasks": dict(input_flush.get("derived_tasks") or {}),
-        }
-    
     def trigger_memory_recall(
         self,
         query: str,
@@ -1102,27 +694,31 @@ class MemoryRuntime:
 
     def flush_pending_memory_inputs(
         self,
-        timeout: Optional[float] = None,
         *,
+        reason: str = "explicit_input_boundary",
         tags: Optional[List[str]] = None,
-    ) -> bool:
-        """Finalize buffered tail input without waiting for manager tasks."""
+    ) -> Dict[str, Any]:
+        """Submit buffered tail input and its final follow-up tasks.
+
+        This establishes an input boundary but does not wait for queued tasks
+        to finish. Call :meth:`wait_for_memory_tasks` when completion is needed.
+        """
         input_flush_report = self._flush_pending_memory_input_units(
-            reason="explicit_input_boundary",
+            reason=reason,
             tags=tags,
         )
-        return not (
-            not input_flush_report.get("queued")
-            and input_flush_report.get("reason") not in {"", "no_pending_segments"}
-        )
+        return {
+            "accepted": bool(input_flush_report.get("accepted", True)),
+            "input_flush": input_flush_report,
+            "user_activity": dict(input_flush_report.get("user_activity") or {}),
+            "fact_followup_dispatch": dict(
+                input_flush_report.get("fact_followup_dispatch") or {}
+            ),
+        }
 
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         """Wait until all tasks already submitted to the memory manager complete."""
-        return self._memory_manager.flush_task_queue(timeout=timeout)
-
-    def derived_task_scheduler_snapshot(self) -> Dict[str, Any]:
-        """Return runtime-local derived-task scheduling diagnostics."""
-        return self._derived_task_scheduler.snapshot()
+        return self._task_scheduler.flush(timeout=timeout)
 
     @staticmethod
     def _transcript_segment_text(segment: Dict[str, Any]) -> str:
@@ -1312,7 +908,7 @@ class MemoryRuntime:
             entry
             for entry in entries
             if _compact_whitespace(entry.get("speaker") or "")
-            in {"用户本人", "助手"}
+            in {"speaker_用户本人", "speaker_助手"}
         ]
 
     def _iter_time_nearby_transcript_unit_indexes(
@@ -1506,6 +1102,8 @@ class MemoryRuntime:
             or segment.get("speaker_id")
             or "unknown_speaker"
         )
+        if speaker == "speaker_0":
+            speaker = "speaker_用户本人"
         started_at = self._transcript_segment_start_time(segment)
         ended_at = self._transcript_segment_end_time(segment)
         try:

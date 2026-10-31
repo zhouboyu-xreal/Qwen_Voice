@@ -3,8 +3,8 @@
 
 Samples can come from a history_dialogue.json file or from
 PYTHON_TEST_SAMPLES below. Both sources are normalized into the same turn
-stream, fed to MemoryRuntime.accept_single_interaction_turn(), and saved in an isolated
-SessionDB under tmp/ by default. Fact extraction follows the batching interval
+stream, fed to PersonWorldModel.accept_memory_input(), and saved in an isolated
+UserMemoryDB under tmp/ by default. Fact extraction follows the batching interval
 configured in the project-level config.yaml.
 """
 
@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 import numpy as np
 
-import requests
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
@@ -29,14 +28,11 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL,
-    MemoryNodeManager,
-    MemoryOperationReporter,
-)
-from memory.memory_runtime import MemoryRuntime
-from memory.config import split_memory_config
+from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from memory.memory_manager import MemoryNodeManager
+from task_scheduler import TaskOperationReporter
+from pwm_manager import PersonWorldModel
+from config import split_memory_config
 from memory.utils import _as_embedding_vector
 
 
@@ -45,120 +41,6 @@ DEFAULT_OUTPUT_ROOT_DIR = REPO_ROOT / "tmp" / "memory_store_fact_test"
 
 SAMPLE_ID_RE = re.compile(r"(?:^|_)sample(\d+)$")
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-
-class StoreFactExtractionManager(MemoryNodeManager):
-    """Use real retain extraction, but skip unrelated async graph work."""
-
-    def __init__(
-        self,
-        *args: Any,
-        report_rows: List[Dict[str, Any]],
-        llm_max_tokens: int,
-        llm_thinking: str,
-        llm_json_mode: bool,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.report_rows = report_rows
-        self._test_llm_max_tokens = max(1, int(llm_max_tokens))
-        self._test_llm_thinking = str(llm_thinking)
-        self._test_llm_json_mode = bool(llm_json_mode)
-        self._test_llm_call_count = 0
-
-    def _call_llm(self, prompt: str) -> str | None:
-        self._test_llm_call_count += 1
-        call_kind = (
-            "fact_extraction_trigger"
-            if "记忆提炼模块" in prompt or "memory extraction module" in prompt
-            else "state_update"
-            if "state 更新模块" in prompt or "state update module" in prompt
-            else "actionable_item_extraction"
-            if "actionable item 提取模块" in prompt or "actionable-item extraction module" in prompt
-            else "recall_analysis"
-            if "recall query 分析器" in prompt or "recall query analyzer" in prompt
-            else "other"
-        )
-        if (
-            not self._llm_api_key
-            or not self._llm_base_url
-            or str(self._llm_base_url).strip().lower() == "none"
-        ):
-            self._logger.info(
-                "LLM call #%s kind=%s skipped: missing llm_api_key or llm_base_url",
-                self._test_llm_call_count,
-                call_kind,
-            )
-            return None
-        url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self._llm_api_key:
-            headers["Authorization"] = f"Bearer {self._llm_api_key}"
-        payload = {
-            "model": self._llm_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": self._test_llm_max_tokens,
-            "stream": False,
-        }
-        if self._test_llm_thinking != "auto":
-            payload["thinking"] = {"type": self._test_llm_thinking}
-        if self._test_llm_json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        self._logger.info(
-            "LLM call #%s kind=%s model=%s prompt_chars=%s max_tokens=%s "
-            "thinking=%s json_mode=%s",
-            self._test_llm_call_count,
-            call_kind,
-            self._llm_model,
-            len(prompt),
-            self._test_llm_max_tokens,
-            self._test_llm_thinking,
-            self._test_llm_json_mode,
-        )
-        try:
-            response = requests.post(url, json=payload, headers=headers, timeout=self._llm_timeout)
-            response.raise_for_status()
-            response_data = response.json()
-            choices = response_data.get("choices", [])
-            if choices:
-                choice = choices[0]
-                content = choice.get("message", {}).get("content", "") or ""
-                finish_reason = choice.get("finish_reason")
-                self._logger.info(
-                    "LLM result #%s kind=%s finish_reason=%s response_chars=%s usage=%s",
-                    self._test_llm_call_count,
-                    call_kind,
-                    finish_reason,
-                    len(content),
-                    response_data.get("usage"),
-                )
-                # logging.info(
-                #     "LLM raw response #%s kind=%s:\n%s",
-                #     self._test_llm_call_count,
-                #     call_kind,
-                #     content,
-                # )
-                if finish_reason == "length":
-                    self._logger.warning(
-                        "LLM result #%s was truncated; increase --llm-max-tokens",
-                        self._test_llm_call_count,
-                    )
-                return content
-            self._logger.error(
-                "LLM response #%s kind=%s contained no choices: %s",
-                self._test_llm_call_count,
-                call_kind,
-                response_data,
-            )
-        except requests.exceptions.RequestException as exc:
-            self._logger.error("LLM request failed for %s with model %s: %s", url, self._llm_model, exc)
-        except (KeyError, ValueError, TypeError) as exc:
-            self._logger.error("LLM response parse failed for %s with model %s: %s", url, self._llm_model, exc)
-        return ""
-
-    def _start_async_work(self, **kwargs: Any) -> None:
-        return None
-
 
 def strip_jsonc(text: str) -> str:
     """Remove JSONC comments and trailing commas without touching strings."""
@@ -301,9 +183,9 @@ def load_test_turns(
 
 def iter_stored_nodes(db: Any, start_id: int) -> Iterable[Dict[str, Any]]:
     rows = db._conn.execute(
-        """SELECT id, episode_id, source_type, event_time_key, dialogue_time_key, summary, keywords,
+        """SELECT id, event_time_key, dialogue_time_key, summary, keywords,
                   fact_type, entities,
-                  fact_root_topic, fact_aspect_topic,
+                  fact_topic,
                   confidence, importance, metadata, created_at, updated_at
              FROM memory_facts
             WHERE id > ?
@@ -356,7 +238,7 @@ def _expand_env_refs(value: Any) -> Any:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Exercise MemoryRuntime.accept_single_interaction_turn fact extraction against JSON or in-file Python samples."
+        description="Exercise PersonWorldModel fact extraction against JSON or in-file Python samples."
     )
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -429,11 +311,6 @@ def parse_args() -> argparse.Namespace:
             "fact_extraction."
         ),
     )
-    parser.add_argument(
-        "--enable-reflect",
-        action="store_true",
-        help='Enable reflect',
-    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--manager-log-level", default="INFO")
     return parser.parse_args()
@@ -489,8 +366,7 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
 
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
-    _runtime_config, _manager_config = split_memory_config(config)
-    llm_config = _manager_config["llm"]
+    llm_config, _embedding_config, _runtime_config, _scheduling_config, _manager_config, _user_state_config = split_memory_config(config)
     memory_input_config = _runtime_config.get("memory_context_manager")
     if not isinstance(memory_input_config, dict):
         memory_input_config = {}
@@ -671,11 +547,17 @@ def main() -> int:
 
     config = load_project_config(args.config)
     (
+        llm_config,
+        embedding_config,
         memory_runtime_config,
+        task_scheduling_config,
         memory_manager_config,
+        user_state_config,
     ) = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -687,59 +569,69 @@ def main() -> int:
     llm_config["llm_base_url"] = str(args.llm_base_url)
     llm_config["llm_api_key"] = str(args.llm_api_key or "")
     llm_config["llm_timeout"] = args.llm_timeout
+    llm_config["llm_max_tokens"] = args.llm_max_tokens
+    llm_config["llm_thinking"] = args.llm_thinking
+    llm_config["llm_json_mode"] = args.llm_json_mode
     memory_manager_config["enable_entity_extraction"] = False
     memory_log_path = args.output_dir / "memory_manager.log"
     memory_logger, memory_log_handler = configure_memory_logger(
         memory_log_path,
         args.manager_log_level,
     )
-    operation_reporter = MemoryOperationReporter()
-    runtime = MemoryRuntime(
-        db_path=db_path,
+    operation_reporter = TaskOperationReporter()
+    pwm = PersonWorldModel(
         memory_runtime_config=memory_runtime_config,
         memory_manager_config=memory_manager_config,
+        user_state_config=user_state_config,
+        llm_model_config=llm_config,
+        embedding_model_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
         operation_reporter=operation_reporter,
         logger=memory_logger,
     )
-    db = runtime.database
-    manager = runtime.manager
+    db = pwm.database
+    manager = pwm.memory_manager
     try:
         validate_embedding_runtime(manager, db, embedding_config)
         log_memory_index_state(db, "initialized")
     except Exception:
-        runtime.close()
+        pwm.close()
         close_memory_logger(memory_logger, memory_log_handler)
         raise
 
     stored_turns = 0
     stored_facts = 0
-    reflect_runs = 0
     base_turn_timestamp = datetime.now().astimezone()
+    has_unfinalized_turns = False
     try:
         with report_path.open("w", encoding="utf-8") as report:
             for local_index, (sample_id, turn_index, user, assistant, hour_offset, is_last_turn) in enumerate(turns):
                 flat_index = args.start + local_index
-                # Keep sample-level spacing at one hour for reflect tests, while
+                # Keep sample-level spacing at one hour, while
                 # giving each turn a unique timestamp so dialogue-time ordering
                 # does not collide on "#00" across turns in the same sample.
                 turn_timestamp = base_turn_timestamp + timedelta(hours=hour_offset, seconds=turn_index)
                 before_id = db._conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM memory_facts").fetchone()["max_id"]
-                pending_before = runtime.get_pending_interaction_turns()
-                pending_with_current = pending_before + [{
-                    "user_message": user,
-                    "assistant_response": assistant,
-                }]
-                ok = runtime.accept_single_interaction_turn(
-                    user,
-                    assistant,
+                ok = pwm.accept_memory_input(
+                    interaction_turn={
+                        "user_message": user,
+                        "assistant_response": assistant,
+                        "turn_timestamp": turn_timestamp,
+                    },
                     tags=["store_fact_test", f"sample:{sample_id}", f"turn:{turn_index}"],
-                    turn_timestamp=turn_timestamp,
                 )
-                if ok.get("queued") and not runtime.flush_pending_memory_inputs():
-                    raise RuntimeError("Timed out while draining queued memory stores")
+                has_unfinalized_turns = True
+                if is_last_turn:
+                    pwm.finalize_memory_session(
+                        reason="store_fact_sample_complete",
+                        tags=["store_fact_test", f"sample:{sample_id}"],
+                    )
+                    has_unfinalized_turns = False
+                if not pwm.wait_for_memory_tasks():
+                    raise RuntimeError("Timed out while draining queued memory tasks")
                 nodes = list(iter_stored_nodes(db, before_id))
                 store_operation_report = operation_reporter.latest_report("memory_fact_extraction")
-                if ok.get("queued"):
+                if nodes:
                     stored_turns += 1
                     stored_facts += len(nodes)
                 row = {
@@ -750,7 +642,6 @@ def main() -> int:
                     "sample_hour_offset": hour_offset,
                     "turn_second_offset": turn_index,
                     "turn_timestamp": turn_timestamp.isoformat(),
-                    "pending_turn_count": len(runtime.get_pending_interaction_turns()),
                     "queued": bool(ok.get("queued")),
                     "store_total_elapsed_ms": float(
                         store_operation_report.get("elapsed_ms") or 0.0
@@ -764,63 +655,36 @@ def main() -> int:
                 report.flush()
                 logging.info(
                     "[%s/%s] %s turn=%s "
-                    "pending=%s stored=%s facts=%s",
+                    "submit_report=%s facts=%s",
                     flat_index - args.start + 1,
                     len(turns),
                     sample_id,
                     turn_index,
-                    len(runtime.get_pending_interaction_turns()),
                     ok,
                     len(nodes),
                 )
-                
-                if args.enable_reflect and is_last_turn:
-                    log_memory_index_state(db, f"before_reflect:{sample_id}")
-                    logging.info(
-                        "Running reflect after sample %s",
-                        sample_id,
-                    )
-                    reflect_submit = runtime.trigger_memory_reflect(
-                        reflect_timestamp=turn_timestamp,
-                    )
-                    if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
-                        raise RuntimeError("Timed out while draining queued memory reflect")
-                    reflect_report = (
-                        operation_reporter.latest_report("memory_reflect")
-                        or reflect_submit
-                    )
-                    reflect_row = {
-                        "event": "memory_reflect",
-                        "after_sample_id": sample_id,
-                        "after_flat_index": flat_index,
-                        "report": reflect_report,
-                        "submit_report": reflect_submit,
-                    }
-                    report.write(json.dumps(reflect_row, ensure_ascii=False, default=str) + "\n")
-                    report.flush()
-                    logging.info(
-                        "Reflect after %s states_updated=%s actionable_items_updated=%s",
-                        sample_id,
-                        reflect_report.get("states_updated"),
-                        reflect_report.get("actionable_items_updated"),
-                    )
-        pending_before_final_flush = len(runtime.get_pending_interaction_turns())
-        if not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining final pending memory stores")
-        logging.info(
-            "Final memory runtime flush completed pending_before=%s pending_after=%s",
-            pending_before_final_flush,
-            len(runtime.get_pending_interaction_turns()),
-        )
+        if has_unfinalized_turns:
+            pwm.finalize_memory_session(reason="store_fact_test_complete")
+            if not pwm.wait_for_memory_tasks():
+                raise RuntimeError("Timed out while draining final memory tasks")
     finally:
         log_memory_index_state(db, "finished")
-        runtime.close()
+        pwm.close()
         close_memory_logger(memory_logger, memory_log_handler)
 
     memory_operation_report = operation_reporter.snapshot()
     operation_counts = memory_operation_report.get("counts") or {}
     store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-    reflect_operation_report = operation_counts.get("memory_reflect") or {}
+    post_store_reports = [
+        operation_counts.get(kind) or {}
+        for kind in (
+            "memory_user_claim_update",
+            "memory_user_intent_update",
+            "user_state_update_from_user_claims",
+            "user_state_update_from_user_threads",
+            "user_state_update_from_user_observed_patterns",
+        )
+    ]
     summary = {
         "sample_source": args.sample_source,
         "input": str(args.input) if args.sample_source == "json" else "PYTHON_TEST_SAMPLES",
@@ -833,14 +697,15 @@ def main() -> int:
         "turns_processed": len(turns),
         "turns_with_facts": stored_turns,
         "facts_stored": stored_facts,
-        "max_pending_interaction_turns": runtime._interaction_segmenter.config.max_pending_turns,
-        "max_pending_interaction_tokens": runtime._interaction_segmenter.config.max_pending_tokens,
-        "pending_turns": len(runtime.get_pending_interaction_turns()),
-        "store_episode_submitted": int(store_operation_report.get("submitted") or 0),
-        "store_episode_succeeded": int(store_operation_report.get("succeeded") or 0),
+        "max_pending_interaction_turns": args.max_pending_interaction_turns,
+        "max_pending_interaction_tokens": args.max_pending_interaction_tokens,
+        "fact_tasks_submitted": int(store_operation_report.get("submitted") or 0),
+        "fact_tasks_succeeded": int(store_operation_report.get("succeeded") or 0),
         "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-        "reflect_runs": int(reflect_operation_report.get("submitted") or 0),
-        "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
+        "post_store_task_runs": sum(int(item.get("submitted") or 0) for item in post_store_reports),
+        "post_store_total_elapsed_ms": sum(
+            float(item.get("total_elapsed_ms") or 0.0) for item in post_store_reports
+        ),
         "llm_model": args.llm_model,
         "llm_base_url": args.llm_base_url,
         "llm_max_tokens": args.llm_max_tokens,

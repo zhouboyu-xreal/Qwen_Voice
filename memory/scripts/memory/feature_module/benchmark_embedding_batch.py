@@ -1,28 +1,32 @@
 #!/usr/bin/env python3
 """Compare single-text and batch embedding latency.
 
-The benchmark intentionally uses the public EmbeddingClient methods. It also
-makes the current implementation visible: if embed_batch internally loops over
-embed_text, its measured latency will be close to the single request loop until
-a real provider-side batch request is implemented.
+Use the same texts and public EmbeddingClient methods as Runtime, without
+starting PWM, extracting facts or modifying memory databases. Timings include
+the client's HTTP and vector normalization work. Failed or inconsistent vectors
+must not be reported as a successful latency improvement.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
+import statistics
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config  # noqa: E402
-from memory.embedding_client import EmbeddingClient  # noqa: E402
+from config import split_memory_config  # noqa: E402
+from embedding_client import EmbeddingClient  # noqa: E402
 
 
 DEFAULT_TEXTS = [
@@ -34,7 +38,7 @@ DEFAULT_TEXTS = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark EmbeddingClient single and batch embedding latency."
     )
@@ -64,28 +68,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--runs",
         type=int,
-        default=1,
+        default=3,
         help="Number of single and batch measurements to run.",
     )
+    parser.add_argument("--batch-size", type=int,
+                        help="Override embedding_model.batch_size (provider inputs per HTTP request).")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="Unmeasured warmup calls per mode, each using one text; 0 disables warmup.")
+    parser.add_argument("--min-cosine", type=float, default=0.999,
+                        help="Minimum same-position single/batch cosine similarity (default: 0.999).")
     parser.add_argument(
         "--output",
         type=Path,
         help="Optional JSON output path.",
     )
-    return parser.parse_args()
-
-
-def load_config(path: Path) -> Dict[str, Any]:
-    try:
-        import yaml
-    except ImportError as exc:  # pragma: no cover - environment dependent
-        raise RuntimeError("PyYAML is required to load config.yaml") from exc
-    loaded = yaml.safe_load(
-        path.expanduser().resolve().read_text(encoding="utf-8")
-    ) or {}
-    if not isinstance(loaded, dict):
-        raise ValueError("config.yaml must contain a mapping at the top level")
-    return loaded
+    args = parser.parse_args(argv)
+    if args.count <= 0 or args.runs <= 0:
+        parser.error("--count and --runs must be positive")
+    if args.batch_size is not None and args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.warmup < 0:
+        parser.error("--warmup must be nonnegative")
+    if not math.isfinite(args.min_cosine) or not 0 <= args.min_cosine <= 1:
+        parser.error("--min-cosine must be between 0 and 1")
+    return args
 
 
 def load_texts(args: argparse.Namespace) -> List[str]:
@@ -115,38 +121,65 @@ def _elapsed_ms(started_at: float) -> float:
     return round((time.perf_counter() - started_at) * 1000, 3)
 
 
-def benchmark_single(
-    client: EmbeddingClient,
-    texts: Sequence[str],
-) -> Dict[str, Any]:
-    started_at = time.perf_counter()
-    vectors = [client.embed_text(text) for text in texts]
-    elapsed_ms = _elapsed_ms(started_at)
-    valid_count = sum(vector is not None for vector in vectors)
-    return {
-        "elapsed_ms": elapsed_ms,
-        "text_count": len(texts),
-        "valid_vector_count": valid_count,
-        "none_vector_count": len(texts) - valid_count,
-        "average_ms_per_text": round(elapsed_ms / max(1, len(texts)), 3),
-    }
+def _valid_vector(vector: Any, dimension: int) -> bool:
+    if vector is None:
+        return False
+    try:
+        values = np.asarray(vector, dtype=np.float64).reshape(-1)
+        return bool(values.size == dimension and np.isfinite(values).all()
+                    and np.linalg.norm(values) > 0)
+    except (TypeError, ValueError):
+        return False
 
 
-def benchmark_batch(
-    client: EmbeddingClient,
-    texts: Sequence[str],
+def _measurement(
+    client: EmbeddingClient, texts: Sequence[str], vectors: Sequence[Any], elapsed_ms: float,
 ) -> Dict[str, Any]:
-    started_at = time.perf_counter()
-    vectors = client.embed_batch(texts)
-    elapsed_ms = _elapsed_ms(started_at)
-    valid_count = sum(vector is not None for vector in vectors)
+    valid_count = sum(_valid_vector(vector, client.dimension) for vector in vectors)
     return {
         "elapsed_ms": elapsed_ms,
         "text_count": len(texts),
         "returned_vector_count": len(vectors),
         "valid_vector_count": valid_count,
-        "none_vector_count": len(texts) - valid_count,
+        "missing_or_invalid_vector_count": max(0, len(texts) - valid_count),
+        "succeeded": len(vectors) == len(texts) and valid_count == len(texts),
         "average_ms_per_text": round(elapsed_ms / max(1, len(texts)), 3),
+        "texts_per_second": round(len(texts) * 1000 / elapsed_ms, 3) if elapsed_ms else None,
+    }
+
+
+def benchmark_single(client: EmbeddingClient, texts: Sequence[str]) -> tuple[Dict[str, Any], List[Any]]:
+    started_at = time.perf_counter()
+    vectors = [client.embed_text(text) for text in texts]
+    elapsed_ms = _elapsed_ms(started_at)
+    return _measurement(client, texts, vectors, elapsed_ms), vectors
+
+
+def benchmark_batch(client: EmbeddingClient, texts: Sequence[str]) -> tuple[Dict[str, Any], List[Any]]:
+    started_at = time.perf_counter()
+    vectors = client.embed_batch(texts)
+    elapsed_ms = _elapsed_ms(started_at)
+    return _measurement(client, texts, vectors, elapsed_ms), vectors
+
+
+def compare_vectors(single: Sequence[Any], batch: Sequence[Any], dimension: int,
+                    min_cosine: float) -> Dict[str, Any]:
+    similarities: List[float] = []
+    differences: List[float] = []
+    for left, right in zip(single, batch):
+        if not _valid_vector(left, dimension) or not _valid_vector(right, dimension):
+            continue
+        a = np.asarray(left, dtype=np.float64).reshape(-1)
+        b = np.asarray(right, dtype=np.float64).reshape(-1)
+        similarity = float(np.sum((a / np.linalg.norm(a)) * (b / np.linalg.norm(b))))
+        similarities.append(float(np.clip(similarity, -1, 1)))
+        differences.append(float(np.max(np.abs(a - b))))
+    return {
+        "compared_vector_count": len(similarities),
+        "minimum_cosine_similarity": min(similarities) if similarities else None,
+        "maximum_absolute_difference": max(differences) if differences else None,
+        "succeeded": bool(single) and len(single) == len(batch) == len(similarities)
+                     and min(similarities) >= min_cosine,
     }
 
 
@@ -156,48 +189,78 @@ def average(values: Sequence[float]) -> Optional[float]:
     return round(sum(values) / len(values), 3)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = parse_args(argv)
     config_path = args.config.expanduser().resolve()
-    config = load_config(config_path)
-    _, memory_manager_config = split_memory_config(config)
-    embedding_config = memory_manager_config.get("embedding") or {}
-    if not isinstance(embedding_config, dict):
-        raise ValueError("memory_manager.embedding must be a mapping")
+    embedding_config = dict(split_memory_config(config_path).embedding_model)
+    if args.batch_size is not None:
+        embedding_config["batch_size"] = args.batch_size
+    batch_size = max(1, int(embedding_config.get("batch_size") or 32))
 
     texts = load_texts(args)
     client = EmbeddingClient(dict(embedding_config))
+    if embedding_config.get("enabled") is False or client._provider != "openai" or not client._api_key:
+        raise ValueError("Benchmark requires enabled OpenAI-compatible embeddings and a configured API key")
+    for _ in range(args.warmup):
+        for measure in (benchmark_single, benchmark_batch):
+            measurement, _vectors = measure(client, texts[:1])
+            if not measurement["succeeded"]:
+                raise RuntimeError("Embedding warmup failed; no latency comparison is valid")
     single_runs: List[Dict[str, Any]] = []
     batch_runs: List[Dict[str, Any]] = []
-    for _ in range(args.runs):
-        single_runs.append(benchmark_single(client, texts))
-        batch_runs.append(benchmark_batch(client, texts))
+    comparisons: List[Dict[str, Any]] = []
+    for index in range(args.runs):
+        order = ("single", "batch") if index % 2 == 0 else ("batch", "single")
+        vectors_by_mode = {}
+        for mode in order:
+            measure = benchmark_single if mode == "single" else benchmark_batch
+            measurement, vectors_by_mode[mode] = measure(client, texts)
+            measurement.update(run=index + 1, execution_order=list(order))
+            (single_runs if mode == "single" else batch_runs).append(measurement)
+            print(f"run={index + 1} mode={mode} elapsed_ms={measurement['elapsed_ms']} "
+                  f"valid={measurement['valid_vector_count']}/{len(texts)}", file=sys.stderr)
+        comparisons.append(compare_vectors(vectors_by_mode["single"], vectors_by_mode["batch"],
+                                           client.dimension, args.min_cosine))
 
     single_average_ms = average([item["elapsed_ms"] for item in single_runs])
     batch_average_ms = average([item["elapsed_ms"] for item in batch_runs])
     speedup: Optional[float] = None
-    if single_average_ms is not None and batch_average_ms and batch_average_ms > 0:
+    succeeded = all(item["succeeded"] for item in [*single_runs, *batch_runs, *comparisons])
+    if succeeded and single_average_ms is not None and batch_average_ms and batch_average_ms > 0:
         speedup = round(single_average_ms / batch_average_ms, 3)
 
     result = {
+        "status": "ok" if succeeded else "failed",
         "config_path": str(config_path),
         "provider": embedding_config.get("provider"),
         "model": embedding_config.get("model"),
         "dimensions": embedding_config.get("dimensions"),
         "text_count": len(texts),
         "runs": args.runs,
+        "batch_size": batch_size,
+        "warmup_calls_per_mode": args.warmup,
+        "input_character_count": sum(len(text) for text in texts),
+        "expected_http_requests_per_run": {
+            "single": len(texts), "batch": math.ceil(len(texts) / batch_size),
+        },
         "single": {
             "runs": single_runs,
             "average_total_elapsed_ms": single_average_ms,
+            "median_total_elapsed_ms": statistics.median(item["elapsed_ms"] for item in single_runs),
         },
         "batch": {
             "runs": batch_runs,
             "average_total_elapsed_ms": batch_average_ms,
+            "median_total_elapsed_ms": statistics.median(item["elapsed_ms"] for item in batch_runs),
         },
+        "vector_comparisons": comparisons,
         "batch_speedup_vs_single": speedup,
         "note": (
-            "A speedup close to 1.0 means embed_batch is still executing "
-            "one embed_text call per input, or the provider/network is the bottleneck."
+            "Both modes use the same input order and EmbeddingClient HTTP behavior; "
+            "there is no concurrency or persistent-session optimization. Warmup is excluded. "
+            "Average per-text batch latency is amortized cost, not time to the first available vector. "
+            "Speedup is omitted on any failure or vector mismatch. Provider/network variance "
+            "can affect results; vector agreement alone does not prove fact-extraction quality."
         ),
     }
     serialized = json.dumps(result, ensure_ascii=False, indent=2)
@@ -206,7 +269,7 @@ def main() -> int:
         output_path = args.output.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(serialized + "\n", encoding="utf-8")
-    return 0
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":

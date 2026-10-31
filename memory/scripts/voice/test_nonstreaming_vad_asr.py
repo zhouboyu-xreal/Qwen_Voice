@@ -15,7 +15,7 @@ for import_root in (SRC_ROOT, ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.config import split_memory_config  # noqa: E402
+from config import load_voice_runtime_config  # noqa: E402
 from voice.voice_runtime import VoiceRuntime  # noqa: E402
 
 
@@ -136,10 +136,7 @@ def main() -> None:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(config, dict):
         raise ValueError(f"Expected YAML mapping in config file: {config_path}")
-    _, _, voice_runtime_config = split_memory_config(
-        config,
-        include_voice_runtime=True,
-    )
+    voice_runtime_config = load_voice_runtime_config(config)
     _configure_speaker_reference_paths(
         voice_runtime_config,
         state_dir=args.state_dir,

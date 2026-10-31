@@ -4,9 +4,9 @@
 The public surface mirrors the current project's `MemoryNodeManager`, but the
 internal model is deliberately unified:
 
-1. Submitted source units are organized into `memory_episodes`.
-2. Extracted evidence becomes narrative `memory_facts`.
-3. Traceable explicit and inductive propositions live in entity claims.
+1. Submitted source units become narrative `memory_facts`.
+2. Longer source windows and their facts yield grounded user-activity observations.
+3. Explicit and derived propositions live in user claims; repeated action patterns live separately.
 4. The legacy actionable-item projection is temporarily disabled while the
    intent and work-item layer is redesigned.
 
@@ -14,61 +14,69 @@ internal model is deliberately unified:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
-import os
-import queue
 import re
-import threading
+import sqlite3
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-import requests
 
 try:
     import jieba
 except ImportError:  # pragma: no cover - exercised only in minimal installs
     jieba = None
 
-from .embedding_client import EmbeddingClient
-from .memory_database import SessionDB
+from embedding_client import EmbeddingClient
+from llm_client import LLMClient
+from .memory_database import UserMemoryDB
 from .memory_types import MemoryUnit
-from .prompts_en import (
-    DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
-    ENTITY_CLAIM_RECONCILIATION_PROMPT_EN,
-    EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
-    INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN,
+from .user_thread_updater import UserThreadUpdater
+from task_scheduler import TaskScheduler
+from prompts_en import (
+    DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN,
+    USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN,
+    USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN,
+    USER_CLAIM_RECONCILIATION_PROMPT_EN,
+    EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN,
+    USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN,
     INTENT_EXTRACTION_PROMPT_EN,
+    INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN,
     INTENT_RECONCILIATION_PROMPT_EN,
-    EPISODE_SUMMARY_PROMPT_EN,
+    USER_ACTIVITY_EXTRACTION_PROMPT_EN,
     MEMORY_RETRIEVED_FORMAT_PROMPT_EN,
     MEMORY_RETRIEVED_SECTION_SPECS_EN,
     RECALL_QUERY_ANALYSIS_PROMPT_EN,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_EN,
 )
-from .prompts_zh import (
-    DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
-    ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH,
-    EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
-    INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH,
+from prompts_zh import (
+    DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH,
+    USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH,
+    USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH,
+    USER_CLAIM_RECONCILIATION_PROMPT_ZH,
+    EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH,
+    USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH,
     INTENT_EXTRACTION_PROMPT_ZH,
+    INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH,
     INTENT_RECONCILIATION_PROMPT_ZH,
-    EPISODE_SUMMARY_PROMPT_ZH,
+    USER_ACTIVITY_EXTRACTION_PROMPT_ZH,
     MEMORY_RETRIEVED_FORMAT_PROMPT_ZH,
     MEMORY_RETRIEVED_SECTION_SPECS_ZH,
     RECALL_QUERY_ANALYSIS_PROMPT_ZH,
     UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH,
 )
 from .utils import _cal_embedding_cosine_similarity
+from .user_action_similarity import action_lexical_similarity
+from user_model import UserStateResolver
 
 RecallTimeBounds = Optional[Tuple[Optional[str], Optional[str]]]
 
-DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
-DEFAULT_LLM_MODEL = "deepseek-v4-flash"
+_PRIMARY_DOMAINS = UserStateResolver.STATE_DOMAINS
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with",
@@ -165,260 +173,6 @@ def _compact_whitespace(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-class MemoryOperationReporter:
-    """Collect asynchronous memory operation results for benchmark callers."""
-
-    def __init__(self, *, recent_task_limit: int = 200) -> None:
-        self._lock = threading.Lock()
-        self._task_seq = 0
-        self._recent_task_limit = max(1, int(recent_task_limit or 200))
-        self._counts: Dict[str, Dict[str, Any]] = {}
-        self._latest_reports: Dict[str, Dict[str, Any]] = {}
-        self._recent_tasks: List[Dict[str, Any]] = []
-
-    @staticmethod
-    def _empty_counts() -> Dict[str, Any]:
-        return {
-            "submitted": 0,
-            "completed": 0,
-            "succeeded": 0,
-            "failed": 0,
-            "rejected": 0,
-            "inflight": 0,
-            "total_elapsed_ms": 0.0,
-        }
-
-    def next_task_id(self, operation_type: str) -> str:
-        clean_type = str(operation_type or "memory_task").strip() or "memory_task"
-        with self._lock:
-            self._task_seq += 1
-            return f"{clean_type}-{self._task_seq}"
-
-    def on_task_submitted(
-        self,
-        *,
-        operation_type: str,
-        task_id: str,
-        payload: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        safe_payload = self._json_compatible(payload or {})
-        with self._lock:
-            counts = self._counts.setdefault(operation_type, self._empty_counts())
-            counts["submitted"] += 1
-            counts["inflight"] += 1
-            self._append_recent_locked({
-                "event": "submitted",
-                "operation_type": operation_type,
-                "task_id": task_id,
-                "payload": safe_payload,
-                "timestamp": _now_text(),
-            })
-
-    def on_task_rejected(
-        self,
-        *,
-        operation_type: str,
-        task_id: str,
-        reason: str,
-    ) -> None:
-        report = {
-            "accepted": False,
-            "status": "rejected",
-            "reason": reason,
-            "task_id": task_id,
-        }
-        with self._lock:
-            counts = self._counts.setdefault(operation_type, self._empty_counts())
-            counts["rejected"] += 1
-            self._latest_reports[operation_type] = dict(report)
-            self._append_recent_locked({
-                "event": "rejected",
-                "operation_type": operation_type,
-                "task_id": task_id,
-                "reason": reason,
-                "timestamp": _now_text(),
-            })
-
-    def on_task_finished(
-        self,
-        *,
-        operation_type: str,
-        task_id: str,
-        started_at: float,
-        result: Any = None,
-        error: Optional[BaseException] = None,
-    ) -> None:
-        elapsed_ms = round((time.monotonic() - started_at) * 1000, 2)
-        succeeded = error is None and self._operation_succeeded(operation_type, result)
-        report = self._operation_result_report(
-            operation_type=operation_type,
-            task_id=task_id,
-            result=result,
-            error=error,
-            succeeded=succeeded,
-            elapsed_ms=elapsed_ms,
-        )
-        with self._lock:
-            counts = self._counts.setdefault(operation_type, self._empty_counts())
-            counts["completed"] += 1
-            counts["inflight"] = max(0, int(counts.get("inflight") or 0) - 1)
-            counts["total_elapsed_ms"] = round(
-                float(counts.get("total_elapsed_ms") or 0.0) + elapsed_ms,
-                2,
-            )
-            counts["succeeded" if succeeded else "failed"] += 1
-            self._latest_reports[operation_type] = dict(report)
-            recent_event = {
-                "event": "finished",
-                "operation_type": operation_type,
-                "task_id": task_id,
-                "status": report.get("status"),
-                "succeeded": succeeded,
-                "elapsed_ms": elapsed_ms,
-                "timestamp": _now_text(),
-            }
-            if error is not None:
-                recent_event["error"] = str(error)
-                recent_event["error_type"] = type(error).__name__
-            self._append_recent_locked(recent_event)
-
-    def on_recall_finished(self, report: Dict[str, Any]) -> None:
-        elapsed_ms = float(report.get("elapsed_ms") or 0.0)
-        status = str(report.get("status") or "").strip().lower()
-        succeeded = status not in {"error", "failed"}
-        recall_report = {
-            key: value
-            for key, value in report.items()
-            if key != "memory_context"
-        }
-        with self._lock:
-            counts = self._counts.setdefault("recall", self._empty_counts())
-            counts["submitted"] += 1
-            counts["completed"] += 1
-            counts["total_elapsed_ms"] = round(
-                float(counts.get("total_elapsed_ms") or 0.0) + elapsed_ms,
-                2,
-            )
-            counts["succeeded" if succeeded else "failed"] += 1
-            self._latest_reports["recall"] = recall_report
-            self._append_recent_locked({
-                "event": "finished",
-                "operation_type": "recall",
-                "task_id": f"recall-{counts['completed']}",
-                "status": recall_report.get("status"),
-                "actual_recall_mode": recall_report.get("actual_recall_mode"),
-                "elapsed_ms": elapsed_ms,
-                "timestamp": _now_text(),
-            })
-
-    def operation_report(self, operation_type: str) -> Dict[str, Any]:
-        with self._lock:
-            counts = dict(
-                self._counts.get(operation_type) or self._empty_counts()
-            )
-            latest = self._latest_reports.get(operation_type)
-        if latest:
-            counts["latest_report"] = dict(latest)
-        return counts
-
-    def latest_report(self, operation_type: str) -> Dict[str, Any]:
-        with self._lock:
-            return dict(self._latest_reports.get(operation_type) or {})
-
-    def snapshot(self) -> Dict[str, Any]:
-        with self._lock:
-            return {
-                "counts": {
-                    key: dict(value)
-                    for key, value in self._counts.items()
-                },
-                "latest_reports": {
-                    key: dict(value)
-                    for key, value in self._latest_reports.items()
-                },
-                "recent_tasks": [dict(item) for item in self._recent_tasks],
-            }
-
-    def _append_recent_locked(self, event: Dict[str, Any]) -> None:
-        self._recent_tasks.append(event)
-        if len(self._recent_tasks) > self._recent_task_limit:
-            del self._recent_tasks[: len(self._recent_tasks) - self._recent_task_limit]
-
-    @classmethod
-    def _json_compatible(cls, value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, datetime):
-            return _to_timestamp_text(value)
-        if isinstance(value, dict):
-            return {
-                str(key): cls._json_compatible(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, (list, tuple)):
-            return [cls._json_compatible(item) for item in value]
-        return str(value)
-
-    @staticmethod
-    def _operation_succeeded(operation_type: str, result: Any) -> bool:
-        failure_statuses = {
-            "failed",
-            "skipped",
-            "error",
-            "queue_rejected",
-        }
-        if operation_type == "memory_fact_extraction":
-            if not isinstance(result, dict):
-                return bool(result)
-            return (
-                str(result.get("status") or "ok").strip().lower()
-                not in failure_statuses
-            )
-        if operation_type in {
-            "memory_episode_summary",
-            "memory_entity_claim_update",
-            "memory_future_commitment_update",
-        }:
-            if not isinstance(result, dict):
-                return False
-            return (
-                str(result.get("status") or "ok").strip().lower()
-                not in failure_statuses
-            )
-        return True
-
-    @staticmethod
-    def _operation_result_report(
-        *,
-        operation_type: str,
-        task_id: str,
-        result: Any,
-        error: Optional[BaseException],
-        succeeded: bool,
-        elapsed_ms: float,
-    ) -> Dict[str, Any]:
-        if isinstance(result, dict):
-            report = dict(result)
-        else:
-            report = {"result": result}
-        result_status = str(report.get("status") or "").strip().lower()
-        report.update({
-            "accepted": True,
-            "task_id": task_id,
-            "operation_type": operation_type,
-            "status": (
-                "failed"
-                if error is not None or not succeeded
-                else (result_status or "ok")
-            ),
-            "total_elapsed_ms": elapsed_ms,
-        })
-        if operation_type in {"memory_fact_extraction", "memory_episode_summary"}:
-            report["stored"] = bool(succeeded and error is None)
-        if error is not None:
-            report["error_type"] = type(error).__name__
-            report["error"] = str(error)
-        return report
 
 
 class MemoryNodeManager:
@@ -426,53 +180,30 @@ class MemoryNodeManager:
 
     def __init__(
         self,
-        db: SessionDB,
+        db: UserMemoryDB,
         *,
         embedding_config: Optional[Dict[str, Any]] = None,
         memory_manager_config: Optional[Dict[str, Any]] = None,
-        operation_reporter: Optional[MemoryOperationReporter] = None,
+        task_scheduler: TaskScheduler,
+        llm_client: LLMClient,
         logger: Optional[logging.Logger] = None,
     ) -> None:
         self._db = db
         self._logger = logger or logging.getLogger(__name__)
-        self._operation_reporter = operation_reporter or MemoryOperationReporter()
+        self._operation_reporter = task_scheduler.operation_reporter
+        self._task_scheduler = task_scheduler
+        self._llm_client = llm_client
         self._memory_cfg = dict(memory_manager_config or {})
         configured_embedding = self._memory_cfg.get("embedding")
         self._embedding_cfg = dict(
             embedding_config
             or (configured_embedding if isinstance(configured_embedding, dict) else {})
         )
-        configured_llm = self._memory_cfg.get("llm")
-        self._llm_cfg = dict(
-            configured_llm if isinstance(configured_llm, dict) else {}
-        )
-        self._llm_model = str(self._llm_cfg.get("llm_name") or DEFAULT_LLM_MODEL)
-        self._llm_base_url = self._normalize_llm_base_url(
-            str(self._llm_cfg.get("llm_base_url") or DEFAULT_LLM_BASE_URL)
-        )
-        self._llm_api_key = self._resolve_env(self._llm_cfg.get("llm_api_key"))
-        self._llm_timeout = int(self._llm_cfg.get("llm_timeout", 120) or 120)
-        self._llm_json_mode = self._config_bool(
-            self._llm_cfg.get("llm_json_mode", True),
-            True,
-        )
-        self._llm_thinking = str(
-            self._llm_cfg.get("llm_thinking", "disabled") or "disabled"
-        )
         self._memory_prompt_language = str(
             self._memory_cfg.get("memory_prompt_language_mode")
-            or self._memory_cfg.get("prompt_language_mode")
             or "source"
         )
         self._memory_enabled = bool(self._memory_cfg.get("memory_enabled", True))
-        self._enable_memory_entity_claim_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_entity_claim_update", True),
-            True,
-        )
-        self._enable_memory_future_commitment_update = self._config_bool(
-            self._memory_cfg.get("enable_memory_future_commitment_update", True),
-            True,
-        )
         configured_world_owner_name = _compact_whitespace(
             self._memory_cfg.get("world_owner_entity_name") or ""
         )
@@ -485,56 +216,58 @@ class MemoryNodeManager:
         self._world_owner_entity_name = (
             configured_world_owner_name or "用户本人"
         )
-        self._entity_claim_explicit_min_confidence = self._clamp_float(
-            self._memory_cfg.get("entity_claim_explicit_min_confidence"),
+        self._user_claim_explicit_min_confidence = self._clamp_float(
+            self._memory_cfg.get("user_claim_explicit_min_confidence"),
             0.0,
             1.0,
             0.72,
         )
-        self._entity_claim_derived_min_confidence = self._clamp_float(
-            self._memory_cfg.get("entity_claim_derived_min_confidence"),
+        self._user_claim_derived_min_confidence = self._clamp_float(
+            self._memory_cfg.get("user_claim_derived_min_confidence"),
             0.0,
             1.0,
             0.75,
         )
-        self._entity_claim_induction_min_support_facts = max(
+        self._user_observed_pattern_min_support_signals = max(
             3,
             int(
                 self._memory_cfg.get(
-                    "entity_claim_induction_min_support_facts", 3,
+                    "user_observed_pattern_min_support_signals", 3,
                 ) or 3
             ),
         )
-        self._entity_claim_induction_min_episodes = max(
-            3,
-            int(self._memory_cfg.get("entity_claim_induction_min_episodes", 3) or 3),
-        )
-        self._entity_claim_induction_min_time_windows = max(
-            2,
-            int(self._memory_cfg.get("entity_claim_induction_min_time_windows", 2) or 2),
-        )
-        self._entity_claim_induction_evidence_limit = max(
-            self._entity_claim_induction_min_support_facts,
-            int(self._memory_cfg.get("entity_claim_induction_evidence_limit", 16) or 16),
+        self._user_observed_pattern_signal_limit = max(
+            self._user_observed_pattern_min_support_signals,
+            int(self._memory_cfg.get("user_observed_pattern_signal_limit", 32) or 32),
         )
         self._initialize_recall_config()
         self._embedding_client: Optional[EmbeddingClient] = None
-        self._task_queue_maxsize = max(
-            1,
-            int(self._memory_cfg.get("task_queue_maxsize", 100) or 100),
+        self._user_thread_updater = UserThreadUpdater(
+            memory_db=self._db, llm_client=self._llm_client,
+            resolve_language=self._resolve_prompt_language_from_text, log=self._log_info,
+            batch_size=self._memory_cfg.get("user_thread_activity_batch_size", 8),
+            candidate_limit=self._memory_cfg.get("user_thread_candidate_limit", 12),
+            event_context_limit=self._memory_cfg.get("user_thread_event_context_limit", 16),
         )
-        self._task_queue: queue.Queue[Dict[str, Any]] = queue.Queue(
-            maxsize=self._task_queue_maxsize,
+        self._task_scheduler.register_handler(
+            "memory_fact_extraction", self._process_memory_fact_extraction_task,
         )
-        self._task_worker_thread: Optional[threading.Thread] = None
-        self._task_worker_lock = threading.Lock()
-        self._task_shutdown_event = threading.Event()
-        self._memory_operation_lock = threading.RLock()
-        self._task_completion_listener_lock = threading.Lock()
-        self._task_completion_listeners: List[
-            Callable[[Dict[str, Any]], None]
-        ] = []
-
+        self._task_scheduler.register_handler(
+            "memory_user_activity_extraction", self._process_memory_user_activity_extraction_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_thread_update", self._process_memory_user_thread_update_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_claim_update", self._process_memory_user_claim_update_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_observed_pattern_update",
+            self._process_memory_user_observed_pattern_update_task,
+        )
+        self._task_scheduler.register_handler(
+            "memory_user_intent_update", self._process_memory_user_intent_update_task,
+        )
     def _initialize_recall_config(self) -> None:
         """Parse nested recall settings and keep legacy flat overrides working."""
         configured_recall = self._memory_cfg.get("recall")
@@ -641,16 +374,6 @@ class MemoryNodeManager:
             0.0,
             1.0,
             0.5,
-        )
-        self._recall_stage1_episode_propagation_decay = self._clamp_float(
-            recall_value(
-                "recall_stage1_episode_propagation_decay",
-                0.70,
-                stage="stage1",
-            ),
-            0.0,
-            1.0,
-            0.70,
         )
         self._recall_stage1_association_propagation_decay = self._clamp_float(
             recall_value(
@@ -823,21 +546,6 @@ class MemoryNodeManager:
             return False
         return default
 
-    @staticmethod
-    def _resolve_env(value: Any) -> str:
-        text = str(value or "").strip()
-        match = re.fullmatch(r"\${([A-Za-z_][A-Za-z0-9_]*)}", text)
-        if match:
-            return os.environ.get(match.group(1), "").strip()
-        return text
-
-    @staticmethod
-    def _normalize_llm_base_url(value: str) -> str:
-        text = str(value or DEFAULT_LLM_BASE_URL).strip().rstrip("/")
-        if text == "https://api.deepseek.com":
-            return "https://api.deepseek.com/v1"
-        return text or DEFAULT_LLM_BASE_URL
-
     # ── Runtime helpers used by benchmark scripts ───────────────────────
 
     def _ensure_embedding_client(self) -> bool:
@@ -845,384 +553,96 @@ class MemoryNodeManager:
             self._embedding_client = EmbeddingClient(self._embedding_cfg)
         return True
 
-    # ── Store path: source units -> episode -> facts -> index cards ──────
+    # ── Store path: source units -> facts -> user activity ───────────────
 
     @property
     def enabled(self) -> bool:
         return self._memory_enabled
 
+    @property
+    def world_owner_entity_name(self) -> str:
+        return self._world_owner_entity_name
+
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         """Set the logger used by memory store, entity-claim, and recall operations."""
         self._logger = logger or logging.getLogger(__name__)
+        self._llm_client.set_logger(self._logger)
 
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
         """Share a pre-initialized embedding client with memory runtime callers."""
         self._embedding_client = embedding_client
 
-    def register_task_completion_listener(
-        self,
-        listener: Callable[[Dict[str, Any]], None],
-    ) -> None:
-        """Register a non-blocking observer for completed asynchronous tasks.
-
-        Listeners receive task metadata only after the manager's domain lock has
-        been released.  They must not perform memory work synchronously; the
-        runtime uses this hook only to update its local scheduling state and
-        optionally enqueue follow-up tasks.
-        """
-        with self._task_completion_listener_lock:
-            if listener not in self._task_completion_listeners:
-                self._task_completion_listeners.append(listener)
-
-    def unregister_task_completion_listener(
-        self,
-        listener: Callable[[Dict[str, Any]], None],
-    ) -> None:
-        """Remove a previously registered asynchronous task observer."""
-        with self._task_completion_listener_lock:
-            self._task_completion_listeners = [
-                candidate
-                for candidate in self._task_completion_listeners
-                if candidate != listener
-            ]
-
-    def _emit_task_completion(self, event: Dict[str, Any]) -> None:
-        """Notify observers without allowing an observer failure to stop work."""
-        with self._task_completion_listener_lock:
-            listeners = list(self._task_completion_listeners)
-        for listener in listeners:
-            try:
-                listener(dict(event))
-            except Exception:
-                self._logger.exception(
-                    "Memory task completion listener failed task_kind=%s task_id=%s",
-                    event.get("task_kind"),
-                    event.get("task_id"),
-                )
-
-    def _task_worker_loop(self) -> None:
-        while not self._task_shutdown_event.is_set() or not self._task_queue.empty():
-            try:
-                task = self._task_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            task_kind = str(task.get("kind") or "")
-            task_id = str(task.get("task_id") or "")
-            started_at = float(task.get("started_at") or time.monotonic())
-            result: Any = None
-            error: Optional[BaseException] = None
-            try:
-                with self._memory_operation_lock:
-                    if task_kind == "memory_fact_extraction":
-                        result = self._process_memory_fact_extraction_task(**task["payload"])
-                    elif task_kind == "memory_episode_summary":
-                        result = self._process_memory_episode_summary_task(**task["payload"])
-                    elif task_kind == "memory_entity_claim_update":
-                        result = self._process_memory_entity_claim_update_task(**task["payload"])
-                    elif task_kind == "memory_future_commitment_update":
-                        result = self._process_memory_future_commitment_update_task(**task["payload"])
-                    else:
-                        raise ValueError(f"Unsupported memory async task: {task_kind}")
-                self._operation_reporter.on_task_finished(
-                    operation_type=task_kind,
-                    task_id=task_id,
-                    started_at=started_at,
-                    result=result,
-                )
-            except Exception as exc:
-                error = exc
-                self._logger.exception("Async memory %s failed: %s", task.get("kind"), exc)
-                self._operation_reporter.on_task_finished(
-                    operation_type=task_kind,
-                    task_id=task_id,
-                    started_at=started_at,
-                    error=exc,
-                )
-            finally:
-                self._emit_task_completion({
-                    "task_kind": task_kind,
-                    "task_id": task_id,
-                    "result": result,
-                    "error": error,
-                    "succeeded": error is None and self._operation_reporter._operation_succeeded(
-                        task_kind,
-                        result,
-                    ),
-                    "completion_context": dict(
-                        task.get("completion_context") or {}
-                    ),
-                })
-                self._task_queue.task_done()
-
-    def _ensure_task_worker_locked(self) -> None:
-        if self._task_worker_thread and self._task_worker_thread.is_alive():
-            return
-        self._task_worker_thread = threading.Thread(
-            target=self._task_worker_loop,
-            daemon=True,
-            name="memory-node-worker",
-        )
-        self._task_worker_thread.start()
-
-    def _submit_memory_task(
-        self,
-        *,
-        task_kind: str,
-        payload: Dict[str, Any],
-        completion_context: Optional[Dict[str, Any]] = None,
+    def _process_memory_user_thread_update_task(
+        self, *, activity_ids: List[int], reference_timestamp: Any = None,
     ) -> Dict[str, Any]:
-        task_id = self._operation_reporter.next_task_id(task_kind)
-        with self._task_worker_lock:
-            if self._task_shutdown_event.is_set():
-                self._logger.warning("Memory worker is shut down; dropping %s task", task_kind)
-                return self._reject_memory_task(
-                    task_kind=task_kind,
-                    task_id=task_id,
-                    reason="worker_shutdown",
-                )
-            try:
-                self._task_queue.put_nowait({
-                    "kind": task_kind,
-                    "payload": payload,
-                    "task_id": task_id,
-                    "started_at": time.monotonic(),
-                    "completion_context": dict(completion_context or {}),
-                })
-            except queue.Full:
-                self._logger.warning(
-                    "Memory task queue is full; dropping %s (maxsize=%d)",
-                    task_kind,
-                    self._task_queue_maxsize,
-                )
-                return self._reject_memory_task(
-                    task_kind=task_kind,
-                    task_id=task_id,
-                    reason="worker_queue_full",
-                )
-            self._operation_reporter.on_task_submitted(
-                operation_type=task_kind,
-                task_id=task_id,
-                payload={
-                    key: value
-                    for key, value in payload.items()
-                    if key not in {"units", "preceding_context_units"}
-                },
-            )
-            self._ensure_task_worker_locked()
-        return {
-            "queued": True,
-            "status": "queued",
-            "task_id": task_id,
-            "operation_type": task_kind,
-        }
-
-    def _reject_memory_task(
-        self,
-        *,
-        task_kind: str,
-        task_id: str,
-        reason: str,
-    ) -> Dict[str, Any]:
-        self._operation_reporter.on_task_rejected(
-            operation_type=task_kind,
-            task_id=task_id,
-            reason=reason,
-        )
-        return {
-            "queued": False,
-            "status": "rejected",
-            "reason": reason,
-            "task_id": task_id,
-            "operation_type": task_kind,
-        }
-
-    def flush_task_queue(self, timeout: Optional[float] = None) -> bool:
-        """Wait until all queued asynchronous memory tasks finish."""
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while self._task_queue.unfinished_tasks:
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            time.sleep(0.01)
-        return True
-
-    def shutdown_task_worker(
-        self,
-        *,
-        wait: bool = True,
-        timeout: Optional[float] = None,
-    ) -> bool:
-        """Stop accepting tasks and optionally drain the memory worker.
-
-        When ``wait`` is true, do not report shutdown as successful until every
-        queued task has called ``task_done`` and the worker thread has exited.
-        This is important because callers close the database immediately after
-        shutdown; closing it while an entity-claim transaction is still running
-        rolls back all state updates made by that transaction.
-        """
-        with self._task_worker_lock:
-            self._task_shutdown_event.set()
-            worker = self._task_worker_thread
-        if not wait or worker is None:
-            return not self._task_queue.unfinished_tasks
-
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while self._task_queue.unfinished_tasks:
-            if not worker.is_alive():
-                return False
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            time.sleep(0.01)
-
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-        worker.join(timeout=remaining)
-        return not worker.is_alive() and not self._task_queue.unfinished_tasks
-
-    def submit_memory_fact_extraction_task(
-        self,
-        *,
-        units: List[MemoryUnit],
-        preceding_context_units: Optional[List[MemoryUnit]] = None,
-        tags: List[str],
-        completion_context: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Queue one typed unit batch for ordered fact extraction."""
-        if not self._memory_enabled or not units:
-            reason = "memory_disabled" if not self._memory_enabled else "no_units"
-            task_id = self._operation_reporter.next_task_id("memory_fact_extraction")
-            return self._reject_memory_task(
-                task_kind="memory_fact_extraction",
-                task_id=task_id,
-                reason=reason,
-            )
-        return self._submit_memory_task(
-            task_kind="memory_fact_extraction",
-            payload={
-                "units": list(units),
-                "preceding_context_units": list(preceding_context_units or []),
-                "tags": tags,
-            },
-            completion_context=completion_context,
+        """Resolve activity membership first, then incrementally update matters."""
+        return self._user_thread_updater.process_update_task(
+            activity_ids=activity_ids, reference_timestamp=reference_timestamp,
         )
 
-    def submit_memory_episode_summary_task(
+    def _process_memory_user_activity_extraction_task(
         self,
         *,
         tags: List[str],
     ) -> Dict[str, Any]:
-        """Queue episode summarization after preceding fact-store tasks."""
-        if not self._memory_enabled:
-            task_id = self._operation_reporter.next_task_id("memory_episode_summary")
-            return self._reject_memory_task(
-                task_kind="memory_episode_summary", task_id=task_id, reason="memory_disabled"
-            )
-        return self._submit_memory_task(
-            task_kind="memory_episode_summary",
-            payload={
-                "tags": list(tags or []),
-            },
-        )
-
-    def _process_memory_episode_summary_task(
-        self,
-        *,
-        tags: List[str],
-    ) -> Dict[str, Any]:
-        source_units = self._db.get_unassigned_memory_source_segments(
+        source_units = self._db.get_unprocessed_memory_source_segments_for_user_activity(
             limit=240,
         )
         if not source_units:
             return {
                 "status": "empty",
-                "reason": "no_unassigned_source_units",
-                "new_episode_count": 0,
+                "reason": "no_unprocessed_source_units",
+                "new_user_activity_count": 0,
                 "fact_count": 0,
                 "source_unit_count": 0,
             }
-        source_started_at = _compact_whitespace(
-            source_units[0].start_time
+        source_row_ids = list(dict.fromkeys(
+            int(unit.source_unit_row_id)
+            for unit in source_units
+            if unit.source_unit_row_id is not None
+        ))
+        facts = self._db.get_memory_facts_for_source_segments(
+            source_segment_ids=source_row_ids, limit=240,
         )
-        source_ended_at = _compact_whitespace(
-            source_units[-1].end_time
-            or source_started_at
-        )
-        facts = self._db.get_unassigned_memory_facts_in_time_window(
-            started_at=source_started_at,
-            ended_at=source_ended_at,
-            limit=80,
-        )
-        episode_info = self._generate_episode_from_source_units(
+        activity_items = self._extract_user_activity_from_source_units(
             source_units=source_units,
             facts=facts,
         )
-        if episode_info.get("status") != "ok":
-            return episode_info
+        if activity_items is None:
+            return {"status": "failed", "reason": "invalid_user_activity_response"}
+        source_started_at = _compact_whitespace(source_units[0].start_time) or _now_text()
+        source_ended_at = _compact_whitespace(source_units[-1].end_time) or source_started_at
+        fact_ids = {int(fact["id"]) for fact in facts}
+        activity_ids: List[int] = []
         with self._db.transaction():
-            episode_id = self._db.insert_episode(
-                episode_type="memory",
-                title=episode_info["title"],
-                summary=episode_info["summary"],
-                participants=episode_info.get("participants") or [],
-                started_at=episode_info.get("started_at") or _now_text(),
-                ended_at=episode_info.get("ended_at") or episode_info.get("started_at") or _now_text(),
-                canonical_topics=episode_info.get("canonical_topics") or [],
-                entity_ids=episode_info.get("entity_ids") or [],
-                metadata={
-                    "tags": list(tags or []),
-                    "fact_count": len(facts),
-                    "source_unit_count": len(source_units),
-                    "generated_from_source_units": True,
-                    "evidence_fact_ids": list(episode_info.get("fact_ids") or []),
-                },
+            for item in activity_items:
+                supported_fact_ids = [
+                    int(value) for value in item.get("evidence_fact_ids") or []
+                    if str(value).isdigit() and int(value) in fact_ids
+                ]
+                activity_ids.append(self._db.insert_user_activity_item(
+                    activity_text=item["activity_text"],
+                    user_role=item["user_role"],
+                    confidence=item["confidence"],
+                    started_at=source_started_at,
+                    ended_at=source_ended_at,
+                    evidence_fact_ids=supported_fact_ids,
+                    source_segment_ids=source_row_ids,
+                    metadata={"tags": list(tags or []), "time_scope": "source_window"},
+                ))
+            processed_rows = self._db.mark_memory_source_segments_processed_for_user_activity(
+                source_segment_ids=source_row_ids,
             )
-            self._upsert_episode_recall_document(
-                episode_id=episode_id,
-                title=episode_info["title"],
-                summary=episode_info["summary"],
-                participants=episode_info.get("participants") or [],
-                entity_ids=episode_info.get("entity_ids") or [],
-                canonical_topics=episode_info.get("canonical_topics") or [],
-                started_at=episode_info.get("started_at") or _now_text(),
-                ended_at=(
-                    episode_info.get("ended_at")
-                    or episode_info.get("started_at")
-                    or _now_text()
-                ),
-            )
-            topic_report = self._db.upsert_memory_topic_items(
-                self._build_memory_topic_item_updates(
-                    canonical_topics=episode_info.get("canonical_topics") or [],
-                    episode_id=episode_id,
-                )
-            )
-            attached = self._db.update_facts_episode_id(
-                fact_ids=episode_info.get("fact_ids") or [], episode_id=episode_id,
-            )
-            attached_source_unit_rows = self._db.update_memory_source_segments_episode_id(
-                source_segment_ids=episode_info.get("source_unit_row_ids") or [],
-                episode_id=episode_id,
-            )
-        episode_info.update({
-            "episode_id": episode_id,
-            "fact_count": attached,
-            # Source evidence is expanded from batch rows before episode
-            # generation, so expose the logical unit count rather than
-            # the number of physical persistence rows attached here.
+        report = {
+            "status": "ok",
+            "new_user_activity_count": len(activity_ids),
+            "user_activity_item_ids": activity_ids,
+            "fact_count": len(facts),
             "source_unit_count": len(source_units),
-            "source_unit_row_count": attached_source_unit_rows,
-            "new_episode_count": 1,
-            "topic_items_created": int(topic_report.get("created_count", 0) or 0),
-            "topic_items_updated": int(topic_report.get("updated_count", 0) or 0),
-        })
-        self._log_info("memory_fact_extraction", "episode_summary_generated", {
-            "episode_id": episode_id,
-            "fact_count": attached,
-            "source_unit_count": len(source_units),
-            "source_unit_row_count": attached_source_unit_rows,
-            "title": episode_info.get("title") or "",
-            "topic_items_created": episode_info.get("topic_items_created", 0),
-            "topic_items_updated": episode_info.get("topic_items_updated", 0),
-        })
-        return episode_info
+            "source_unit_row_count": processed_rows,
+        }
+        self._log_info("memory_user_activity_extraction", "finish", report)
+        return report
 
     def _process_memory_fact_extraction_task(
         self,
@@ -1232,20 +652,23 @@ class MemoryNodeManager:
         tags: List[str],
     ) -> Dict[str, Any]:
         store_started_at = time.monotonic()
+        units = self._valid_memory_units(units)
         preceding_units = list(preceding_context_units or [])
         if not units:
             elapsed_ms = round((time.monotonic() - store_started_at) * 1000, 2)
-            self._log_info("memory_fact_extraction", "finish", {
-                "status": "skipped",
+            report = {
+                "status": "empty",
                 "reason": "no_units",
-                "total_elapsed_ms": elapsed_ms,
-            })
-            return {
-                "status": "skipped",
-                "reason": "no_units",
+                "attempt_count": 0,
                 "new_fact_count": 0,
+                "fact_ids": [],
+                "source_unit_row_ids": [],
+                "source_unit_count": 0,
+                "source_unit_row_count": 0,
                 "total_elapsed_ms": elapsed_ms,
             }
+            self._log_info("memory_fact_extraction", "finish", report)
+            return report
         with self._db.transaction():
             source_unit_row_ids = self._db.insert_memory_source_segments(
                 units=units,
@@ -1254,33 +677,59 @@ class MemoryNodeManager:
             units,
             preceding_context_units=preceding_units,
         )
+        if fact_info["status"] != "ok":
+            report = {
+                "status": fact_info["status"],
+                "reason": fact_info["reason"],
+                "attempt_count": fact_info["attempt_count"],
+                "new_fact_count": 0,
+                "fact_ids": [],
+                "source_unit_row_ids": source_unit_row_ids,
+                "source_unit_count": len(units),
+                "source_unit_row_count": len(source_unit_row_ids),
+                "total_elapsed_ms": round((time.monotonic() - store_started_at) * 1000, 2),
+            }
+            if fact_info.get("error_type"):
+                report["error_type"] = fact_info["error_type"]
+            self._log_info("memory_fact_extraction", "finish", report)
+            return report
         facts = list(fact_info.get("facts") or [])
         self._log_extracted_fact_info(facts=facts)
         with self._db.transaction():
             save_fact_info = self._store_extracted_memory_facts_into_db(
-                episode_id=None,
                 facts=facts,
                 tags=tags,
-                episode_context_topics=None,
+            )
+            self._db.insert_fact_source_mappings(
+                fact_ids=save_fact_info.get("fact_ids") or [],
+                source_segment_ids=source_unit_row_ids,
             )
             topic_report = self._db.upsert_memory_topic_items(
                 save_fact_info.get("topic_item_updates") or []
             )
         report = {
-            "status": "ok",
+            "status": fact_info["status"],
+            "reason": fact_info["reason"],
+            "attempt_count": fact_info["attempt_count"],
             "new_fact_count": len(list(save_fact_info.get("fact_ids") or [])),
             "fact_ids": list(save_fact_info.get("fact_ids") or []),
-            "entity_claim_signal_fact_count": int(
-                save_fact_info.get("entity_claim_signal_fact_count") or 0
+            "user_claim_signal_fact_count": int(
+                save_fact_info.get("user_claim_signal_fact_count") or 0
             ),
-            "entity_claim_signal_count": int(
-                save_fact_info.get("entity_claim_signal_count") or 0
+            "user_claim_signal_count": int(
+                save_fact_info.get("user_claim_signal_count") or 0
             ),
-            "future_commitment_signal_fact_count": int(
-                save_fact_info.get("future_commitment_signal_fact_count") or 0
+            "user_action_signal_fact_count": int(
+                save_fact_info.get("user_action_signal_fact_count") or 0
             ),
-            "future_commitment_signal_count": int(
-                save_fact_info.get("future_commitment_signal_count") or 0
+            "user_action_signal_count": int(
+                save_fact_info.get("user_action_signal_count") or 0
+            ),
+            "user_intent_signal_fact_count": int(
+                save_fact_info.get("user_intent_signal_fact_count") or 0
+            ),
+            "user_intent_signal_count": int(
+                save_fact_info.get("user_intent_signal_count") or 0
             ),
             "source_unit_row_ids": source_unit_row_ids,
             "source_unit_count": len(units),
@@ -1356,8 +805,7 @@ class MemoryNodeManager:
         keywords: Sequence[str],
         entities: Sequence[str],
         entity_ids: Sequence[int],
-        fact_root_topic: str,
-        fact_aspect_topic: str,
+        fact_topic: str,
         event_time_key: str,
         dialogue_time_key: str,
         confidence: float,
@@ -1374,48 +822,14 @@ class MemoryNodeManager:
                 f"summary: {_compact_whitespace(summary)}",
                 f"keywords: {keyword_text}",
                 f"entities: {', '.join(entities or [])}",
-                f"fact_root_topic: {fact_root_topic}",
-                f"fact_aspect_topic: {fact_aspect_topic}",
+                f"fact_topic: {fact_topic}",
             ],
             entity_ids=entity_ids,
-            topic_keys=[fact_root_topic, fact_aspect_topic],
+            topic_keys=[fact_topic],
             time_start=event_time_key or dialogue_time_key,
             time_end=event_time_key or dialogue_time_key,
             confidence=confidence,
             importance=importance,
-            metadata={"projection_version": "v1"},
-        )
-
-    def _upsert_episode_recall_document(
-        self,
-        *,
-        episode_id: int,
-        title: str,
-        summary: str,
-        participants: Sequence[str],
-        entity_ids: Sequence[int],
-        canonical_topics: Sequence[str],
-        started_at: str,
-        ended_at: str,
-    ) -> int:
-        """Project one experience-level summary without exposing raw units."""
-        return self._upsert_memory_recall_document(
-            object_type="episode",
-            object_id=episode_id,
-            title=title,
-            summary=summary,
-            identity_lines=[
-                f"title: {_compact_whitespace(title)}",
-                f"summary: {_compact_whitespace(summary)}",
-                f"participants: {', '.join(participants or [])}",
-                f"canonical_topics: {', '.join(canonical_topics or [])}",
-            ],
-            entity_ids=entity_ids,
-            topic_keys=canonical_topics,
-            time_start=started_at,
-            time_end=ended_at,
-            confidence=0.85,
-            importance=0.6,
             metadata={"projection_version": "v1"},
         )
 
@@ -1441,10 +855,10 @@ class MemoryNodeManager:
                     "keywords": fact.get("keywords") or "",
                     "entities": fact.get("entities") or [],
                     "primary_entity": fact.get("primary_entity"),
-                    "fact_root_topic": fact.get("fact_root_topic") or "",
-                    "fact_aspect_topic": fact.get("fact_aspect_topic") or "",
-                    "entity_claim_signal": fact.get("entity_claim_signal") or [],
-                    "future_commitment_signals": fact.get("future_commitment_signals") or [],
+                    "fact_topic": fact.get("fact_topic") or "",
+                    "user_claim_signals": fact.get("user_claim_signals") or [],
+                    "user_action_signals": fact.get("user_action_signals") or [],
+                    "user_intent_signals": fact.get("user_intent_signals") or [],
                     "importance": fact.get("importance"),
                     "confidence": fact.get("confidence"),
                     "time_confidence": metadata.get("time_confidence") or "",
@@ -1461,8 +875,10 @@ class MemoryNodeManager:
         *,
         preceding_context_units: Optional[Sequence[MemoryUnit]] = None,
     ) -> Dict[str, Any]:
-        """Extract narrative facts with the unified fact prompt."""
+        """Return ok/empty/failed, facts, a reason and the extraction attempt count."""
         current_units = self._valid_memory_units(units)
+        if not current_units:
+            return {"status": "empty", "facts": [], "reason": "no_units", "attempt_count": 0}
         preceding_units = self._valid_memory_units(preceding_context_units or [])
         prompt_language = self._resolve_prompt_language_from_memory_units(
             [*current_units, *preceding_units],
@@ -1484,16 +900,19 @@ class MemoryNodeManager:
             if prompt_language == "en"
             else UNIFIED_MEMORY_EXTRACTION_PROMPT_ZH
         )
-        memory_topic_item_context = (
-            self._collect_memory_topic_item_context(units=current_units)
-            if prompt_language != "en"
-            else {"canonical_topics": [], "aspect_topics": []}
-        )
+        known_world_owner_aliases = [
+            item["alias_name"]
+            for item in self._db.get_owner_entity_aliases(
+                self._intent_world_owner_entity_id(),
+                status="confirmed",
+                limit=128,
+            )
+        ]
         prompt = (
             prompt_template
             .replace(
-                "{existing_memory_topic_items}",
-                self._format_memory_topic_items_for_prompt(memory_topic_item_context),
+                "{known_world_owner_aliases}",
+                json.dumps(known_world_owner_aliases[:32], ensure_ascii=False),
             )
             .replace(
                 "{dialogue_batch}",
@@ -1510,11 +929,27 @@ class MemoryNodeManager:
                 ) or ("(none)" if prompt_language == "en" else "（无）"),
             )
         )
+        failure_info: Dict[str, Any] = {}
         for attempt in range(2):
-            result = self._call_llm(prompt)
+            try:
+                result = self._llm_client.call_llm(prompt)
+            except Exception as exc:
+                failure_info = {"reason": "llm_request_error", "error_type": type(exc).__name__}
+                self._logger.exception("Unified memory LLM request failed attempt=%s", attempt + 1)
+                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
+                    "attempt": attempt + 1,
+                    "parse_status": "request_error",
+                    "error_type": type(exc).__name__,
+                    "response_chars": 0,
+                    "raw_fact_count": None,
+                    "normalized_fact_count": 0,
+                    "dropped_fact_counts": {},
+                })
+                continue
             response_text = str(result or "")
             response_chars = len(response_text)
             if not response_text.strip():
+                failure_info = {"reason": "empty_llm_response"}
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
                     "attempt": attempt + 1,
                     "parse_status": "empty_response",
@@ -1526,8 +961,9 @@ class MemoryNodeManager:
                 if attempt == 0:
                     self._logger.debug("Unified memory LLM extraction failed, retrying")
                 continue
-            parsed = self._parse_json_object_from_llm_text(result or "")
+            parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
             if parsed is None:
+                failure_info = {"reason": "invalid_llm_json_object"}
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
                     "attempt": attempt + 1,
                     "parse_status": "invalid_json_object",
@@ -1542,6 +978,7 @@ class MemoryNodeManager:
                     parsed,
                     current_units,
                     prompt_language=prompt_language,
+                    known_world_owner_aliases=known_world_owner_aliases,
                     diagnostics=normalization_diagnostics,
                 )
                 self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
@@ -1552,31 +989,37 @@ class MemoryNodeManager:
                     **normalization_diagnostics,
                 })
                 if normalized is not None:
-                    return normalized
+                    facts = normalized["facts"]
+                    return {
+                        "status": "ok" if facts else "empty",
+                        "facts": facts,
+                        "reason": (
+                            "" if facts else "no_retained_facts" if parsed["facts"] else "no_facts"
+                        ),
+                        "attempt_count": attempt + 1,
+                    }
+                failure_info = {
+                    "reason": normalization_diagnostics.get("normalization_status")
+                    or "invalid_llm_fact_response",
+                }
             if attempt == 0:
                 self._logger.debug("Unified memory LLM extraction failed, retrying")
-        return {"facts": []}
+        return {"status": "failed", "facts": [], "attempt_count": 2, **failure_info}
 
-    def _generate_episode_from_source_units(
+    def _extract_user_activity_from_source_units(
         self,
         *,
         source_units: Sequence[MemoryUnit],
         facts: Sequence[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """Generate an experience-level episode from source evidence.
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Observe what the user is doing across a source window.
 
-        Facts remain compact coverage anchors, but the chronological source
-        units are the authoritative narrative material. This prevents an
-        episode from degrading into a sentence-by-sentence fact concatenation.
+        Raw units are authoritative; facts provide compact evidence anchors.
+        An empty list is valid when the window does not establish user activity.
         """
         unit_list = self._valid_memory_units(source_units)
         if not unit_list:
-            return {
-                "status": "empty",
-                "new_episode_count": 0,
-                "fact_count": 0,
-                "source_unit_count": 0,
-            }
+            return []
         prompt_language = self._resolve_prompt_language_from_memory_units(
             unit_list,
         )
@@ -1590,8 +1033,7 @@ class MemoryNodeManager:
                 "id": item.get("id"),
                 "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
                 "fact_type": item.get("fact_type") or "",
-                "fact_root_topic": item.get("fact_root_topic") or "",
-                "fact_aspect_topic": item.get("fact_aspect_topic") or "",
+                "fact_topic": item.get("fact_topic") or "",
                 "dialogue_time_key": item.get("dialogue_time_key") or "",
                 "event_time_key": item.get("event_time_key") or "",
             }
@@ -1602,166 +1044,55 @@ class MemoryNodeManager:
             prompt_language=prompt_language,
         )
         prompt_template = (
-            EPISODE_SUMMARY_PROMPT_EN
+            USER_ACTIVITY_EXTRACTION_PROMPT_EN
             if prompt_language == "en"
-            else EPISODE_SUMMARY_PROMPT_ZH
+            else USER_ACTIVITY_EXTRACTION_PROMPT_ZH
         )
         prompt = (
             prompt_template
             .replace("{source_units}", source_text)
             .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
         )
-        parsed: Dict[str, Any] = {}
+        allowed_fact_ids = {
+            int(item["id"]) for item in fact_list
+            if str(item.get("id") or "").isdigit()
+        }
         for _ in range(2):
-            parsed = self._parse_json_object_from_llm_text(self._call_llm(prompt) or "") or {}
-            if _compact_whitespace(parsed.get("summary") or ""):
-                break
-        summary = _compact_whitespace(parsed.get("summary") or "")
-        if not summary:
-            summary = self._fallback_generate_episode_summary_from_units(unit_list)
-        title = _compact_whitespace(parsed.get("title") or "")
-        if not title:
-            title = self._fallback_generate_episode_title_from_units(unit_list)
-        source_text_for_topics = " ".join(
-            _compact_whitespace(item.text) for item in unit_list
-        )
-        topics = self._normalize_episode_canonical_topics(
-            parsed.get("canonical_topics"),
-            fallback_text=source_text_for_topics,
-            limit=3,
-        )
-        if not topics:
-            topics = (
-                self._normalize_unique_labels([
-                    item.get("fact_root_topic")
-                    for item in fact_payload
-                    if item.get("fact_root_topic")
-                ])[:3]
-                or self._topic_candidates(summary)[:3]
-        )
-        participants = self._parse_participants_from_units(unit_list)
-        episode_entity_ids: List[int] = []
-        for fact in fact_list:
-            for value in fact.get("entity_ids") or []:
-                try:
-                    entity_id = int(value)
-                except (TypeError, ValueError):
-                    continue
-                if entity_id and entity_id not in episode_entity_ids:
-                    episode_entity_ids.append(entity_id)
-                if len(episode_entity_ids) >= 64:
-                    break
-            if len(episode_entity_ids) >= 64:
-                break
-        start = _compact_whitespace(
-            unit_list[0].start_time,
-        ) or _now_text()
-        end = (
-            _compact_whitespace(unit_list[-1].end_time)
-            or start
-        )
-        return {
-            "status": "ok",
-            "new_episode_count": 0,
-            "title": title,
-            "summary": summary,
-            "canonical_topics": topics,
-            "participants": participants,
-            "entity_ids": episode_entity_ids,
-            "fact_ids": [
-                int(item["id"])
-                for item in fact_list
-                if str(item.get("id", "")).isdigit()
-            ],
-            "source_unit_row_ids": list(dict.fromkeys(
-                int(item.source_unit_row_id)
-                for item in unit_list
-                if item.source_unit_row_id is not None
-            )),
-            "started_at": start,
-            "ended_at": end,
-        }
-
-    def _call_llm(self, prompt: str) -> Optional[str]:
-        if (
-            not self._llm_api_key
-            or not self._llm_base_url
-            or str(self._llm_base_url).strip().lower() == "none"
-        ):
-            self._logger.debug(
-                "Skipping LLM call because llm_api_key or llm_base_url is not configured"
-            )
-            return None
-        url = f"{self._llm_base_url.rstrip('/')}/chat/completions"
-        headers = {"Content-Type": "application/json"}
-        if self._llm_api_key:
-            headers["Authorization"] = f"Bearer {self._llm_api_key}"
-        payload: Dict[str, Any] = {
-            "model": self._llm_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "stream": False,
-            "max_tokens": 4096,
-        }
-        if self._llm_json_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if self._llm_thinking in {"disabled", "enabled"}:
-            payload["thinking"] = {"type": self._llm_thinking}
-
-        attempts = [payload]
-        if "thinking" in payload:
-            stripped = dict(payload)
-            stripped.pop("thinking", None)
-            attempts.append(stripped)
-        if "response_format" in payload:
-            stripped = dict(payload)
-            stripped.pop("response_format", None)
-            attempts.append(stripped)
-
-        seen = set()
-        for item in attempts:
-            marker = json.dumps(sorted(item.keys()), ensure_ascii=False)
-            if marker in seen:
+            parsed = self._llm_client.parse_json_object_from_llm_text(
+                self._llm_client.call_llm(prompt) or ""
+            ) or {}
+            raw_items = parsed.get("user_activities")
+            if not isinstance(raw_items, list):
                 continue
-            seen.add(marker)
-            try:
-                response = requests.post(url, json=item, headers=headers, timeout=self._llm_timeout)
-                response.raise_for_status()
-                data = response.json()
-                choices = data.get("choices") or []
-                if choices:
-                    message = choices[0].get("message") or {}
-                    content = message.get("content")
-                    if content:
-                        return str(content)
-            except requests.RequestException as exc:
-                text = str(exc).lower()
-                if "response_format" in text or "json" in text or "thinking" in text:
+            activities: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for raw in raw_items[:12]:
+                if not isinstance(raw, dict):
                     continue
-                self._logger.warning("Unified memory LLM call failed: %s", exc)
-                return None
+                activity_text = _compact_whitespace(raw.get("activity_text") or "")
+                user_role = str(raw.get("user_role") or "").strip().lower()
+                if not activity_text or user_role not in {"actor", "participant", "contextual"}:
+                    continue
+                if activity_text in seen:
+                    continue
+                seen.add(activity_text)
+                raw_evidence_ids = raw.get("evidence_fact_ids")
+                if not isinstance(raw_evidence_ids, list):
+                    raw_evidence_ids = []
+                confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.5)
+                if not math.isfinite(confidence):
+                    confidence = 0.5
+                activities.append({
+                    "activity_text": activity_text,
+                    "user_role": user_role,
+                    "confidence": confidence,
+                    "evidence_fact_ids": list(dict.fromkeys(
+                        int(value) for value in raw_evidence_ids
+                        if str(value).isdigit() and int(value) in allowed_fact_ids
+                    )),
+                })
+            return activities
         return None
-
-    @staticmethod
-    def _parse_json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        if raw.startswith("```"):
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if start >= 0 and end > start:
-                raw = raw[start : end + 1]
-        else:
-            start = raw.find("{")
-            end = raw.rfind("}")
-            if 0 <= start < end and (start > 0 or end < len(raw) - 1):
-                raw = raw[start : end + 1]
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        return data if isinstance(data, dict) else None
 
     def _normalize_memory_fact_extraction_llm_output(
         self,
@@ -1769,6 +1100,7 @@ class MemoryNodeManager:
         units: Sequence[MemoryUnit],
         *,
         prompt_language: str,
+        known_world_owner_aliases: Sequence[str],
         diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         diagnostics = diagnostics if diagnostics is not None else {}
@@ -1795,7 +1127,6 @@ class MemoryNodeManager:
             index: int,
             raw_fact: Any,
             result: str,
-            priority: Optional[int] = None,
         ) -> None:
             if len(candidate_diagnostics) >= 12:
                 return
@@ -1803,7 +1134,6 @@ class MemoryNodeManager:
             candidate_diagnostics.append({
                 "index": index,
                 "result": result,
-                "priority": priority,
                 "text": self._format_log_text(
                     raw_payload.get("text") or raw_payload.get("summary") or "",
                     limit=300,
@@ -1814,6 +1144,7 @@ class MemoryNodeManager:
         dialogue_time_key = _to_timestamp_text(
             units[0].start_time if units else ""
         ) or _now_text()
+        newly_confirmed_aliases: List[str] = []
         for index, raw_fact in enumerate(raw_facts, 1):
             if not isinstance(raw_fact, dict):
                 record_drop("non_object_fact")
@@ -1832,26 +1163,43 @@ class MemoryNodeManager:
                     result="dropped_missing_text",
                 )
                 continue
-            priority = self._normalize_priority(raw_fact.get("priority", 70))
-            if priority < 60:
-                record_drop("priority_below_runtime_minimum")
-                record_candidate(
-                    index=index,
-                    raw_fact=raw_fact,
-                    result="dropped_priority_below_runtime_minimum",
-                    priority=priority,
-                )
-                continue
             keywords = self._normalize_string_list(raw_fact.get("keywords"), limit=18)
             if not keywords:
                 keywords = self._keywords(text, limit=18)
-            allows_world_owner_reference = self._units_include_world_owner(
-                units,
+            raw_entity_descriptors = self._normalize_entity_descriptors(
+                raw_fact.get("entities"), limit=16,
+            )
+            alias_candidates = self._normalize_world_owner_alias_candidates(
+                raw_fact.get("world_owner_alias_candidates"),
+                fact_text=text,
+                entity_names=[item["name"] for item in raw_entity_descriptors],
+                source_units=units,
+            )
+            confirmed_aliases = self._confirmed_owner_aliases_in_fact(
+                entity_names=[item["name"] for item in raw_entity_descriptors],
+                fact_text=text,
+                confirmed_aliases=[
+                    *known_world_owner_aliases,
+                    *newly_confirmed_aliases,
+                    *(
+                        item["alias_name"] for item in alias_candidates
+                        if item["status"] == "confirmed"
+                    ),
+                ],
+            )
+            owner_alias_reference = bool(confirmed_aliases)
+            allows_world_owner_reference = (
+                self._units_include_world_owner(units) or owner_alias_reference
             )
             entity_descriptors = self._normalize_fact_entity_descriptors(
                 raw_fact.get("entities"),
                 allows_world_owner_reference=allows_world_owner_reference,
             )
+            if owner_alias_reference:
+                self._merge_entity_descriptor(entity_descriptors, {
+                    "name": self._world_owner_entity_name,
+                    "type": "PERSON",
+                })
             entities = [item["name"] for item in entity_descriptors]
             if not entities:
                 entity_descriptors = self._normalize_fact_entity_descriptors(
@@ -1896,33 +1244,33 @@ class MemoryNodeManager:
                     index=index,
                     raw_fact=raw_fact,
                     result="dropped_low_value_assistant_closing",
-                    priority=priority,
-                )
-                continue
-            if self._is_world_owner_entity_reference(primary_entity_name) \
-                    and self._is_low_value_user_acknowledgement(text):
-                record_drop("low_value_user_acknowledgement")
-                record_candidate(
-                    index=index,
-                    raw_fact=raw_fact,
-                    result="dropped_low_value_user_acknowledgement",
-                    priority=priority,
                 )
                 continue
             fact_topic_fallback = " ".join(keywords[:3]) if keywords else "general"
-            fact_root_topic, fact_aspect_topic = self._normalize_fact_topic_fields(
-                raw_fact.get("fact_root_topic"),
-                raw_fact.get("fact_aspect_topic"),
-                fallback_root_topic=fact_topic_fallback,
-                fallback_aspect_topic=fact_topic_fallback,
+            fact_topic = (
+                self._normalize_topic_name(raw_fact.get("fact_topic"))
+                or self._normalize_topic_name(fact_topic_fallback)
+                or "general"
             )
-            entity_claim_signal = self._normalize_entity_claim_signal(
-                raw_fact.get("entity_claim_signal"),
+            user_claim_signals = self._normalize_user_claim_signal(
+                raw_fact.get("user_claim_signals"),
+                allows_world_owner_reference=allows_world_owner_reference,
+                source_units=units,
+                owner_aliases=confirmed_aliases,
             )
-            future_commitment_signals = self._normalize_future_commitment_signals(
-                raw_fact.get("future_commitment_signals"),
+            user_action_signals = self._normalize_user_action_signals(
+                raw_fact.get("user_action_signals"),
+                fact_entities=entities,
+                allows_world_owner_reference=allows_world_owner_reference,
+                source_units=units,
+                owner_aliases=confirmed_aliases,
+            )
+            user_intent_signals = self._normalize_user_intent_signals(
+                raw_fact.get("user_intent_signals"),
                 fallback_entity=primary_entity,
                 allows_world_owner_reference=allows_world_owner_reference,
+                source_units=units,
+                owner_aliases=confirmed_aliases,
             )
             event_time_key = _compact_whitespace(raw_fact.get("event_time_key") or "")
             facts.append({
@@ -1934,25 +1282,50 @@ class MemoryNodeManager:
                 "entities": entities,
                 "entity_descriptors": entity_descriptors,
                 "primary_entity": primary_entity,
-                "entity_claim_signal": entity_claim_signal,
-                "future_commitment_signals": future_commitment_signals,
-                "fact_root_topic": fact_root_topic,
-                "fact_aspect_topic": fact_aspect_topic,
-                "importance": max(0.6, min(1.0, priority / 100.0)),
+                "user_claim_signals": user_claim_signals,
+                "user_action_signals": user_action_signals,
+                "user_intent_signals": user_intent_signals,
+                "world_owner_alias_candidates": alias_candidates,
+                "resolved_world_owner_aliases": confirmed_aliases,
+                "fact_topic": fact_topic,
+                "importance": 0.5,
                 "confidence": 0.9,
                 "metadata": {
                     "extractor": "llm",
-                    "priority": priority,
                     "time_confidence": _compact_whitespace(raw_fact.get("time_confidence") or "unknown"),
                     "where": _compact_whitespace(raw_fact.get("where") or ""),
-                    "has_world_owner_interaction": allows_world_owner_reference,
+                    "has_world_owner_speaker": (
+                        any(
+                            signal.get("owner_evidence_type") in {
+                                "self_statement", "confirmed_response",
+                            }
+                            for signal in user_claim_signals
+                        )
+                        or any(
+                            signal.get("assertion_source") in {
+                                "self_statement", "confirmed_response",
+                            }
+                            for signal in user_intent_signals
+                        )
+                        or (
+                            self._units_include_world_owner(units)
+                            and any(
+                                signal.get("assertion_source") == "observed_event"
+                                for signal in user_intent_signals
+                            )
+                        )
+                    ),
+                    "has_world_owner_alias_reference": owner_alias_reference,
                 },
             })
+            newly_confirmed_aliases.extend(
+                item["alias_name"] for item in alias_candidates
+                if item["status"] == "confirmed"
+            )
             record_candidate(
                 index=index,
                 raw_fact=raw_fact,
                 result="accepted",
-                priority=priority,
             )
         diagnostics.update({
             "normalization_status": "ok",
@@ -1968,30 +1341,13 @@ class MemoryNodeManager:
         })
         return {"facts": facts}
 
-    def _normalize_fact_topic_fields(
-        self,
-        root_topic: Any,
-        aspect_topic: Any,
-        *,
-        fallback_root_topic: Any,
-        fallback_aspect_topic: Any,
-    ) -> Tuple[str, str]:
-        normalized_root = (
-            self._normalize_topic_name(root_topic)
-            or self._normalize_topic_name(fallback_root_topic)
-            or "general"
-        )
-        normalized_aspect = (
-            self._normalize_topic_name(aspect_topic)
-            or self._normalize_topic_name(fallback_aspect_topic)
-            or normalized_root
-        )
-        return normalized_root, normalized_aspect
-
-    def _normalize_entity_claim_signal(
+    def _normalize_user_claim_signal(
         self,
         value: Any,
         *,
+        allows_world_owner_reference: bool = False,
+        source_units: Optional[Sequence[MemoryUnit]] = None,
+        owner_aliases: Sequence[str] = (),
         limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
@@ -2001,31 +1357,19 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("entity_claim_signal_max_per_fact", 3) or 3
+                else self._memory_cfg.get("user_claim_signal_max_per_fact", 3) or 3
             ),
         )
         if max_items <= 0:
             return []
-        allowed_types = self._entity_claim_types()
-        allowed_kinds = {"explicit_assertion", "pattern_observation"}
+        allowed_types = self._user_claim_types()
         normalized: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str, str, str]] = set()
+        seen: set[Tuple[str, str, str]] = set()
         for raw in value:
             if not isinstance(raw, dict):
                 continue
-            signal_kind = str(raw.get("signal_kind") or "").strip().lower()
             claim_type_hint = str(raw.get("claim_type_hint") or "").strip().lower()
-            if signal_kind not in allowed_kinds or claim_type_hint not in allowed_types:
-                continue
-            if (
-                signal_kind == "explicit_assertion"
-                and claim_type_hint == "behavior_pattern"
-            ):
-                continue
-            if (
-                signal_kind == "pattern_observation"
-                and claim_type_hint not in {"preference", "behavior_pattern"}
-            ):
+            if claim_type_hint not in allowed_types:
                 continue
             claim_anchor = _compact_whitespace(
                 raw.get("claim_anchor")
@@ -2045,18 +1389,28 @@ class MemoryNodeManager:
             ):
                 continue
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
-            entity = raw.get("entity")
-            if isinstance(entity, dict):
-                entity_name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
-                entity_type = self._normalize_entity_type(entity.get("type"))
-            else:
-                entity_name = _compact_whitespace(entity)
-                entity_type = "OTHER"
-            if not entity_name:
+            subject_entity = _compact_whitespace(raw.get("subject_entity") or "")
+            if not subject_entity:
                 continue
-            entity_payload = {"name": entity_name, "type": entity_type}
+            # user_claim signals are evidence about the configured wearer
+            # only. A third-party entity may still appear in the fact or as
+            # the object of a relation, but cannot be the claim subject.
+            is_owner_reference = (
+                self._is_world_owner_entity_reference(subject_entity)
+                or subject_entity.lower() == self._world_owner_entity_name.lower()
+            )
+            if not allows_world_owner_reference or not is_owner_reference:
+                continue
+            owner_evidence = self._normalize_user_signal_owner_evidence(
+                raw,
+                source_units=source_units,
+                owner_aliases=owner_aliases,
+            )
+            if owner_evidence is None:
+                continue
+            if owner_evidence["owner_evidence_type"] == "third_party_report":
+                confidence = min(confidence, 0.65)
             key = (
-                signal_kind,
                 claim_type_hint,
                 claim_anchor.lower(),
                 evidence_basis.lower(),
@@ -2065,25 +1419,89 @@ class MemoryNodeManager:
                 continue
             seen.add(key)
             item: Dict[str, Any] = {
-                "signal_kind": signal_kind,
+                "subject_entity": self._world_owner_entity_name,
                 "claim_type_hint": claim_type_hint,
                 "claim_anchor": claim_anchor,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
+                **owner_evidence,
             }
-            item["entity"] = entity_payload
             normalized.append(item)
             if len(normalized) >= max_items:
                 break
         return normalized
 
-    def _normalize_future_commitment_signals(
+    def _normalize_user_action_signals(
+        self,
+        value: Any,
+        *,
+        fact_entities: Sequence[str],
+        allows_world_owner_reference: bool,
+        source_units: Optional[Sequence[MemoryUnit]] = None,
+        owner_aliases: Sequence[str] = (),
+    ) -> List[Dict[str, Any]]:
+        """Retain only grounded, wearer-attributed concrete action evidence."""
+        if not isinstance(value, list) or not allows_world_owner_reference:
+            return []
+        owner_name = self._world_owner_entity_name
+        if owner_name not in fact_entities:
+            return []
+        normalized: List[Dict[str, Any]] = []
+        seen: set[Tuple[str, str, str, str]] = set()
+        for raw in value:
+            if not isinstance(raw, dict):
+                continue
+            subject = _compact_whitespace(raw.get("subject_entity") or "")
+            if not self._is_world_owner_entity_reference(subject) and (
+                subject.lower() != owner_name.lower()
+            ):
+                continue
+            action_kind = str(raw.get("action_kind") or "").strip().lower()
+            if action_kind not in {"action", "choice", "participation"}:
+                continue
+            action_text = _compact_whitespace(raw.get("action_text") or "")[:480]
+            evidence_basis = _compact_whitespace(raw.get("evidence_basis") or "")[:480]
+            if not action_text or not evidence_basis:
+                continue
+            owner_evidence = self._normalize_user_signal_owner_evidence(
+                raw,
+                source_units=source_units,
+                owner_aliases=owner_aliases,
+            )
+            if owner_evidence is None:
+                continue
+            key = (
+                action_kind, action_text.lower(),
+                owner_evidence["owner_evidence_text"].lower(),
+                owner_evidence["other_evidence_text"].lower(),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
+            if owner_evidence["owner_evidence_type"] == "third_party_report":
+                confidence = min(confidence, 0.65)
+            normalized.append({
+                "subject_entity": owner_name,
+                "action_kind": action_kind,
+                "action_text": action_text,
+                "evidence_basis": evidence_basis,
+                "confidence": confidence,
+                **owner_evidence,
+            })
+            if len(normalized) >= 3:
+                break
+        return normalized
+
+    def _normalize_user_intent_signals(
         self,
         value: Any,
         *,
         fallback_entity: Optional[Dict[str, str]] = None,
         limit: Optional[int] = None,
         allows_world_owner_reference: bool = False,
+        source_units: Optional[Sequence[MemoryUnit]] = None,
+        owner_aliases: Sequence[str] = (),
     ) -> List[Dict[str, Any]]:
         """Normalize fact-level evidence for the prospective world model."""
         if not isinstance(value, list):
@@ -2093,40 +1511,19 @@ class MemoryNodeManager:
             int(
                 limit
                 if limit is not None
-                else self._memory_cfg.get("future_commitment_signal_max_per_fact", 2) or 2
+                else self._memory_cfg.get("user_intent_signal_max_per_fact", 2) or 2
             ),
         )
         if max_items <= 0:
             return []
-        evidence_kind_aliases = {
-            "goal_expression": "goal",
-            "future_plan": "plan",
-            "responsibility_commitment": "responsibility",
-            "work_item": "responsibility",
-            "plan_lifecycle_update": "lifecycle_update",
-            "work_item_lifecycle_update": "lifecycle_update",
-        }
-        default_object_types = {
-            "goal": ["goal"],
-            "plan": ["plan"],
-            "responsibility": ["work_item"],
-            "lifecycle_update": ["plan", "work_item"],
-        }
+        allowed_signal_purposes = {"future_intent", "lifecycle_update"}
         normalized: List[Dict[str, Any]] = []
-        seen: set[Tuple[str, str, str]] = set()
+        seen: set[Tuple[str, str, str, Tuple[str, ...]]] = set()
         for raw in value:
             if not isinstance(raw, dict):
                 continue
-            evidence_kind = evidence_kind_aliases.get(
-                str(
-                    raw.get("evidence_kind")
-                    or raw.get("signal_type")
-                    or raw.get("type")
-                    or ""
-                ).strip().lower(),
-                str(raw.get("evidence_kind") or "").strip().lower(),
-            )
-            if evidence_kind not in default_object_types:
+            signal_purpose = str(raw.get("signal_purpose") or "").strip().lower()
+            if signal_purpose not in allowed_signal_purposes:
                 continue
             raw_object_types = raw.get("candidate_object_types")
             if isinstance(raw_object_types, str):
@@ -2137,17 +1534,17 @@ class MemoryNodeManager:
                 str(item).strip().lower()
                 for item in raw_object_types
                 if str(item).strip().lower() in {"goal", "plan", "work_item"}
-            )) or list(default_object_types[evidence_kind])
+            ))
+            if not candidate_object_types:
+                continue
             user_role = str(raw.get("user_role") or "").strip().lower()
             if user_role not in {"owner", "participant", "responsible"}:
                 continue
             assertion_source = str(raw.get("assertion_source") or "").strip().lower()
             if assertion_source not in {
-                "self_statement", "third_party_report", "observed_event",
+                "self_statement", "confirmed_response", "third_party_report",
+                "observed_event",
             }:
-                continue
-            explicitness = str(raw.get("explicitness") or "").strip().lower()
-            if explicitness not in {"direct", "reported", "tentative"}:
                 continue
             subject = raw.get("subject_entity") or raw.get("subject") or fallback_entity
             if isinstance(subject, dict):
@@ -2156,39 +1553,58 @@ class MemoryNodeManager:
                 )
             else:
                 subject_name = _compact_whitespace(subject)
-            if self._is_world_owner_entity_reference(subject_name):
-                if not allows_world_owner_reference:
-                    continue
-                subject_name = self._world_owner_entity_name
-            elif subject_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES:
+            if not allows_world_owner_reference or not (
+                self._is_world_owner_entity_reference(subject_name)
+                or subject_name.lower() == self._world_owner_entity_name.lower()
+            ):
                 continue
-            future_commitment_anchor = _compact_whitespace(
-                raw.get("future_commitment_anchor") or raw.get("intent_anchor") or ""
+            subject_name = self._world_owner_entity_name
+            user_intent_anchor = _compact_whitespace(
+                raw.get("user_intent_anchor") or raw.get("intent_anchor") or ""
             )[:240]
             evidence_basis = _compact_whitespace(
                 raw.get("evidence_basis") or raw.get("evidence") or raw.get("reason") or ""
             )[:480]
-            if not subject_name or not future_commitment_anchor or not evidence_basis:
+            if not subject_name or not user_intent_anchor or not evidence_basis:
                 continue
+            if assertion_source == "observed_event":
+                if raw.get("owner_evidence_text") or raw.get("other_evidence_text"):
+                    continue
+                owner_evidence = {
+                    "owner_evidence_text": "",
+                    "other_evidence_text": "",
+                }
+            else:
+                owner_evidence = self._normalize_user_signal_owner_evidence(
+                    {**raw, "owner_evidence_type": assertion_source},
+                    source_units=source_units,
+                    owner_aliases=owner_aliases,
+                )
+                if owner_evidence is None:
+                    continue
+                owner_evidence.pop("owner_evidence_type")
             confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75)
+            if assertion_source == "third_party_report":
+                confidence = min(confidence, 0.65)
             key = (
                 subject_name.lower(),
-                evidence_kind,
-                self._generate_topic_name_key(future_commitment_anchor),
+                signal_purpose,
+                self._generate_topic_name_key(user_intent_anchor),
+                tuple(sorted(candidate_object_types)),
             )
             if key in seen:
                 continue
             seen.add(key)
             normalized.append({
                 "subject_entity": subject_name,
-                "evidence_kind": evidence_kind,
+                "signal_purpose": signal_purpose,
                 "candidate_object_types": candidate_object_types,
                 "user_role": user_role,
-                "future_commitment_anchor": future_commitment_anchor,
+                "user_intent_anchor": user_intent_anchor,
                 "assertion_source": assertion_source,
-                "explicitness": explicitness,
                 "evidence_basis": evidence_basis,
                 "confidence": confidence,
+                **owner_evidence,
             })
             if len(normalized) >= max_items:
                 break
@@ -2202,16 +1618,207 @@ class MemoryNodeManager:
 
     @staticmethod
     def _units_include_world_owner(units: Sequence[MemoryUnit]) -> bool:
-        """Return whether this fact task contains the tagged wearer side."""
+        """Return whether this fact task contains a verified wearer speaker."""
         return any(
             isinstance(unit, MemoryUnit)
-            and unit.unit_type == "interaction"
             and any(
-                _compact_whitespace(speaker) == "用户本人"
+                _compact_whitespace(speaker) == "speaker_用户本人"
                 for speaker in unit.speakers or []
             )
             for unit in units or ()
         )
+
+    def _confirmed_owner_aliases_in_fact(
+        self,
+        *,
+        entity_names: Sequence[str],
+        fact_text: str,
+        confirmed_aliases: Sequence[str],
+    ) -> List[str]:
+        """Resolve aliases co-referenced with the wearer, without another DB lookup."""
+        if not any(
+            self._is_world_owner_entity_reference(name)
+            or _compact_whitespace(name).lower() == self._world_owner_entity_name.lower()
+            for name in entity_names
+        ):
+            return []
+        confirmed_keys = {
+            self._db.normalize_owner_alias_key(name)
+            for name in confirmed_aliases
+        }
+        aliases: List[str] = []
+        for name in entity_names:
+            normalized_name = _compact_whitespace(name)
+            if (
+                normalized_name
+                and self._db.normalize_owner_alias_key(normalized_name) in confirmed_keys
+                and normalized_name.casefold() in fact_text.casefold()
+                and normalized_name not in aliases
+            ):
+                aliases.append(normalized_name)
+        return aliases
+
+    def _normalize_world_owner_alias_candidates(
+        self,
+        value: Any,
+        *,
+        fact_text: str,
+        entity_names: Sequence[str],
+        source_units: Sequence[MemoryUnit],
+    ) -> List[Dict[str, Any]]:
+        """Validate proposed owner names against current, speaker-attributed audio text."""
+        if not isinstance(value, list):
+            return []
+        source_entries = [
+            (_compact_whitespace(entry.get("speaker")), _compact_whitespace(entry.get("text")))
+            for unit in source_units
+            for entry in unit.entries()
+        ]
+        entity_keys = {
+            self._db.normalize_owner_alias_key(name)
+            for name in entity_names
+        }
+        candidates: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for raw in value[:4]:
+            if not isinstance(raw, dict):
+                continue
+            alias_name = _compact_whitespace(raw.get("alias_name") or "")[:80]
+            alias_key = self._db.normalize_owner_alias_key(alias_name)
+            evidence_type = str(raw.get("evidence_type") or "").strip().lower()
+            evidence_text = _compact_whitespace(raw.get("evidence_text") or "")[:480]
+            response_text = _compact_whitespace(raw.get("owner_response_text") or "")[:240]
+            if (
+                len(alias_key) < 2 or alias_key in seen
+                or alias_key not in entity_keys or alias_name not in fact_text
+                or alias_name.lower() in _AMBIGUOUS_USER_ENTITY_ALIASES
+                or self._is_world_owner_entity_reference(alias_name)
+                or evidence_type not in {
+                    "self_identification", "direct_address", "third_party_reference",
+                }
+                or not evidence_text or alias_name not in evidence_text
+            ):
+                continue
+            matching_positions = [
+                index for index, (speaker, text) in enumerate(source_entries)
+                if evidence_text in text and (
+                    speaker == "speaker_用户本人"
+                    if evidence_type == "self_identification"
+                    else speaker not in {"speaker_用户本人", "speaker_助手"}
+                )
+            ]
+            if not matching_positions:
+                continue
+            if evidence_type == "self_identification":
+                if not re.search(
+                    rf"(?:我叫|我是|我的名字(?:是)?|本人叫|my name is|i am|i'm)\s*{re.escape(alias_name)}",
+                    evidence_text,
+                    re.IGNORECASE,
+                ):
+                    continue
+                status = "confirmed"
+                source_speaker = "speaker_用户本人"
+            elif evidence_type == "direct_address":
+                if not response_text or response_text in {
+                    "嗯", "哦", "好", "好的", "知道了", "收到", "明白了",
+                } or not any(
+                    speaker == "speaker_用户本人" and response_text in text
+                    for position in matching_positions
+                    for speaker, text in source_entries[position + 1:]
+                ):
+                    continue
+                status = "confirmed"
+                source_speaker = source_entries[matching_positions[0]][0]
+            else:
+                if response_text:
+                    continue
+                status = "candidate"
+                source_speaker = source_entries[matching_positions[0]][0]
+            seen.add(alias_key)
+            candidates.append({
+                "alias_name": alias_name,
+                "status": status,
+                "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.75),
+                "evidence_type": evidence_type,
+                "evidence_text": evidence_text,
+                "source_speaker": source_speaker,
+            })
+        return candidates
+
+    def _normalize_user_signal_owner_evidence(
+        self,
+        signal: Dict[str, Any],
+        *,
+        source_units: Optional[Sequence[MemoryUnit]],
+        owner_aliases: Sequence[str] = (),
+    ) -> Optional[Dict[str, str]]:
+        """Validate the attributed quote, preserving whether it is hearsay."""
+        evidence_type = str(signal.get("owner_evidence_type") or "").strip().lower()
+        if evidence_type not in {"self_statement", "confirmed_response", "third_party_report"}:
+            return None
+        owner_text = _compact_whitespace(
+            signal.get("owner_evidence_text") or ""
+        ).strip("\"'“”")
+        other_text = _compact_whitespace(
+            signal.get("other_evidence_text") or ""
+        ).strip("\"'“”")
+        if evidence_type == "third_party_report":
+            if (
+                owner_text or not other_text or not any(
+                    self._db.normalize_owner_alias_key(alias)
+                    in self._db.normalize_owner_alias_key(other_text)
+                    for alias in owner_aliases
+                )
+            ):
+                return None
+            if source_units is not None and not any(
+                _compact_whitespace(entry.get("speaker") or "")
+                not in {"speaker_用户本人", "speaker_助手"}
+                and other_text in _compact_whitespace(entry.get("text") or "")
+                for unit in source_units for entry in unit.entries()
+            ):
+                return None
+            return {
+                "owner_evidence_type": evidence_type,
+                "owner_evidence_text": "",
+                "other_evidence_text": other_text,
+            }
+        if not owner_text or (
+            evidence_type == "confirmed_response" and not other_text
+        ) or (
+            evidence_type == "self_statement" and other_text
+        ):
+            return None
+        if evidence_type == "confirmed_response" and owner_text in {
+            "嗯", "哦", "好", "好的", "知道了", "收到", "明白了",
+        }:
+            return None
+        if source_units is not None:
+            source_entries = [
+                (
+                    _compact_whitespace(entry.get("speaker") or ""),
+                    _compact_whitespace(entry.get("text") or ""),
+                )
+                for unit in source_units
+                for entry in unit.entries()
+            ]
+            owner_positions = [
+                index for index, (speaker, text) in enumerate(source_entries)
+                if speaker == "speaker_用户本人" and owner_text in text
+            ]
+            if not owner_positions:
+                return None
+            if evidence_type == "confirmed_response" and not any(
+                speaker != "speaker_用户本人" and other_text in text
+                for owner_position in owner_positions
+                for speaker, text in source_entries[:owner_position]
+            ):
+                return None
+        return {
+            "owner_evidence_type": evidence_type,
+            "owner_evidence_text": owner_text,
+            "other_evidence_text": other_text,
+        }
 
     def _normalize_fact_entity_descriptors(
         self,
@@ -2253,8 +1860,8 @@ class MemoryNodeManager:
     ) -> str:
         is_en = prompt_language == "en"
         time_label = "Conversation timestamp" if is_en else "对话发生时间"
-        user_label = "user self" if is_en else "用户本人"
-        assistant_label = "Assistant" if is_en else "助手"
+        user_label = "speaker_用户本人"
+        assistant_label = "speaker_助手"
         blocks: List[str] = []
         for index, turn in enumerate(turns, 1):
             blocks.append(
@@ -2419,29 +2026,20 @@ class MemoryNodeManager:
         canonical_topics: Sequence[Any],
         aspect_topics: Sequence[Any] = (),
         fact_id: Optional[int] = None,
-        episode_id: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Create compact topic-registry updates from persisted memory fields."""
         normalized_fact_id = int(fact_id or 0)
-        normalized_episode_id = int(episode_id or 0)
         updates: List[Dict[str, Any]] = []
-        canonical_keys: set[str] = set()
-
         def add(topic_kind: str, value: Any) -> None:
             topic_name = self._normalize_topic_name(value)
             if not topic_name or not self._is_indexable_memory_topic(topic_name):
                 return
             topic_key = self._generate_topic_name_key(topic_name)
-            if topic_kind == "aspect" and topic_key in canonical_keys:
-                # An aspect equal to its fact root adds no finer-grained
-                # vocabulary and would only duplicate prompt candidates.
-                return
             item: Dict[str, Any] = {
                 "topic_kind": topic_kind,
                 "topic_name": topic_name,
                 "topic_key": topic_key,
                 "fact_ids": [normalized_fact_id] if normalized_fact_id > 0 else [],
-                "episode_ids": [normalized_episode_id] if normalized_episode_id > 0 else [],
             }
             if not any(
                 existing["topic_kind"] == topic_kind
@@ -2451,135 +2049,12 @@ class MemoryNodeManager:
                 updates.append(item)
 
         for topic in canonical_topics or ():
-            topic_name = self._normalize_topic_name(topic)
-            if topic_name and self._is_indexable_memory_topic(topic_name):
-                canonical_keys.add(self._generate_topic_name_key(topic_name))
             add("canonical", topic)
-        # Aspect topics are defined only by facts. Episode callers therefore
-        # leave this sequence empty.
+        # Aspect topics are defined only by facts.
         if normalized_fact_id > 0:
             for topic in aspect_topics or ():
                 add("aspect", topic)
         return updates
-
-    def _collect_memory_topic_item_context(
-        self,
-        *,
-        units: Sequence[MemoryUnit],
-        canonical_limit: int = 12,
-        aspect_limit: int = 12,
-    ) -> Dict[str, List[str]]:
-        """Return only topic names lexically related to the incoming evidence."""
-        query_text = " ".join(
-            _compact_whitespace(unit.text)
-            for unit in units or ()
-            if isinstance(unit, MemoryUnit)
-        )
-        query_terms = self._lexical_search_terms_for_text(
-            query_text,
-            limit=24,
-            preserve_phrase=False,
-        )
-        if not query_terms:
-            return {"canonical_topics": [], "aspect_topics": []}
-        try:
-            rows = self._db.list_memory_topic_items(limit=240)
-        except Exception as exc:
-            self._logger.debug("Failed to load memory topic item context: %s", exc)
-            return {"canonical_topics": [], "aspect_topics": []}
-
-        ranked: List[Tuple[float, Dict[str, Any]]] = []
-        query_key = self._generate_topic_name_key(query_text)
-        for row in rows:
-            topic_name = self._normalize_topic_name(row.get("topic_name") or "")
-            topic_key = self._generate_topic_name_key(topic_name) if topic_name else ""
-            if not topic_name or not topic_key:
-                continue
-            score = self._topic_name_best_pair_similarity(
-                query_terms,
-                [topic_name],
-            )
-            if query_key and topic_key and topic_key in query_key:
-                score = max(score, 0.9)
-            if score < 0.5:
-                continue
-            ranked.append((score, row))
-
-        result: Dict[str, List[str]] = {
-            "canonical_topics": [],
-            "aspect_topics": [],
-        }
-        limits = {
-            "canonical": max(1, int(canonical_limit or 12)),
-            "aspect": max(1, int(aspect_limit or 12)),
-        }
-        for _score, row in sorted(
-            ranked,
-            key=lambda item: (
-                item[0],
-                str(item[1].get("last_seen_at") or ""),
-                int(item[1].get("fact_occurrence_count") or 0)
-                + int(item[1].get("episode_occurrence_count") or 0),
-            ),
-            reverse=True,
-        ):
-            kind = str(row.get("topic_kind") or "").strip().lower()
-            result_key = f"{kind}_topics"
-            topic_name = self._normalize_topic_name(row.get("topic_name") or "")
-            if (
-                kind not in limits
-                or not topic_name
-                or topic_name in result[result_key]
-                or len(result[result_key]) >= limits[kind]
-            ):
-                continue
-            result[result_key].append(topic_name)
-        return result
-
-    @staticmethod
-    def _format_memory_topic_items_for_prompt(
-        topic_items: Dict[str, List[str]],
-        *,
-        max_chars: int = 1200,
-    ) -> str:
-        payload = {
-            "canonical_topics": list(topic_items.get("canonical_topics") or []),
-            "aspect_topics": list(topic_items.get("aspect_topics") or []),
-        }
-        while payload["canonical_topics"] or payload["aspect_topics"]:
-            text = json.dumps(payload, ensure_ascii=False, indent=2)
-            if len(text) <= max_chars:
-                return text
-            if len(payload["aspect_topics"]) >= len(payload["canonical_topics"]):
-                payload["aspect_topics"].pop()
-            else:
-                payload["canonical_topics"].pop()
-        return "[]"
-
-    def _normalize_episode_canonical_topics(
-        self,
-        value: Any,
-        *,
-        fallback_text: str,
-        limit: int,
-    ) -> List[str]:
-        raw_topics = self._coerce_topic_list(value)
-        if not raw_topics:
-            raw_topics = self._topic_candidates(fallback_text)
-        normalized: List[str] = []
-        seen: set[str] = set()
-        for raw_topic in raw_topics:
-            topic = self._normalize_topic_name(raw_topic)
-            if not topic:
-                continue
-            key = topic.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(topic)
-            if len(normalized) >= max(1, int(limit or 5)):
-                break
-        return normalized
 
     @staticmethod
     def _coerce_topic_list(value: Any) -> List[Any]:
@@ -2686,49 +2161,6 @@ class MemoryNodeManager:
         )
         return self._resolve_prompt_language_from_text(text)
 
-    def _episode_title(self, turns: List[Dict[str, Any]]) -> str:
-        for turn in turns:
-            text = turn.get("user_message") or turn.get("assistant_response") or ""
-            if text:
-                return _compact_whitespace(text)[:96]
-        return "assistant interaction episode"
-
-    def _episode_summary(self, turns: List[Dict[str, Any]]) -> str:
-        chunks: List[str] = []
-        for turn in turns[:6]:
-            if turn.get("user_message"):
-                chunks.append(f"User: {turn['user_message']}")
-            if turn.get("assistant_response"):
-                chunks.append(f"Assistant: {turn['assistant_response'][:600]}")
-        return "\n".join(chunks)
-
-    def _fallback_generate_episode_title_from_units(self, units: Sequence[MemoryUnit]) -> str:
-        for unit in units:
-            text = unit.text or ""
-            if text:
-                return _compact_whitespace(text)[:96]
-        return "memory episode"
-
-    def _fallback_generate_episode_summary_from_units(self, units: Sequence[MemoryUnit]) -> str:
-        chunks: List[str] = []
-        for unit in list(units)[:10]:
-            for index, text in enumerate(unit.texts or []):
-                clean_text = _compact_whitespace(text)
-                if not clean_text:
-                    continue
-                speaker = (
-                    unit.speakers[index]
-                    if index < len(unit.speakers)
-                    else "speaker"
-                )
-                started_at = (
-                    unit.started_ats[index]
-                    if index < len(unit.started_ats)
-                    else ""
-                ) or ""
-                chunks.append(f"{started_at} {speaker}: {clean_text[:600]}")
-        return "\n".join(chunks)
-
     def _is_low_value_assistant_closing(self, text: str) -> bool:
         clean = _compact_whitespace(text)
         if not clean:
@@ -2745,36 +2177,27 @@ class MemoryNodeManager:
             return not has_specific_action
         return False
 
-    @staticmethod
-    def _is_low_value_user_acknowledgement(text: str) -> bool:
-        clean = _compact_whitespace(text)
-        if not clean:
-            return True
-        lower = clean.lower()
-        if len(clean) > 48:
-            return False
-        if any(marker in lower for marker in ("?", "？", "帮我", "需要", "想要", "计划", "决定", "安排", "提醒", "购买", "预约", "need", "want", "plan", "decide", "remind")):
-            return False
-        acknowledgement_markers = (
-            "好的", "可以", "行", "嗯", "谢谢", "试一试", "听起来", "明白",
-            "ok", "okay", "thanks", "thank you", "sounds good", "i'll try",
-        )
-        return any(marker in lower for marker in acknowledgement_markers)
-
     def _store_extracted_memory_facts_into_db(
         self,
         *,
-        episode_id: Optional[int],
         facts: List[Dict[str, Any]],
         tags: List[str],
-        episode_context_topics: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         fact_ids: List[int] = []
         topic_item_updates: List[Dict[str, Any]] = []
-        entity_claim_signal_mapping_updates: List[Dict[str, Any]] = []
-        future_commitment_signal_mapping_updates: List[Dict[str, Any]] = []
-        entity_claim_signal_fact_ids: List[int] = []
-        future_commitment_signal_fact_ids: List[int] = []
+        user_claim_signal_mapping_updates: List[Dict[str, Any]] = []
+        user_action_signal_updates: List[Dict[str, Any]] = []
+        user_intent_signal_mapping_updates: List[Dict[str, Any]] = []
+        user_claim_signal_fact_ids: List[int] = []
+        user_action_signal_fact_ids: List[int] = []
+        user_intent_signal_fact_ids: List[int] = []
+        owner_entity_id = self._intent_world_owner_entity_id()
+        stored_confirmed_alias_keys = {
+            str(row["alias_key"])
+            for row in self._db.get_owner_entity_aliases(
+                owner_entity_id, status="confirmed", limit=4096,
+            )
+        }
         for fact in facts:
             keywords = self._normalize_string_list(
                 fact.get("keywords"),
@@ -2786,18 +2209,29 @@ class MemoryNodeManager:
             entity_descriptors = list(fact.get("entity_descriptors") or [])
             raw_metadata = fact.get("metadata")
             metadata = dict(raw_metadata) if isinstance(raw_metadata, dict) else {}
+            resolved_world_owner_aliases = list(fact["resolved_world_owner_aliases"])
             fallback_topics = self._topic_candidates(fact["summary"])
-            fact_root_topic = self._normalize_topic_name(
-                fact.get("fact_root_topic")
-                or next(iter(episode_context_topics or []), "")
-            ) or self._normalize_topic_name(
-                fallback_topics[0] if fallback_topics else ""
-            ) or "general"
-            fact_aspect_topic = self._normalize_topic_name(
-                fact.get("fact_aspect_topic")
-                or fact_root_topic
-            ) or fact_root_topic
-            entity_mapping = self._db.upsert_entity_nodes(entity_descriptors)
+            fact_topic = (
+                self._normalize_topic_name(fact.get("fact_topic"))
+                or self._normalize_topic_name(
+                    fallback_topics[0] if fallback_topics else ""
+                )
+                or "general"
+            )
+            owner_alias_keys = {
+                self._db.normalize_owner_alias_key(alias)
+                for alias in resolved_world_owner_aliases
+            }
+            entity_mapping = self._db.upsert_entity_nodes([
+                descriptor for descriptor in entity_descriptors
+                if self._db.normalize_owner_alias_key(descriptor.get("name") or "")
+                not in owner_alias_keys
+            ])
+            if owner_alias_keys:
+                for descriptor in entity_descriptors:
+                    name = str(descriptor.get("name") or "")
+                    if self._db.normalize_owner_alias_key(name) in owner_alias_keys:
+                        entity_mapping[name] = owner_entity_id
             entity_ids = [
                 entity_mapping[entity_name]
                 for entity_name in fact_entities
@@ -2807,430 +2241,430 @@ class MemoryNodeManager:
                 **metadata,
                 "tags": tags,
                 "entity_descriptors": entity_descriptors,
-                "episode_context_topics": list(episode_context_topics or []),
             }
             fact_id = self._db.insert_fact(
-                episode_id=episode_id,
                 fact_type=fact["fact_type"],
                 summary=fact["summary"],
                 keywords=keywords,
                 entities=fact_entities,
                 entity_ids=entity_ids,
-                fact_root_topic=fact_root_topic,
-                fact_aspect_topic=fact_aspect_topic,
+                fact_topic=fact_topic,
                 event_time_key=fact.get("event_time_key") or "",
                 dialogue_time_key=fact.get("dialogue_time_key") or "",
                 confidence=fact["confidence"],
                 importance=fact["importance"],
                 metadata=fact_metadata,
             )
+            confirmed_candidates_by_key = {
+                self._db.normalize_owner_alias_key(alias["alias_name"]): alias
+                for alias in fact.get("world_owner_alias_candidates") or []
+                if isinstance(alias, dict) and alias.get("status") == "confirmed"
+            }
+            for alias_name in resolved_world_owner_aliases:
+                alias_key = self._db.normalize_owner_alias_key(alias_name)
+                alias = confirmed_candidates_by_key.get(alias_key)
+                if alias_key in stored_confirmed_alias_keys or alias is None:
+                    # Known aliases need no new row, and fresh aliases need
+                    # current-fact confirmation evidence before persistence.
+                    continue
+                self._db.upsert_owner_entity_alias(
+                    owner_entity_id=owner_entity_id,
+                    alias_name=alias_name,
+                    status="confirmed",
+                    confidence=alias["confidence"],
+                    evidence_fact_id=fact_id,
+                    evidence_type=alias["evidence_type"],
+                    evidence_text=alias["evidence_text"],
+                    source_speaker=alias["source_speaker"],
+                )
+                stored_confirmed_alias_keys.add(alias_key)
             self._upsert_fact_recall_document(
                 fact_id=fact_id,
                 summary=fact["summary"],
                 keywords=keywords,
                 entities=fact_entities,
                 entity_ids=entity_ids,
-                fact_root_topic=fact_root_topic,
-                fact_aspect_topic=fact_aspect_topic,
+                fact_topic=fact_topic,
                 event_time_key=fact.get("event_time_key") or "",
                 dialogue_time_key=fact.get("dialogue_time_key") or "",
                 confidence=float(fact["confidence"]),
                 importance=float(fact["importance"]),
             )
             fact_ids.append(fact_id)
-            entity_claim_updates = (
-                self._fact_entity_claim_signal_mapping_updates(fact_id, fact)
+            user_claim_updates = (
+                self._fact_user_claim_signal_mapping_updates(fact_id, fact)
             )
-            entity_claim_signal_mapping_updates.extend(entity_claim_updates)
-            if any(
-                str(item.get("signal_key") or "") != "__fact__"
-                for item in entity_claim_updates
-            ):
-                entity_claim_signal_fact_ids.append(fact_id)
-            future_commitment_updates = (
-                self._fact_future_commitment_signal_mapping_updates(fact_id, fact)
+            user_claim_signal_mapping_updates.extend(user_claim_updates)
+            if user_claim_updates:
+                user_claim_signal_fact_ids.append(fact_id)
+            action_updates = self._fact_user_action_signal_updates(
+                fact_id=fact_id,
+                fact=fact,
+                owner_entity_id=owner_entity_id,
             )
-            future_commitment_signal_mapping_updates.extend(future_commitment_updates)
-            if any(
-                str(item.get("signal_key") or "") != "__fact__"
-                for item in future_commitment_updates
-            ):
-                future_commitment_signal_fact_ids.append(fact_id)
+            user_action_signal_updates.extend(action_updates)
+            if action_updates:
+                user_action_signal_fact_ids.append(fact_id)
+            user_intent_updates = (
+                self._fact_user_intent_signal_mapping_updates(fact_id, fact)
+            )
+            user_intent_signal_mapping_updates.extend(user_intent_updates)
+            if user_intent_updates:
+                user_intent_signal_fact_ids.append(fact_id)
             topic_item_updates.extend(
                 self._build_memory_topic_item_updates(
-                    canonical_topics=[fact_root_topic],
-                    aspect_topics=[fact_aspect_topic],
+                    canonical_topics=[],
+                    aspect_topics=[fact_topic],
                     fact_id=fact_id,
                 )
             )
-        self._db.upsert_fact_entity_claim_signal_mappings(
-            entity_claim_signal_mapping_updates
+        self._db.upsert_fact_user_claim_signals(
+            user_claim_signal_mapping_updates
         )
-        self._db.upsert_fact_future_commitment_signal_mappings(
-            future_commitment_signal_mapping_updates
+        self._db.upsert_fact_user_action_signals(user_action_signal_updates)
+        self._db.upsert_fact_user_intent_signals(
+            user_intent_signal_mapping_updates
         )
         return {
             "fact_ids": fact_ids,
             "topic_item_updates": topic_item_updates,
-            "entity_claim_signal_fact_count": len(entity_claim_signal_fact_ids),
-            "entity_claim_signal_count": sum(
-                1
-                for item in entity_claim_signal_mapping_updates
-                if str(item.get("signal_key") or "") != "__fact__"
+            "user_claim_signal_fact_count": len(user_claim_signal_fact_ids),
+            "user_claim_signal_count": len(user_claim_signal_mapping_updates),
+            "user_action_signal_fact_count": len(user_action_signal_fact_ids),
+            "user_action_signal_count": len(user_action_signal_updates),
+            "user_intent_signal_fact_count": len(
+                user_intent_signal_fact_ids
             ),
-            "future_commitment_signal_fact_count": len(
-                future_commitment_signal_fact_ids
-            ),
-            "future_commitment_signal_count": sum(
-                1
-                for item in future_commitment_signal_mapping_updates
-                if str(item.get("signal_key") or "") != "__fact__"
-            ),
+            "user_intent_signal_count": len(user_intent_signal_mapping_updates),
         }
 
-    # ── Entity-claim update: facts/episodes -> entity claims ─────────────
-
-    def submit_memory_entity_claim_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
-        """Queue an entity-claim update after accepted memory tasks."""
-        completion_context = kwargs.pop("completion_context", None)
-        if not self._memory_enabled:
-            task_id = self._operation_reporter.next_task_id(
-                "memory_entity_claim_update"
-            )
-            return self._reject_memory_task(
-                task_kind="memory_entity_claim_update",
-                task_id=task_id,
-                reason="memory_disabled",
-            )
-        return self._submit_memory_task(
-            task_kind="memory_entity_claim_update",
-            payload=dict(kwargs),
-            completion_context=(
-                dict(completion_context)
-                if isinstance(completion_context, dict)
-                else None
-            ),
-        )
-
-    def submit_memory_future_commitment_update_task(self, *_, **kwargs: Any) -> Dict[str, Any]:
-        """Queue a future-commitment projection after committed fact evidence."""
-        completion_context = kwargs.pop("completion_context", None)
-        if not self._memory_enabled or not self._enable_memory_future_commitment_update:
-            task_id = self._operation_reporter.next_task_id("memory_future_commitment_update")
-            return self._reject_memory_task(
-                task_kind="memory_future_commitment_update",
-                task_id=task_id,
-                reason=("memory_disabled" if not self._memory_enabled else "future_commitment_update_disabled"),
-            )
-        return self._submit_memory_task(
-            task_kind="memory_future_commitment_update",
-            payload=dict(kwargs),
-            completion_context=(
-                dict(completion_context)
-                if isinstance(completion_context, dict)
-                else None
-            ),
-        )
-
-    def _process_memory_entity_claim_update_task(
-        self,
-        limit: Optional[int] = None,
+    def _process_memory_user_observed_pattern_update_task(
+        self, *, signal_ids: Optional[Sequence[int]] = None,
         reference_timestamp: Optional[Any] = None,
+        **_: Any,
+    ) -> Dict[str, Any]:
+        """Find similar past actions and reconcile resulting pattern candidates."""
+        selected_ids = list(dict.fromkeys(
+            int(value) for value in signal_ids or [] if int(value) > 0
+        ))
+        if not selected_ids:
+            return {"status": "empty", "signal_count": 0,
+                    "new_pattern_ids": [], "pattern_relation_event_ids": [],
+                    "_completed_signal_ids": []}
+        started_at = time.monotonic()
+        update = self._update_user_observed_patterns_from_action_signals(
+            selected_ids,
+        )
+        completed = bool(update.get("completed"))
+        pattern_relation_event_ids = [int(event["id"])
+            for event in self._db.get_user_observed_pattern_events_for_signal_ids(
+                selected_ids
+            )
+        ] if completed else []
+        report = {
+            "status": "ok" if completed else "failed",
+            "signal_count": len(selected_ids),
+            "similar_action_batches": int(update.get("similar_action_batches") or 0),
+            "pattern_relations_recorded": int(update.get("relations_recorded") or 0),
+            "direct_support_signal_count": int(
+                update.get("direct_support_signal_count") or 0
+            ),
+            "user_observed_patterns_created": int(update.get("created") or 0),
+            "user_observed_patterns_updated": int(update.get("updated") or 0),
+            "new_pattern_ids": update.get("new_pattern_ids") or [],
+            "pattern_relation_event_ids": pattern_relation_event_ids,
+            "reference_timestamp": reference_timestamp,
+            "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+            "_completed_signal_ids": selected_ids if completed else [],
+        }
+        if update.get("error"):
+            report["error"] = update["error"]
+        self._log_info("memory_user_observed_pattern_update", "finish", report)
+        return report
+
+    def _process_memory_user_claim_update_task(
+        self,
+        reference_timestamp: Optional[Any] = None,
+        signal_ids: Optional[Sequence[int]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """Project new facts and completed episodes into entity claims."""
+        """Project new facts into user claims."""
         update_started_at = time.monotonic()
-        limit = max(
-            1,
-            int(limit or self._memory_cfg.get("entity_claim_limit") or 100),
-        )
+        selected_signal_ids = list(dict.fromkeys(
+            int(value) for value in signal_ids or [] if int(value) > 0
+        ))
         if reference_timestamp is None:
             reference_timestamp = kwargs.get("timestamp") or _now_text()
-        self._log_info("memory_entity_claim", "start", {
-            "limit": limit,
+        self._log_info("memory_user_claim", "start", {
             "timestamp": reference_timestamp,
+            "user_claim_signal_count": len(selected_signal_ids),
         })
-        with self._db.transaction():
-            claim_report = self._update_memory_entity_claims(
-                limit=limit,
-                reference_timestamp=reference_timestamp,
-            )
+        claim_report = self._update_memory_user_claims(
+            signal_ids=selected_signal_ids,
+            reference_timestamp=reference_timestamp,
+        )
+        new_claim_ids = list(claim_report.get("new_claim_ids") or [])
+        claim_relations = list(claim_report.get("claim_relations") or [])
+        self._log_info("memory_user_claim", "user_claim_update_finish", claim_report)
+        explicit_failed_count = int(
+            claim_report.get("explicit", {}).get("failed_signal_count") or 0
+        )
+        completed_signal_count = len(
+            claim_report.get("_completed_signal_ids") or []
+        )
+        failed_derived_seed_claim_ids = list(
+            claim_report.get("derived", {}).get("failed_seed_claim_ids") or []
+        )
+        has_failures = explicit_failed_count > 0 or bool(failed_derived_seed_claim_ids)
         report = {
             "status": (
-                "ok"
-                if (
-                    claim_report.get("explicit", {}).get("fact_count", 0)
-                    or claim_report.get("derived", {}).get("updated", 0)
-                    or claim_report.get("inductive", {}).get("seed_fact_count", 0)
-                )
-                else "empty"
+                "partial" if has_failures and completed_signal_count
+                else "failed" if has_failures
+                else "ok" if completed_signal_count else "empty"
             ),
+            "explicit_failed_signal_count": explicit_failed_count,
+            "failed_derived_seed_claim_ids": failed_derived_seed_claim_ids,
+            "derived_failures": list(claim_report.get("derived", {}).get("failures") or []),
             "explicit_claims_updated": int(
                 claim_report.get("explicit", {}).get("updated", 0) or 0
             ),
-            "inductive_claims_updated": int(
-                claim_report.get("inductive", {}).get("updated", 0) or 0
-            ),
             "derived_claims_updated": int(
                 claim_report.get("derived", {}).get("updated", 0) or 0
-            ),
-            "facts_marked_processed_for_memory_entity_claim": int(
-                claim_report.get("explicit", {}).get("facts_marked_processed", 0) or 0
-            ),
-            "facts_marked_processed_for_entity_claim_induction": int(
-                claim_report.get("inductive", {}).get("facts_marked_processed", 0) or 0
             ),
             "total_elapsed_ms": round(
                 (time.monotonic() - update_started_at) * 1000,
                 2,
             ),
         }
-        self._log_info("memory_entity_claim", "finish", report)
+        report["new_claim_ids"] = new_claim_ids
+        report["claim_relations"] = claim_relations
+        report["reference_timestamp"] = reference_timestamp
+        report["_completed_signal_ids"] = claim_report.get(
+            "_completed_signal_ids", [],
+        )
+        self._log_info("memory_user_claim", "finish", report)
         return report
 
-    def _process_memory_future_commitment_update_task(
+    def _process_memory_user_intent_update_task(
         self,
         *,
-        limit: Optional[int] = None,
         reference_timestamp: Optional[Any] = None,
+        signal_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
-        """Settle pending future-facing evidence in isolated evidence groups."""
-        limit = max(
-            1,
-            int(limit or self._memory_cfg.get("future_commitment_limit") or 100),
-        )
+        """Process independent signal batches and return only committed change events."""
         reference_timestamp = reference_timestamp or _now_text()
-        facts = self._db.get_unprocessed_facts(
-            processing_target="future_commitment_update",
-            reference_timestamp=reference_timestamp,
-            limit=limit,
-            restrict_to_today=False,
+        selected_signal_ids = list(dict.fromkeys(
+            int(value) for value in signal_ids or [] if int(value) > 0
+        ))
+        pending_signals = self._db.get_user_intent_signals_by_ids(
+            selected_signal_ids,
+        )
+        facts = self._db.get_memory_facts_by_ids(
+            sorted({int(signal["fact_id"]) for signal in pending_signals})
         )
         report: Dict[str, Any] = {
             "status": "empty",
-            "seed_fact_count": len(facts),
-            "future_commitment_signal_count": 0,
-            "evidence_group_count": 0,
-            "candidate_count": 0,
-            "applied_count": 0,
-            "created": 0,
-            "updated": 0,
-            "facts_marked_processed": 0,
-            "failed_group_count": 0,
+            "reference_timestamp": str(reference_timestamp),
+            "intent_event_ids": [],
+            "_completed_signal_ids": [],
+            "failed_signal_ids": [],
         }
-        self._log_future_commitment_facts_loaded(
-            "future_commitment_update", facts, limit, reference_timestamp,
-        )
-        if not facts:
-            self._log_info("memory_future_commitment_update", "finish", report)
-            return report
-
         facts_by_id = {
             int(fact["id"]): fact
             for fact in facts
             if str(fact.get("id") or "").strip().isdigit()
         }
-        future_commitment_signals = [
-            signal
-            for fact in facts_by_id.values()
-            for signal in self._future_commitment_signals_from_fact(fact)
-        ]
-        report["future_commitment_signal_count"] = len(future_commitment_signals)
-        if not future_commitment_signals:
-            self._log_info("memory_future_commitment_update", "finish", report)
+        signal_items: List[Dict[str, Any]] = []
+        for signal in pending_signals:
+            fact_id = int(signal["fact_id"])
+            fact = facts_by_id.get(fact_id)
+            if fact is None:
+                continue
+            signal_items.append({
+                "signal_id": int(signal["signal_id"]),
+                "fact_id": fact_id,
+                "fact": fact,
+                "signal": signal,
+            })
+        self._log_user_intent_signals_loaded(signal_items, reference_timestamp)
+        available_signal_ids = {item["signal_id"] for item in signal_items}
+        report["failed_signal_ids"] = sorted(set(selected_signal_ids) - available_signal_ids)
+        if report["failed_signal_ids"]:
+            self._log_info("memory_user_intent_update", "batch_error", {
+                "phase": "input_validation",
+                "signal_ids": report["failed_signal_ids"],
+                "error": "missing_signal_or_supporting_fact",
+            })
+        if not signal_items:
+            if report["failed_signal_ids"]:
+                report["status"] = "failed"
+            self._log_info("memory_user_intent_update", "finish", report)
             return report
 
         world_owner_id = self._intent_world_owner_entity_id()
-        evidence_groups = self._group_future_commitment_signals(
-            future_commitment_signals,
-            facts_by_id=facts_by_id,
+        batch_size = max(
+            1,
+            int(self._memory_cfg.get("user_intent_signal_batch_size") or 8),
         )
-        report["evidence_group_count"] = len(evidence_groups)
-        successful_group_fact_ids: set[int] = set()
-        failed_group_fact_ids: set[int] = set()
-        for group_index, group in enumerate(evidence_groups):
-            group_facts = list(group["facts"])
-            group_fact_ids = list(group["fact_ids"])
+        for batch_start in range(0, len(signal_items), batch_size):
+            batch = signal_items[batch_start:batch_start + batch_size]
+            batch_index = batch_start // batch_size
             language = self._resolve_prompt_language_from_text("\n".join(
-                str(fact.get("summary") or "") for fact in group_facts
+                str(item["fact"].get("summary") or "") for item in batch
             ))
             prompt_template = (
                 INTENT_EXTRACTION_PROMPT_EN
                 if language == "en" else INTENT_EXTRACTION_PROMPT_ZH
             )
-            world_owner_prompt_name = (
-                "user self"
-                if language == "en"
-                else self._world_owner_entity_name
-            )
-            raw = self._call_llm(
-                prompt_template.replace("{world_owner_name}", world_owner_prompt_name)
-                .replace("{reference_timestamp}", str(reference_timestamp))
-                .replace("{facts}", json.dumps(
-                    self._future_commitment_group_fact_prompt_views(group),
-                    ensure_ascii=False,
-                    indent=2,
-                ))
-            )
-            parsed = self._parse_json_object_from_llm_text(raw or "")
-            candidate_list_fields = (
-                "goal_candidates",
-                "plan_candidates",
-                "work_item_candidates",
-            )
-            if (
-                parsed is None
-                or not isinstance(parsed, dict)
-                or any(not isinstance(parsed.get(field), list) for field in candidate_list_fields)
-            ):
-                report["failed_group_count"] += 1
-                failed_group_fact_ids.update(group_fact_ids)
-                self._log_info("memory_future_commitment_update", "group_error", {
-                    "group_index": group_index,
-                    "group_key": group["group_key"],
-                    "fact_ids": group_fact_ids,
-                    "error": "invalid_llm_future_commitment_extraction_response",
+            batch_error = ""
+            try:
+                raw = self._llm_client.call_llm(
+                    prompt_template.replace("{reference_timestamp}", str(reference_timestamp))
+                    .replace("{signal_items}", json.dumps(
+                        [self._user_intent_signal_prompt_view(item) for item in batch],
+                        ensure_ascii=False,
+                        indent=2,
+                    ))
+                )
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            except Exception as exc:
+                parsed = None
+                batch_error = str(exc)
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+                report["failed_signal_ids"].extend(item["signal_id"] for item in batch)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [item["signal_id"] for item in batch],
+                    "phase": "extraction",
+                    "error": batch_error or "invalid_llm_user_intent_extraction_response",
                 })
                 continue
 
-            group_facts_by_id = {
-                int(fact["id"]): fact
-                for fact in group_facts
-                if str(fact.get("id") or "").strip().isdigit()
-            }
-            entity_ids_by_name: Dict[str, int] = {}
-            for fact in group_facts_by_id.values():
-                for raw_name, raw_entity_id in zip(
-                    fact.get("entities") or [],
-                    fact.get("entity_ids") or [],
-                ):
-                    entity_name = _compact_whitespace(raw_name)
-                    if not entity_name or entity_name in entity_ids_by_name:
-                        continue
-                    try:
-                        entity_id = int(raw_entity_id)
-                    except (TypeError, ValueError):
-                        continue
-                    if entity_id > 0:
-                        entity_ids_by_name[entity_name] = entity_id
-            candidates = self._normalize_intent_candidates(
-                parsed,
-                facts_by_id=group_facts_by_id,
-                entity_ids=entity_ids_by_name,
-                world_owner_id=world_owner_id,
-            )
-            report["candidate_count"] += len(candidates)
-            decisions = self._reconcile_intent_candidates(
-                candidates,
-                world_owner_id=world_owner_id,
-                prompt_language=language,
-                existing_by_type=self._retrieve_future_commitment_related_intent_objects(
+            try:
+                normalized = self._normalize_intent_candidates(
+                    parsed["results"],
+                    signal_items=batch,
+                    world_owner_id=world_owner_id,
+                )
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                report["failed_signal_ids"].extend(item["signal_id"] for item in batch)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [item["signal_id"] for item in batch],
+                    "phase": "normalization",
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+                continue
+            candidates = normalized["future_intent_candidates"]
+            observations = normalized["intent_lifecycle_observations"]
+            report["_completed_signal_ids"].extend(normalized["empty_signal_ids"])
+            report["failed_signal_ids"].extend(normalized["failed_signal_ids"])
+            phase = "future_intent_reconciliation"
+            try:
+                decisions = self._reconcile_future_intent_candidates(
                     candidates,
                     world_owner_id=world_owner_id,
-                ),
-            )
-            with self._db.transaction():
-                applied = self._apply_intent_candidates(candidates, decisions)
-            successful_group_fact_ids.update(group_fact_ids)
-            report["applied_count"] += len(applied)
-            report["created"] += sum(item["created"] for item in applied)
-            report["updated"] += sum(not item["created"] for item in applied)
-            self._log_info("memory_future_commitment_update", "group_finish", {
-                "group_index": group_index,
-                "group_key": group["group_key"],
-                "fact_ids": group_fact_ids,
-                "future_commitment_signal_count": len(group["signals"]),
+                    prompt_language=language,
+                )
+                phase = "future_intent_save"
+                applied = self._save_future_intent_candidates(
+                    candidates,
+                    decisions,
+                    facts_by_id=facts_by_id,
+                    reference_timestamp=reference_timestamp,
+                )
+                report["_completed_signal_ids"].extend(applied["completed_signal_ids"])
+                report["failed_signal_ids"].extend(applied["failed_signal_ids"])
+                report["intent_event_ids"].extend(applied["intent_event_ids"])
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                report["failed_signal_ids"].extend(candidate["signal_id"] for candidate in candidates)
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": [candidate["signal_id"] for candidate in candidates],
+                    "error_type": type(exc).__name__, "error": str(exc),
+                    "phase": phase,
+                })
+
+            # Match after saving future candidates so this batch's newly stored
+            # intents are visible too. A failure in either branch is independent.
+            phase = "lifecycle_reconciliation"
+            try:
+                lifecycle_decisions = self._reconcile_intent_lifecycle_observations(
+                    observations, facts_by_id=facts_by_id,
+                    world_owner_id=world_owner_id, prompt_language=language,
+                )
+                phase = "lifecycle_save"
+                saved = self._save_intent_lifecycle_observations(
+                    observations, lifecycle_decisions, world_owner_id=world_owner_id,
+                )
+            except sqlite3.Error:
+                raise
+            except Exception as exc:
+                saved = {
+                    "completed_signal_ids": [],
+                    "failed_signal_ids": [item["signal_id"] for item in observations],
+                    "intent_event_ids": [], "intent_lifecycle_observation_ids": [],
+                    "unmatched_observation_ids": [],
+                }
+                self._log_info("memory_user_intent_update", "batch_error", {
+                    "batch_index": batch_index,
+                    "signal_ids": saved["failed_signal_ids"],
+                    "phase": phase,
+                    "error_type": type(exc).__name__, "error": str(exc),
+                })
+            report["_completed_signal_ids"].extend(saved["completed_signal_ids"])
+            report["failed_signal_ids"].extend(saved["failed_signal_ids"])
+            report["intent_event_ids"].extend(saved["intent_event_ids"])
+            self._log_info("memory_user_intent_update", "batch_finish", {
+                "batch_index": batch_index,
+                "signal_ids": [item["signal_id"] for item in batch],
                 "candidate_count": len(candidates),
-                "created": sum(item["created"] for item in applied),
-                "updated": sum(not item["created"] for item in applied),
+                "lifecycle_observation_count": len(observations),
+                "lifecycle_observation_saved_count": len(saved["intent_lifecycle_observation_ids"]),
+                "lifecycle_relation_count": (
+                    len(saved["intent_lifecycle_observation_ids"])
+                    - len(saved["unmatched_observation_ids"])
+                ),
+                "unmatched_lifecycle_observation_ids": saved["unmatched_observation_ids"],
             })
 
-        completed_group_fact_ids = sorted(
-            successful_group_fact_ids - failed_group_fact_ids
+        report["intent_event_ids"] = sorted(set(report["intent_event_ids"]))
+        report["_completed_signal_ids"] = sorted(set(report["_completed_signal_ids"]))
+        # Never silently lose an input that received no terminal handler result.
+        report["failed_signal_ids"] = sorted(
+            set(report["failed_signal_ids"])
+            | (set(selected_signal_ids) - set(report["_completed_signal_ids"]))
         )
-        if completed_group_fact_ids:
-            with self._db.transaction():
-                report["facts_marked_processed"] += self._db.mark_facts_processed(
-                    processing_target="future_commitment_update",
-                    fact_ids=completed_group_fact_ids,
-                )
-
         report["status"] = (
-            "error" if report["failed_group_count"] == len(evidence_groups)
-            else "ok"
+            "partial" if report["failed_signal_ids"] and report["_completed_signal_ids"]
+            else "failed" if report["failed_signal_ids"] else "ok"
         )
-        self._log_info("memory_future_commitment_update", "finish", report)
+        self._log_info("memory_user_intent_update", "finish", report)
         return report
 
-    def _group_future_commitment_signals(
+    def _user_intent_signal_prompt_view(
         self,
-        future_commitment_signals: Sequence[Dict[str, Any]],
-        *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Group compatible persisted signals while keeping each prompt small."""
-        groups_by_key: Dict[str, List[Dict[str, Any]]] = {}
-        for signal in future_commitment_signals:
-            fact_id = int(signal["fact_id"])
-            if fact_id not in facts_by_id:
-                continue
-            object_key = ",".join(signal["candidate_object_types"])
-            # A group is a bounded extraction batch, not an assertion that its
-            # signals describe the same prospective object.  Anchors remain in
-            # the prompt view as semantic evidence, but must not fragment the
-            # batch merely because the fact extractor phrased them differently.
-            base_key = "|".join((
-                str(signal["subject_entity"]).lower(),
-                object_key,
-            ))
-            groups = groups_by_key.setdefault(base_key, [])
-            target = next((
-                group for group in groups
-                if fact_id in group["fact_ids"] or len(group["fact_ids"]) < 8
-            ), None)
-            if target is None:
-                target = {
-                    "group_key": f"{base_key}#{len(groups) + 1}",
-                    "signals": [],
-                    "fact_ids": [],
-                    "facts": [],
-                }
-                groups.append(target)
-            target["signals"].append(signal)
-            if fact_id not in target["fact_ids"]:
-                target["fact_ids"].append(fact_id)
-                target["facts"].append(facts_by_id[fact_id])
-        return [
-            group
-            for groups in groups_by_key.values()
-            for group in groups
-        ]
+        item: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        signal = item["signal"]
+        return {
+            "signal_id": item["signal_id"],
+            "fact": self._intent_fact_prompt_view(item["fact"]),
+            "user_intent_signal": {
+                key: signal.get(key)
+                for key in (
+                    "signal_purpose", "candidate_object_types", "subject_entity",
+                    "user_role", "user_intent_anchor", "assertion_source",
+                    "evidence_basis", "confidence",
+                )
+            },
+        }
 
-    def _future_commitment_group_fact_prompt_views(
-        self,
-        group: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        signals_by_fact_id: Dict[int, List[Dict[str, Any]]] = {}
-        for signal in group["signals"]:
-            signals_by_fact_id.setdefault(int(signal["fact_id"]), []).append(signal)
-        views: List[Dict[str, Any]] = []
-        for fact in group["facts"]:
-            view = self._intent_fact_prompt_view(fact)
-            view["future_commitment_signals"] = [
-                {
-                    key: signal[key]
-                    for key in (
-                        "evidence_kind", "candidate_object_types", "subject_entity",
-                        "user_role", "future_commitment_anchor",
-                        "assertion_source", "explicitness",
-                    )
-                }
-                for signal in signals_by_fact_id.get(int(fact.get("id") or 0), [])
-            ]
-            views.append(view)
-        return views
-
-    def _retrieve_future_commitment_related_intent_objects(
+    def _retrieve_user_intent_related_intent_objects(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
@@ -3242,17 +2676,11 @@ class MemoryNodeManager:
         cannot be a retrieval gate because separately extracted descriptions
         of the same future-facing object rarely use identical keys.
         """
-        active_statuses = {
-            "goal": ["active"],
-            "plan": ["planned", "rescheduled"],
-            "work_item": ["open", "in_progress", "blocked"],
-        }
         related_by_type: Dict[str, List[Dict[str, Any]]] = {}
-        for object_type, statuses in active_statuses.items():
+        for object_type in ("goal", "plan", "work_item"):
             existing = self._db.get_intent_objects(
                 object_type=object_type,
                 world_owner_entity_id=world_owner_id,
-                statuses=statuses,
                 limit=64,
             )
             candidates_of_type = [
@@ -3280,20 +2708,11 @@ class MemoryNodeManager:
                     item for score, item in ranked
                     if score >= 0.35
                 ][:4]
-                # Lifecycle updates are especially important not to lose. If
-                # lexical/structured evidence is sparse, expose only the two
-                # best candidate-ranked objects rather than an arbitrary
-                # recency slice of the entire active set.
-                if (
-                    not strong_matches
-                    and candidate.get("lifecycle_evidence") != "none"
-                ):
-                    strong_matches = [item for _score, item in ranked[:2]]
                 for item in strong_matches:
                     object_id = int(item.get("id") or 0)
                     if object_id > 0:
                         selected_by_id[object_id] = item
-            related_by_type[object_type] = list(selected_by_id.values())[:16]
+            related_by_type[object_type] = list(selected_by_id.values())
         return related_by_type
 
     def _build_intent_object_match_profile(
@@ -3391,42 +2810,160 @@ class MemoryNodeManager:
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
             "keywords": fact.get("keywords") or [],
-            "topics": [fact.get("fact_root_topic") or "", fact.get("fact_aspect_topic") or ""],
+            "topics": [fact.get("fact_topic") or ""],
         }
 
     def _normalize_intent_candidates(
         self,
-        payload: Dict[str, Any],
+        results: Sequence[Any],
         *,
-        facts_by_id: Dict[int, Dict[str, Any]],
-        entity_ids: Dict[str, int],
+        signal_items: Sequence[Dict[str, Any]],
         world_owner_id: int,
-    ) -> List[Dict[str, Any]]:
-        """Normalize type-specific prompt lists into one internal sequence."""
-        normalized: List[Dict[str, Any]] = []
-        for field_name, object_type in (
-            ("goal_candidates", "goal"),
-            ("plan_candidates", "plan"),
-            ("work_item_candidates", "work_item"),
-        ):
-            raw_candidates = payload.get(field_name)
-            if not isinstance(raw_candidates, list):
+    ) -> Dict[str, Any]:
+        """Validate and route batch results by signal purpose before normalizing each output."""
+        results_by_id: Dict[int, List[Dict[str, Any]]] = {}
+        for result in results:
+            if not isinstance(result, dict):
                 continue
-            for raw_candidate in raw_candidates:
-                candidate = self._normalize_intent_candidate(
+            try:
+                signal_id = int(result.get("signal_id"))
+            except (TypeError, ValueError):
+                continue
+            results_by_id.setdefault(signal_id, []).append(result)
+
+        candidates: List[Dict[str, Any]] = []
+        observations: List[Dict[str, Any]] = []
+        empty_signal_ids: List[int] = []
+        errors: Dict[int, str] = {}
+        for item in signal_items:
+            signal_id = item["signal_id"]
+            signal_results = results_by_id.get(signal_id) or []
+            if len(signal_results) != 1 or not all(
+                key in signal_results[0]
+                for key in ("future_intent_candidate", "intent_lifecycle_observation")
+            ):
+                errors[signal_id] = "missing_or_duplicate_signal_result"
+                continue
+            result = signal_results[0]
+            purpose = item["signal"].get("signal_purpose")
+            output_key = {
+                "future_intent": "future_intent_candidate",
+                "lifecycle_update": "intent_lifecycle_observation",
+            }.get(purpose)
+            if output_key is None or any(
+                result[key] is not None
+                for key in ("future_intent_candidate", "intent_lifecycle_observation")
+                if key != output_key
+            ):
+                errors[signal_id] = "invalid_signal_result_route"
+                continue
+            raw_candidate = result[output_key]
+            if raw_candidate is None:
+                empty_signal_ids.append(signal_id)
+                continue
+            fact_id = item["fact_id"]
+            if (
+                not isinstance(raw_candidate, dict)
+                or raw_candidate.get("evidence_fact_ids") != [fact_id]
+                or raw_candidate.get("object_type") not in item["signal"]["candidate_object_types"]
+            ):
+                errors[signal_id] = "invalid_signal_result_scope"
+                continue
+            if purpose == "lifecycle_update":
+                observation = self._normalize_single_intent_lifecycle_observation(raw_candidate)
+                if observation is None:
+                    errors[signal_id] = "invalid_normalized_intent_lifecycle_observation"
+                    continue
+                observation["signal_id"] = signal_id
+                observations.append(observation)
+                continue
+            fact = item["fact"]
+            entity_ids_by_name = {
+                _compact_whitespace(name): int(entity_id)
+                for name, entity_id in zip(
+                    fact.get("entities") or [], fact.get("entity_ids") or [],
+                )
+                if _compact_whitespace(name) and str(entity_id).isdigit()
+                and int(entity_id) > 0
+            }
+            try:
+                candidate = self._normalize_single_intent_candidate(
                     raw_candidate,
-                    object_type=object_type,
-                    facts_by_id=facts_by_id,
-                    entity_ids=entity_ids,
+                    object_type=raw_candidate["object_type"],
+                    facts_by_id={fact_id: fact},
+                    entity_ids=entity_ids_by_name,
                     world_owner_id=world_owner_id,
                 )
-                if candidate is not None:
-                    normalized.append(candidate)
-                if len(normalized) >= 24:
-                    return normalized
-        return normalized
+            except Exception as exc:
+                errors[signal_id] = str(exc)
+                continue
+            if candidate is None:
+                errors[signal_id] = "invalid_normalized_future_intent_candidate"
+                continue
+            candidate["signal_id"] = signal_id
+            candidates.append(candidate)
 
-    def _normalize_intent_candidate(
+        for signal_id, error in errors.items():
+            self._log_info("memory_user_intent_update", "signal_error", {
+                "signal_id": signal_id, "error": error,
+            })
+        return {
+            "future_intent_candidates": candidates,
+            "intent_lifecycle_observations": observations,
+            "empty_signal_ids": empty_signal_ids,
+            "failed_signal_ids": list(errors),
+        }
+
+    def _normalize_single_intent_lifecycle_observation(
+        self, raw: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Normalize observed changes without reconstructing or updating an intent."""
+        if any(not isinstance(raw.get(key), str) for key in (
+            "object_type", "target_description", "observation_text", "lifecycle_evidence",
+        )) or not isinstance(raw.get("effective_at", ""), str):
+            return None
+        object_type = str(raw.get("object_type") or "")
+        allowed_evidence = {
+            "goal": {"confirmed", "updated", "completed", "cancelled", "blocked"},
+            "plan": {"confirmed", "updated", "occurred", "cancelled", "rescheduled", "blocked"},
+            "work_item": {"confirmed", "updated", "completed", "cancelled", "blocked"},
+        }
+        lifecycle_evidence = str(raw.get("lifecycle_evidence") or "").strip().lower()
+        target = _compact_whitespace(raw.get("target_description") or "")[:480]
+        text = _compact_whitespace(raw.get("observation_text") or "")[:800]
+        if not target or not text or lifecycle_evidence not in allowed_evidence.get(object_type, set()):
+            return None
+        effective_at = _compact_whitespace(raw.get("effective_at") or "")
+        if effective_at:
+            try:
+                datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        raw_details = raw.get("details", {})
+        if not isinstance(raw_details, dict):
+            return None
+        details: Dict[str, str] = {}
+        for key in ("time_start", "time_end", "location", "progress_text"):
+            value = raw_details.get(key)
+            if value is None or value == "":
+                continue
+            if not isinstance(value, str):
+                return None
+            text_value = _compact_whitespace(value)[:480]
+            if text_value:
+                details[key] = text_value
+        return {
+            "object_type": object_type,
+            "target_description": target,
+            "observation_text": text,
+            "lifecycle_evidence": lifecycle_evidence,
+            "effective_at": effective_at,
+            "confidence": self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
+            "evidence_fact_ids": list(raw["evidence_fact_ids"]),
+            "details": details,
+        }
+
+    def _normalize_single_intent_candidate(
         self,
         raw: Any,
         *,
@@ -3439,39 +2976,33 @@ class MemoryNodeManager:
             return None
         if object_type not in {"goal", "plan", "work_item"}:
             return None
+        details = raw.get("details")
+        details = details if isinstance(details, dict) else {}
         evidence_ids = list(dict.fromkeys(
             int(value) for value in (raw.get("evidence_fact_ids") or [])
             if str(value).strip().isdigit() and int(value) in facts_by_id
         ))[:12]
         summary = _compact_whitespace(raw.get("summary") or "")[:480]
-        if not summary or not evidence_ids:
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        if not summary or not evidence_ids or not primary_domain:
             return None
         allows_world_owner_reference = any(
             isinstance(facts_by_id[fact_id].get("metadata"), dict)
             and bool(
-                facts_by_id[fact_id]["metadata"].get(
-                    "has_world_owner_interaction"
-                )
+                facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
+                or facts_by_id[fact_id]["metadata"].get("has_world_owner_alias_reference")
             )
             for fact_id in evidence_ids
             if isinstance(facts_by_id.get(fact_id, {}).get("metadata"), dict)
         )
         canonical_key = self._generate_topic_name_key(raw.get("canonical_key") or summary)
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        lifecycle_evidence = str(raw.get("lifecycle_evidence") or "none").strip().lower()
-        allowed_lifecycle_evidence = {
-            "goal": {"none", "confirmed", "completed", "cancelled", "blocked"},
-            "plan": {"none", "confirmed", "occurred", "cancelled", "rescheduled", "blocked"},
-            "work_item": {"none", "confirmed", "completed", "cancelled", "blocked"},
-        }
-        if lifecycle_evidence not in allowed_lifecycle_evidence[object_type]:
-            lifecycle_evidence = "none"
         candidate: Dict[str, Any] = {
             "object_type": object_type, "summary": summary,
             "canonical_key": canonical_key, "confidence": confidence,
+            "primary_domain": primary_domain,
             "evidence_fact_ids": evidence_ids,
             "world_owner_entity_id": world_owner_id,
-            "lifecycle_evidence": lifecycle_evidence,
         }
         def entity_id(value: Any, *, fallback: int = 0) -> int:
             name = _compact_whitespace(value or "")
@@ -3479,7 +3010,7 @@ class MemoryNodeManager:
                 return world_owner_id if allows_world_owner_reference else 0
             return int(entity_ids.get(name) or fallback)
         if object_type == "goal":
-            owner_name = _compact_whitespace(raw.get("owner_entity") or "")
+            owner_name = _compact_whitespace(raw.get("subject_entity") or "")
             if self._is_world_owner_entity_reference(owner_name):
                 if not allows_world_owner_reference:
                     return None
@@ -3490,14 +3021,28 @@ class MemoryNodeManager:
                 owner_name,
                 fallback=(world_owner_id if allows_world_owner_reference else 0),
             )
-            desired_outcome = _compact_whitespace(raw.get("desired_outcome") or "")[:480]
+            desired_outcome = _compact_whitespace(details.get("desired_outcome") or "")[:480]
             if not owner_id or not desired_outcome:
                 return None
-            candidate.update(owner_entity_id=owner_id, owner_name=owner_name, desired_outcome=desired_outcome,
-                success_criteria=_compact_whitespace(raw.get("success_criteria") or "")[:480],
-                target_at=_compact_whitespace(raw.get("target_at") or "")[:80])
+            target_at = _compact_whitespace(
+                details.get("target_at") or raw.get("time_end") or ""
+            )[:80]
+            candidate.update(
+                owner_entity_id=owner_id,
+                owner_name=owner_name,
+                desired_outcome=desired_outcome,
+                success_criteria=_compact_whitespace(details.get("success_criteria") or "")[:480],
+                target_at=target_at,
+                time_start="",
+                time_end=target_at,
+                details={
+                    "desired_outcome": desired_outcome,
+                    "success_criteria": _compact_whitespace(details.get("success_criteria") or "")[:480],
+                    "target_at": target_at,
+                },
+            )
         elif object_type == "plan":
-            actor_name = _compact_whitespace(raw.get("actor_entity") or "")
+            actor_name = _compact_whitespace(raw.get("subject_entity") or "")
             if self._is_world_owner_entity_reference(actor_name):
                 if not allows_world_owner_reference:
                     return None
@@ -3508,39 +3053,54 @@ class MemoryNodeManager:
                 actor_name,
                 fallback=(world_owner_id if allows_world_owner_reference else 0),
             )
-            event = _compact_whitespace(raw.get("event_or_activity") or "")[:320]
+            event = _compact_whitespace(details.get("event_or_activity") or "")[:320]
             if not actor_id or not event:
                 return None
-            location = _compact_whitespace(raw.get("location") or "")[:160]
+            location = _compact_whitespace(details.get("location") or "")[:160]
             if location and location not in entity_ids:
                 entity_ids.update(self._db.add_entity_names([location]))
+            start_at = _compact_whitespace(raw.get("time_start") or "")[:80]
+            end_at = _compact_whitespace(raw.get("time_end") or "")[:80]
             candidate.update(actor_entity_id=actor_id, actor_name=actor_name, event_or_activity=event,
-                start_at=_compact_whitespace(raw.get("scheduled_start_at") or "")[:80],
-                end_at=_compact_whitespace(raw.get("scheduled_end_at") or "")[:80],
+                start_at=start_at,
+                end_at=end_at,
                 time_precision=(
-                    str(raw.get("time_precision") or "unknown").lower()
-                    if str(raw.get("time_precision") or "unknown").lower()
+                    str(details.get("time_precision") or "unknown").lower()
+                    if str(details.get("time_precision") or "unknown").lower()
                     in {"exact", "day", "week", "relative", "unknown"}
                     else "unknown"
                 ),
                 location_text=location, location_entity_id=int(entity_ids.get(location) or 0),
-                participant_names=self._normalize_string_list(raw.get("participants"), limit=12))
+                participant_names=self._normalize_string_list(details.get("participants"), limit=12),
+                time_start=start_at,
+                time_end=end_at,
+                details={
+                    "event_or_activity": event,
+                    "time_precision": (
+                        str(details.get("time_precision") or "unknown").lower()
+                        if str(details.get("time_precision") or "unknown").lower()
+                        in {"exact", "day", "week", "relative", "unknown"}
+                        else "unknown"
+                    ),
+                    "location": location,
+                    "participants": self._normalize_string_list(details.get("participants"), limit=12),
+                })
         else:
-            responsible_name = _compact_whitespace(raw.get("responsible_entity") or "")
+            responsible_name = _compact_whitespace(raw.get("subject_entity") or "")
             if self._is_world_owner_entity_reference(responsible_name):
                 if not allows_world_owner_reference:
                     return None
                 responsible_name = self._world_owner_entity_name
             responsible_id = entity_id(responsible_name)
-            action_text = _compact_whitespace(raw.get("action_text") or "")[:480]
-            deliverable = _compact_whitespace(raw.get("deliverable") or "")[:320]
-            responsibility_type = str(raw.get("responsibility_type") or "").lower()
+            action_text = _compact_whitespace(details.get("action_text") or "")[:480]
+            deliverable = _compact_whitespace(details.get("deliverable") or "")[:320]
+            responsibility_type = str(details.get("responsibility_type") or "").lower()
             if not responsible_id or not action_text or responsibility_type not in {
                 "personal_action", "commitment", "assigned", "external_commitment",
             }:
                 return None
-            due_at = _compact_whitespace(raw.get("due_at") or "")[:80]
-            available_from = _compact_whitespace(raw.get("available_from") or "")[:80]
+            due_at = _compact_whitespace(raw.get("time_end") or "")[:80]
+            available_from = _compact_whitespace(raw.get("time_start") or "")[:80]
             has_completion_anchor = bool(deliverable or due_at) or responsibility_type in {
                 "commitment", "assigned", "external_commitment",
             }
@@ -3550,13 +3110,24 @@ class MemoryNodeManager:
                 deliverable=deliverable, responsibility_type=responsibility_type,
                 due_at=due_at,
                 start_at=available_from,
-                priority=_compact_whitespace(raw.get("priority") or "")[:80],
-                beneficiary_names=self._normalize_string_list(raw.get("beneficiary_entities"), limit=8),
-                delegator_names=self._normalize_string_list(raw.get("delegator_entities"), limit=8),
-                collaborator_names=self._normalize_string_list(raw.get("collaborator_entities"), limit=8))
+                priority=_compact_whitespace(details.get("priority") or "")[:80],
+                beneficiary_names=self._normalize_string_list(details.get("beneficiary_entities"), limit=8),
+                delegator_names=self._normalize_string_list(details.get("delegator_entities"), limit=8),
+                collaborator_names=self._normalize_string_list(details.get("collaborator_entities"), limit=8),
+                time_start=available_from,
+                time_end=due_at,
+                details={
+                    "action_text": action_text,
+                    "deliverable": deliverable,
+                    "responsibility_type": responsibility_type,
+                    "priority": _compact_whitespace(details.get("priority") or "")[:80],
+                    "beneficiary_entities": self._normalize_string_list(details.get("beneficiary_entities"), limit=8),
+                    "delegator_entities": self._normalize_string_list(details.get("delegator_entities"), limit=8),
+                    "collaborator_entities": self._normalize_string_list(details.get("collaborator_entities"), limit=8),
+                })
         return candidate
 
-    def _reconcile_intent_candidates(
+    def _reconcile_future_intent_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
@@ -3564,89 +3135,192 @@ class MemoryNodeManager:
         prompt_language: str,
         existing_by_type: Optional[Dict[str, List[Dict[str, Any]]]] = None,
     ) -> Dict[int, Dict[str, Any]]:
+        """Adjudicate candidate persistence, relationships, and existing-intent changes."""
+        if not candidates:
+            return {}
         if existing_by_type is None:
-            existing_by_type = self._retrieve_future_commitment_related_intent_objects(
+            existing_by_type = self._retrieve_user_intent_related_intent_objects(
                 candidates,
                 world_owner_id=world_owner_id,
             )
         existing_by_type = {
-            object_type: list(existing_by_type.get(object_type) or [])
+            object_type: [
+                item for item in existing_by_type.get(object_type) or []
+                if int(item.get("world_owner_entity_id") or 0) == world_owner_id
+                and int(item.get("id") or 0) > 0
+            ]
             for object_type in ("goal", "plan", "work_item")
         }
         decisions: Dict[int, Dict[str, Any]] = {}
-        for index, candidate in enumerate(candidates):
-            direct = next((
-                item for item in existing_by_type[candidate["object_type"]]
-                if str(item.get("canonical_key") or "") == candidate["canonical_key"]
-            ), None)
-            decisions[index] = {
-                "operation": (
-                    self._intent_operation_from_lifecycle_evidence(candidate)
-                    if direct else "create"
-                ),
-                "target_object_type": candidate["object_type"] if direct else "",
-                "target_object_id": int(direct["id"]) if direct else 0,
-                "reason": "deterministic_canonical_key_match" if direct else "no_direct_match",
-            }
         existing = [
-            self._intent_object_prompt_view(object_type, item)
+            {
+                **self._intent_object_prompt_view(object_type, item),
+                "time_start": item.get("time_start") or "",
+                "time_end": item.get("time_end") or "",
+                "details": item.get("details") or {},
+            }
             for object_type, items in existing_by_type.items() for item in items
         ]
-        if not candidates or not existing:
-            return decisions
+        facts_by_id = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids(sorted({
+                fact_id for candidate in candidates
+                for fact_id in candidate["evidence_fact_ids"]
+            }))
+        }
+        candidate_inputs = [{
+            **candidate,
+            "facts": [
+                self._intent_fact_prompt_view(facts_by_id[fact_id])
+                for fact_id in candidate["evidence_fact_ids"] if fact_id in facts_by_id
+            ],
+        } for candidate in candidates]
         prompt_template = (
             INTENT_RECONCILIATION_PROMPT_EN
             if prompt_language == "en" else INTENT_RECONCILIATION_PROMPT_ZH
         )
-        raw = self._call_llm(
-            prompt_template.replace("{candidates}", json.dumps(candidates, ensure_ascii=False, indent=2))
-            .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
-        )
-        parsed = self._parse_json_object_from_llm_text(raw or "")
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+        try:
+            raw = self._llm_client.call_llm(
+                prompt_template.replace("{candidates}", json.dumps(candidate_inputs, ensure_ascii=False, indent=2))
+                .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
+            )
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+                raise ValueError("invalid_future_intent_reconciliation_response")
+        except Exception as exc:
+            self._log_info("memory_user_intent_update", "batch_error", {
+                "candidate_indices": list(range(len(candidates))),
+                "phase": "future_intent_reconciliation", "error": str(exc),
+            })
             return decisions
-        valid_ids = {
-            (object_type, int(item["id"]))
+        existing_by_id = {
+            (object_type, int(item["id"])): item
             for object_type, items in existing_by_type.items() for item in items
         }
+        allowed_statuses = {
+            "goal": {"active", "blocked", "completed", "cancelled"},
+            "plan": {"planned", "rescheduled", "blocked", "occurred", "cancelled"},
+            "work_item": {"open", "in_progress", "blocked", "completed", "cancelled"},
+        }
+        detail_fields = {
+            "goal": {"desired_outcome", "success_criteria", "target_at"},
+            "plan": {"event_or_activity", "time_precision", "location_text", "participants"},
+            "work_item": {
+                "action_text", "deliverable", "responsibility_type", "priority",
+                "beneficiary_entities", "delegator_entities", "collaborator_entities",
+                "completed_at",
+            },
+        }
+        results_by_index: Dict[int, List[Dict[str, Any]]] = {}
         for raw_decision in parsed["decisions"]:
             if not isinstance(raw_decision, dict):
                 continue
             index = raw_decision.get("candidate_index")
-            if not isinstance(index, int) or not 0 <= index < len(candidates):
-                continue
-            operation = str(raw_decision.get("operation") or "create").lower()
-            target_type = str(raw_decision.get("target_object_type") or "").lower()
+            if type(index) is int and 0 <= index < len(candidates):
+                results_by_index.setdefault(index, []).append(raw_decision)
+        for index, candidate in enumerate(candidates):
             try:
-                target_id = int(raw_decision.get("target_object_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if operation not in {"create", "confirm", "update", "complete", "cancel", "reschedule", "block"}:
-                continue
-            if operation != "create" and (
-                target_type != candidates[index]["object_type"]
-                or (target_type, target_id) not in valid_ids
-            ):
-                continue
-            decisions[index] = {
-                "operation": operation, "target_object_type": target_type,
-                "target_object_id": target_id,
-                "reason": _compact_whitespace(raw_decision.get("reason") or "llm_reconciliation")[:240],
-            }
+                results = results_by_index.get(index, [])
+                if len(results) != 1:
+                    raise ValueError("missing_or_duplicate_future_intent_decision")
+                result = results[0]
+                if (type(result.get("save_new_intent")) is not bool
+                        or not isinstance(result.get("reason"), str)):
+                    raise ValueError("invalid_future_intent_decision_fields")
+                relations = result.get("relations")
+                updates = result.get("intent_updates")
+                if (not isinstance(relations, list) or len(relations) > 1
+                        or not isinstance(updates, list) or len(updates) > 1):
+                    raise ValueError("invalid_future_intent_relations_or_updates")
+                object_type = candidate["object_type"]
+                normalized_relations = []
+                normalized_updates = []
+                target_id = None
+                if relations:
+                    relation = relations[0]
+                    if not isinstance(relation, dict):
+                        raise ValueError("invalid_future_intent_relation")
+                    target_id = relation.get("target_intent_id")
+                    if (type(target_id) is not int
+                            or (object_type, target_id) not in existing_by_id
+                            or relation.get("relation") not in {"same_intent", "supersedes", "conflicts"}):
+                        raise ValueError("invalid_future_intent_target_or_relation")
+                    normalized_relations.append({
+                        "target_intent_id": target_id, "relation": relation["relation"],
+                    })
+                if updates:
+                    update = updates[0]
+                    if (not isinstance(update, dict) or target_id is None
+                            or type(update.get("target_intent_id")) is not int
+                            or update["target_intent_id"] != target_id
+                            or update.get("status") not in allowed_statuses[object_type]):
+                        raise ValueError("invalid_future_intent_update_target_or_status")
+                    patch = update.get("field_updates")
+                    if (not isinstance(patch, dict)
+                            or set(patch) - {"summary", "time_start", "time_end", "details"}):
+                        raise ValueError("invalid_future_intent_field_updates")
+                    for field, value in patch.items():
+                        if field == "details":
+                            if not isinstance(value, dict) or set(value) - detail_fields[object_type]:
+                                raise ValueError("invalid_future_intent_detail_updates")
+                            for key, detail in value.items():
+                                if key in {"participants", "beneficiary_entities", "delegator_entities", "collaborator_entities"}:
+                                    if (not isinstance(detail, list) or not detail
+                                            or any(not isinstance(name, str) or not name.strip() for name in detail)):
+                                        raise ValueError("invalid_future_intent_detail_list")
+                                elif not isinstance(detail, str) or not detail.strip():
+                                    raise ValueError("invalid_future_intent_detail_value")
+                        elif not isinstance(value, str) or not value.strip():
+                            raise ValueError("future_intent_patch_must_not_clear_values")
+                    if object_type == "goal" and "target_at" in patch.get("details", {}):
+                        target_at = patch["details"]["target_at"]
+                        if "time_end" in patch and patch["time_end"] != target_at:
+                            raise ValueError("conflicting_goal_deadline_fields")
+                        patch = {**patch, "time_end": target_at}
+                    effective_at = update.get("effective_at")
+                    if not isinstance(effective_at, str):
+                        raise ValueError("invalid_future_intent_effective_at")
+                    effective_at = effective_at.strip()
+                    if effective_at:
+                        datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
+                    normalized_updates.append({
+                        "target_intent_id": target_id, "status": update["status"],
+                        "field_updates": patch, "effective_at": effective_at,
+                    })
+                decisions[index] = {
+                    "save_new_intent": result["save_new_intent"],
+                    "relations": normalized_relations, "intent_updates": normalized_updates,
+                    "reason": _compact_whitespace(result["reason"])[:480],
+                }
+            except Exception as exc:
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": candidates[index].get("signal_id"), "candidate_index": index,
+                    "phase": "future_intent_reconciliation", "error": str(exc),
+                })
+        # Do not apply contradictory patches to the same object in list order.
+        updates_by_target: Dict[int, Dict[str, Any]] = {}
+        conflicting_targets = set()
+        for decision in decisions.values():
+            for update in decision["intent_updates"]:
+                fields = {"status": update["status"]}
+                for field, value in update["field_updates"].items():
+                    if field == "details":
+                        fields.update({f"details.{key}": detail for key, detail in value.items()})
+                    else:
+                        fields[field] = value
+                previous = updates_by_target.setdefault(update["target_intent_id"], {})
+                if any(key in previous and previous[key] != value for key, value in fields.items()):
+                    conflicting_targets.add(update["target_intent_id"])
+                previous.update(fields)
+        for index in list(decisions):
+            if any(update["target_intent_id"] in conflicting_targets
+                   for update in decisions[index]["intent_updates"]):
+                del decisions[index]
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": candidates[index].get("signal_id"), "candidate_index": index,
+                    "phase": "future_intent_reconciliation", "error": "conflicting_future_intent_updates",
+                })
         return decisions
-
-    @staticmethod
-    def _intent_operation_from_lifecycle_evidence(candidate: Dict[str, Any]) -> str:
-        """Map fact-level lifecycle evidence to an update for a matched object."""
-        lifecycle_evidence = str(candidate.get("lifecycle_evidence") or "none").lower()
-        return {
-            "confirmed": "confirm",
-            "completed": "complete",
-            "occurred": "complete",
-            "cancelled": "cancel",
-            "rescheduled": "reschedule",
-            "blocked": "block",
-        }.get(lifecycle_evidence, "update")
 
     @staticmethod
     def _intent_object_prompt_view(object_type: str, item: Dict[str, Any]) -> Dict[str, Any]:
@@ -3655,11 +3329,14 @@ class MemoryNodeManager:
             "plan": ("summary", "event_or_activity", "status", "start_at", "end_at", "location_text", "canonical_key"),
             "work_item": ("summary", "action_text", "deliverable", "status", "due_at", "responsibility_type", "canonical_key"),
         }[object_type]
-        return {"object_type": object_type, "id": item.get("id"), **{
-            field: item.get(field) or "" for field in fields
-        }}
+        return {
+            "object_type": object_type,
+            "id": item.get("id"),
+            "primary_domain": item.get("primary_domain") or "",
+            **{field: item.get(field) or "" for field in fields},
+        }
 
-    def _sync_future_commitment_recall_document(
+    def _sync_user_intent_recall_document(
         self,
         *,
         object_type: str,
@@ -3689,6 +3366,7 @@ class MemoryNodeManager:
                 f"desired_outcome: {_compact_whitespace(item.get('desired_outcome') or '')}",
                 f"success_criteria: {_compact_whitespace(item.get('success_criteria') or '')}",
                 f"canonical_key: {item.get('canonical_key') or ''}",
+                f"primary_domain: {item.get('primary_domain') or ''}",
                 f"status: {item.get('status') or ''}",
                 f"target_at: {item.get('target_at') or ''}",
             ]
@@ -3701,6 +3379,7 @@ class MemoryNodeManager:
                 f"event_or_activity: {_compact_whitespace(item.get('event_or_activity') or '')}",
                 f"location: {_compact_whitespace(item.get('location_text') or '')}",
                 f"canonical_key: {item.get('canonical_key') or ''}",
+                f"primary_domain: {item.get('primary_domain') or ''}",
                 f"status: {item.get('status') or ''}",
                 f"start_at: {item.get('start_at') or ''}",
                 f"end_at: {item.get('end_at') or ''}",
@@ -3714,6 +3393,7 @@ class MemoryNodeManager:
                 f"action: {_compact_whitespace(item.get('action_text') or '')}",
                 f"deliverable: {_compact_whitespace(item.get('deliverable') or '')}",
                 f"canonical_key: {item.get('canonical_key') or ''}",
+                f"primary_domain: {item.get('primary_domain') or ''}",
                 f"status: {item.get('status') or ''}",
                 f"due_at: {item.get('due_at') or ''}",
                 f"priority: {item.get('priority') or ''}",
@@ -3732,86 +3412,442 @@ class MemoryNodeManager:
             confidence=float(item.get("confidence") or 0.0),
             importance=0.7,
             metadata={
-                "future_commitment_object_type": normalized_type,
+                "user_intent_object_type": normalized_type,
+                "primary_domain": item.get("primary_domain") or "",
                 "projection_version": "v1",
             },
         )
 
-    def _apply_intent_candidates(
+    def _retrieve_intent_lifecycle_observation_cases(
+        self, observations: Sequence[Dict[str, Any]], *,
+        facts_by_id: Dict[int, Dict[str, Any]], world_owner_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve same-type identity candidates without filtering intent lifecycle status."""
+        existing_by_type = {
+            object_type: self._db.get_intent_objects(
+                object_type=object_type, world_owner_entity_id=world_owner_id, limit=120,
+            )
+            for object_type in {item["object_type"] for item in observations}
+        }
+        cases: List[Dict[str, Any]] = []
+        for observation in observations:
+            object_type = observation["object_type"]
+            identity = {"object_type": object_type, "summary": observation["target_description"]}
+            ranked = sorted(
+                ((self._score_intent_candidate_against_existing_object(identity, item), item)
+                 for item in existing_by_type[object_type]),
+                key=lambda pair: pair[0], reverse=True,
+            )
+            cases.append({
+                "intent_lifecycle_observation": {
+                    key: observation[key] for key in (
+                        "object_type", "target_description", "observation_text",
+                        "lifecycle_evidence", "effective_at", "confidence", "details",
+                    )
+                },
+                "fact": self._intent_fact_prompt_view(
+                    facts_by_id[observation["evidence_fact_ids"][0]],
+                ),
+                "existing_intents": [
+                    {
+                        **self._intent_object_prompt_view(object_type, item),
+                        "time_start": item.get("time_start") or "",
+                        "time_end": item.get("time_end") or "",
+                        "details": item.get("details") or {},
+                        "updated_at": item.get("updated_at") or "",
+                    }
+                    for score, item in ranked[:6] if score >= 0.2
+                ],
+            })
+        return cases
+
+    def _reconcile_intent_lifecycle_observations(
+        self, observations: Sequence[Dict[str, Any]], *,
+        facts_by_id: Dict[int, Dict[str, Any]], world_owner_id: int, prompt_language: str,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Match observations and adjudicate sparse intent updates without writing to storage."""
+        if not observations:
+            return {}
+        decisions: Dict[int, Dict[str, Any]] = {}
+        cases = self._retrieve_intent_lifecycle_observation_cases(
+            observations, facts_by_id=facts_by_id, world_owner_id=world_owner_id,
+        )
+        matching_indices = {index for index, case in enumerate(cases) if case["existing_intents"]}
+        decisions_by_index: Dict[int, List[Dict[str, Any]]] = {}
+        if matching_indices:
+            self._log_info("memory_user_intent_update", "lifecycle_matching_inputs", {
+                "observation_cases": cases,
+            })
+            try:
+                template = (
+                    INTENT_LIFECYCLE_RECONCILIATION_PROMPT_EN if prompt_language == "en"
+                    else INTENT_LIFECYCLE_RECONCILIATION_PROMPT_ZH
+                )
+                raw = self._llm_client.call_llm(template.replace(
+                    "{observation_cases}", json.dumps(cases, ensure_ascii=False, indent=2),
+                ))
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+                if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
+                    raise ValueError("invalid_lifecycle_matching_response")
+                for decision in parsed["decisions"]:
+                    if not isinstance(decision, dict):
+                        continue
+                    index = decision.get("observation_index")
+                    if type(index) is int and index in matching_indices:
+                        decisions_by_index.setdefault(index, []).append(decision)
+            except Exception as exc:
+                self._log_info("memory_user_intent_update", "lifecycle_match_error", {
+                    "observation_indices": sorted(matching_indices),
+                    "error": str(exc),
+                })
+
+        allowed_statuses = {
+            "goal": {"active", "blocked", "completed", "cancelled"},
+            "plan": {"planned", "rescheduled", "blocked", "occurred", "cancelled"},
+            "work_item": {"open", "in_progress", "blocked", "completed", "cancelled"},
+        }
+        detail_fields = {
+            "goal": {"desired_outcome", "success_criteria", "target_at"},
+            "plan": {"event_or_activity", "time_precision", "location_text", "participants"},
+            "work_item": {
+                "action_text", "deliverable", "responsibility_type", "priority", "completed_at",
+                "beneficiary_entities", "delegator_entities", "collaborator_entities",
+            },
+        }
+        for index, case in enumerate(cases):
+            try:
+                if not case["existing_intents"]:
+                    decision = {"relations": [], "intent_updates": [], "reason": "no_related_intent"}
+                else:
+                    results = decisions_by_index.get(index, [])
+                    if len(results) != 1:
+                        raise ValueError("missing_or_duplicate_lifecycle_matching_decision")
+                    decision = results[0]
+                relations = decision.get("relations")
+                updates = decision.get("intent_updates")
+                if (not isinstance(relations, list) or len(relations) > 1
+                        or not isinstance(updates, list) or len(updates) > 1
+                        or not isinstance(decision.get("reason"), str)):
+                    raise ValueError("invalid_lifecycle_decision_fields")
+                object_type = case["intent_lifecycle_observation"]["object_type"]
+                normalized_relations = []
+                normalized_updates = []
+                target_id = None
+                if relations:
+                    relation = relations[0]
+                    if not isinstance(relation, dict):
+                        raise ValueError("invalid_lifecycle_relation")
+                    target_id = relation.get("target_intent_id")
+                    if (type(target_id) is not int or target_id <= 0
+                            or relation.get("relation") != "same_intent"
+                            or target_id not in {item["id"] for item in case["existing_intents"]
+                                                 if item["object_type"] == object_type}):
+                        raise ValueError("invalid_lifecycle_matching_target")
+                    normalized_relations.append({
+                        "target_intent_id": target_id, "relation": "same_intent",
+                    })
+                if updates:
+                    update = updates[0]
+                    if (not isinstance(update, dict) or target_id is None
+                            or type(update.get("target_intent_id")) is not int
+                            or update["target_intent_id"] != target_id
+                            or update.get("status") not in allowed_statuses[object_type]):
+                        raise ValueError("invalid_lifecycle_update_target_or_status")
+                    patch = update.get("field_updates")
+                    if (not isinstance(patch, dict)
+                            or set(patch) - {"summary", "time_start", "time_end", "details"}):
+                        raise ValueError("invalid_lifecycle_field_updates")
+                    for field, value in patch.items():
+                        if field == "details":
+                            if not isinstance(value, dict) or set(value) - detail_fields[object_type]:
+                                raise ValueError("invalid_lifecycle_detail_updates")
+                            for key, detail in value.items():
+                                if key in {"participants", "beneficiary_entities", "delegator_entities", "collaborator_entities"}:
+                                    if (not isinstance(detail, list) or not detail
+                                            or any(not isinstance(name, str) or not name.strip() for name in detail)):
+                                        raise ValueError("invalid_lifecycle_detail_list")
+                                elif not isinstance(detail, str) or not detail.strip():
+                                    raise ValueError("invalid_lifecycle_detail_value")
+                        elif not isinstance(value, str) or not value.strip():
+                            raise ValueError("lifecycle_patch_must_not_clear_values")
+                    if object_type == "goal" and "target_at" in patch.get("details", {}):
+                        target_at = patch["details"]["target_at"]
+                        if "time_end" in patch and patch["time_end"] != target_at:
+                            raise ValueError("conflicting_goal_deadline_fields")
+                        patch = {**patch, "time_end": target_at}
+                    effective_at = update.get("effective_at")
+                    if not isinstance(effective_at, str):
+                        raise ValueError("invalid_lifecycle_effective_at")
+                    effective_at = effective_at.strip()
+                    if effective_at:
+                        datetime.fromisoformat(effective_at.replace("Z", "+00:00"))
+                    normalized_updates.append({
+                        "target_intent_id": target_id, "status": update["status"],
+                        "field_updates": patch, "effective_at": effective_at,
+                    })
+                decisions[index] = {
+                    "relations": normalized_relations, "intent_updates": normalized_updates,
+                    "reason": _compact_whitespace(decision["reason"])[:480],
+                }
+            except Exception as exc:
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "observation_index": index, "phase": "lifecycle_reconciliation", "error": str(exc),
+                })
+        # Do not let incompatible batch updates overwrite one another in list order.
+        updates_by_target: Dict[int, Dict[str, Any]] = {}
+        conflicting_targets = set()
+        for decision in decisions.values():
+            for update in decision["intent_updates"]:
+                fields = {"status": update["status"]}
+                for field, value in update["field_updates"].items():
+                    if field == "details":
+                        fields.update({f"details.{key}": detail for key, detail in value.items()})
+                    else:
+                        fields[field] = value
+                previous = updates_by_target.setdefault(update["target_intent_id"], {})
+                if any(key in previous and previous[key] != value for key, value in fields.items()):
+                    conflicting_targets.add(update["target_intent_id"])
+                previous.update(fields)
+        for index in list(decisions):
+            if any(update["target_intent_id"] in conflicting_targets
+                   for update in decisions[index]["intent_updates"]):
+                del decisions[index]
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "observation_index": index, "phase": "lifecycle_reconciliation",
+                    "error": "conflicting_lifecycle_updates",
+                })
+        return decisions
+
+    def _save_intent_lifecycle_observations(
+        self, observations: Sequence[Dict[str, Any]], decisions: Dict[int, Dict[str, Any]], *,
+        world_owner_id: int,
+    ) -> Dict[str, Any]:
+        """Atomically save each observation, its adjudicated intent changes, and fact evidence."""
+        report: Dict[str, Any] = {
+            "intent_lifecycle_observation_ids": [],
+            "intent_event_ids": [],
+            "unmatched_observation_ids": [], "completed_signal_ids": [], "failed_signal_ids": [],
+        }
+        for index, observation in enumerate(observations):
+            signal_id = observation["signal_id"]
+            try:
+                recorded_events = self._db.get_user_intent_events(source_signal_id=signal_id)
+                if recorded_events:
+                    report["intent_event_ids"].extend(event["id"] for event in recorded_events)
+                    report["intent_lifecycle_observation_ids"].extend(
+                        sorted({event["lifecycle_observation_id"] for event in recorded_events
+                                if event["lifecycle_observation_id"] is not None})
+                    )
+                    report["completed_signal_ids"].append(signal_id)
+                    continue
+                decision = decisions.get(index)
+                if decision is None:
+                    raise ValueError("missing_valid_lifecycle_matching_decision")
+                relation = decision["relations"][0] if decision["relations"] else None
+                update = decision["intent_updates"][0] if decision["intent_updates"] else None
+                event_id = None
+                with self._db.transaction():
+                    observation_id = self._db.upsert_user_intent_lifecycle_observation(observation)
+                    if relation:
+                        object_type = observation["object_type"]
+                        target_id = relation["target_intent_id"]
+                        target = self._db.get_intent_object(object_type=object_type, object_id=target_id)
+                        if (not target
+                                or target["world_owner_entity_id"] != world_owner_id):
+                            raise ValueError("invalid_lifecycle_matching_target")
+                        if update:
+                            patch = update["field_updates"]
+                            # Merge before calling the typed DB writer so sparse
+                            # lifecycle patches cannot erase unrelated columns.
+                            payload = {key: target[key] for key in (
+                                "world_owner_entity_id", "canonical_key", "summary", "primary_domain",
+                                "time_start", "time_end", "confidence", "metadata",
+                            )}
+                            entity_field = {
+                                "goal": "owner_entity_id", "plan": "actor_entity_id",
+                                "work_item": "responsible_entity_id",
+                            }[object_type]
+                            payload[entity_field] = target[entity_field]
+                            payload.update({key: value for key, value in patch.items() if key != "details"})
+                            payload["details"] = {**target["details"], **patch.get("details", {})}
+                            if object_type == "goal":
+                                if "time_end" in patch:
+                                    payload["details"]["target_at"] = patch["time_end"]
+                                elif "target_at" in patch.get("details", {}):
+                                    payload["time_end"] = patch["details"]["target_at"]
+                            payload["status"] = update["status"]
+                            if any(payload[key] != target.get(key) for key in payload):
+                                if not self._db.update_intent_object(
+                                    object_type=object_type, object_id=target_id, payload=payload,
+                                ):
+                                    raise ValueError("lifecycle_intent_update_failed")
+                                updated_target = self._db.get_intent_object(
+                                    object_type=object_type, object_id=target_id,
+                                )
+                                if not updated_target:
+                                    raise ValueError("updated_lifecycle_intent_missing")
+                                event_id = self._db.insert_user_intent_event(
+                                    intent_id=target_id,
+                                    event_type="updated",
+                                    previous_payload=target,
+                                    new_payload=updated_target,
+                                    source_signal_id=signal_id,
+                                    lifecycle_observation_id=observation_id,
+                                    effective_at=update["effective_at"],
+                                )
+                        facts = self._db.get_memory_facts_by_ids(observation["evidence_fact_ids"])
+                        if len(facts) != len(observation["evidence_fact_ids"]):
+                            raise ValueError("missing_lifecycle_evidence_fact")
+                        self._db.upsert_intent_evidence([{
+                            "object_type": object_type, "object_id": target_id,
+                            "evidence_type": "fact", "evidence_id": fact["id"],
+                            "role": observation["lifecycle_evidence"],
+                            "observed_at": str(fact.get("dialogue_time_key") or fact.get("event_time_key") or ""),
+                        } for fact in facts])
+            except Exception as exc:
+                report["failed_signal_ids"].append(signal_id)
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": signal_id, "phase": "lifecycle_observation_save", "error": str(exc),
+                })
+                continue
+            report["intent_lifecycle_observation_ids"].append(observation_id)
+            report["completed_signal_ids"].append(signal_id)
+            if event_id is not None:
+                report["intent_event_ids"].append(event_id)
+            if not relation:
+                report["unmatched_observation_ids"].append(observation_id)
+            self._log_info("memory_user_intent_update", "lifecycle_relation", {
+                **decision, "signal_id": signal_id,
+                "observation_id": observation_id, "intent_event_id": event_id,
+            })
+        return report
+
+    def _save_future_intent_candidates(
         self,
         candidates: Sequence[Dict[str, Any]],
         decisions: Dict[int, Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        applied: List[Dict[str, Any]] = []
+        *,
+        facts_by_id: Dict[int, Dict[str, Any]],
+        reference_timestamp: Any,
+    ) -> Dict[str, Any]:
+        """Atomically save new intents, existing-intent changes, and their fact evidence."""
+        report: Dict[str, Any] = {
+            "intent_event_ids": [],
+            "completed_signal_ids": [],
+            "failed_signal_ids": [],
+        }
         for index, candidate in enumerate(candidates):
-            decision = decisions.get(index) or {"operation": "create", "target_object_id": 0}
-            object_type = candidate["object_type"]
-            operation = str(decision.get("operation") or "create")
-            target_id = int(decision.get("target_object_id") or 0)
-            target = self._db.get_intent_object(
-                object_type=object_type, object_id=target_id,
-            ) if target_id else None
-            status = self._intent_status_for_operation(object_type, operation, target)
-            payload = self._intent_storage_payload(candidate, status=status)
-            created = target is None
-            if created:
-                object_id = self._db.create_intent_object(
-                    object_type=object_type, payload=payload,
+            signal_id = candidate["signal_id"]
+            try:
+                recorded_events = self._db.get_user_intent_events(source_signal_id=signal_id)
+                if recorded_events:
+                    report["intent_event_ids"].extend(event["id"] for event in recorded_events)
+                    report["completed_signal_ids"].append(signal_id)
+                    continue
+                signal_event_ids: List[int] = []
+                fact = facts_by_id[candidate["evidence_fact_ids"][0]]
+                observed_at = _to_timestamp_text(
+                    fact.get("dialogue_time_key")
+                    or fact.get("event_time_key")
+                    or reference_timestamp
                 )
-                previous_status = ""
-                previous_payload: Dict[str, Any] = {}
-            else:
-                object_id = int(target["id"])
-                previous_status = str(target.get("status") or "")
-                previous_payload = dict(target)
-                update_payload = {
-                    key: value for key, value in payload.items()
-                    if value not in ("", None, 0, {}) or key in {"status", "confidence"}
-                }
-                self._db.update_intent_object(
-                    object_type=object_type, object_id=object_id, payload=update_payload,
-                )
-            stored_object = self._db.get_intent_object(
-                object_type=object_type,
-                object_id=object_id,
-            )
-            if stored_object:
-                self._sync_future_commitment_recall_document(
-                    object_type=object_type,
-                    item=stored_object,
-                )
-            evidence_role = {
-                "create": "creation", "confirm": "confirmation", "complete": "completion",
-                "cancel": "cancellation", "block": "block",
-            }.get(operation, "update")
-            self._db.upsert_intent_evidence([{
-                "object_type": object_type, "object_id": object_id,
-                "evidence_type": "fact", "evidence_id": fact_id,
-                "role": evidence_role, "observed_at": self._intent_effective_at(candidate),
-            } for fact_id in candidate["evidence_fact_ids"]])
-            self._db.insert_intent_event(
-                object_type=object_type, object_id=object_id,
-                event_type="create" if created else operation,
-                previous_status=previous_status, new_status=status,
-                previous_payload=previous_payload, new_payload=payload,
-                evidence_fact_ids=candidate["evidence_fact_ids"],
-                effective_at=self._intent_effective_at(candidate),
-                decision_source=str(decision.get("reason") or "intent_reconciliation"),
-            )
-            self._write_intent_entity_links(object_type, object_id, candidate)
-            applied.append({"object_type": object_type, "object_id": object_id, "created": created})
-        return applied
-
-    @staticmethod
-    def _intent_status_for_operation(
-        object_type: str, operation: str, target: Optional[Dict[str, Any]]) -> str:
-        defaults = {"goal": "active", "plan": "planned", "work_item": "open"}
-        status = str((target or {}).get("status") or defaults[object_type])
-        return {
-            "goal": {"complete": "achieved", "cancel": "abandoned"},
-            "plan": {"complete": "occurred", "cancel": "cancelled", "reschedule": "rescheduled"},
-            "work_item": {"complete": "completed", "cancel": "cancelled", "block": "blocked"},
-        }[object_type].get(operation, status)
+                decision = decisions.get(index)
+                if decision is None:
+                    raise ValueError("missing_valid_future_intent_decision")
+                object_type = candidate["object_type"]
+                relation = decision["relations"][0] if decision["relations"] else None
+                update = decision["intent_updates"][0] if decision["intent_updates"] else None
+                target_id = relation["target_intent_id"] if relation else 0
+                with self._db.transaction():
+                    target = self._db.get_intent_object(
+                        object_type=object_type, object_id=target_id,
+                    ) if target_id else None
+                    if relation and (
+                        not target or target["world_owner_entity_id"] != candidate["world_owner_entity_id"]
+                    ):
+                        raise ValueError("future_intent_target_missing_or_owner_mismatch")
+                    if decision["save_new_intent"]:
+                        status = {
+                            "goal": "active", "plan": "planned", "work_item": "open",
+                        }[object_type]
+                        object_id = self._db.create_intent_object(
+                            object_type=object_type,
+                            payload=self._intent_storage_payload(candidate, status=status),
+                        )
+                        stored_object = self._db.get_intent_object(
+                            object_type=object_type, object_id=object_id,
+                        )
+                        if not stored_object:
+                            raise ValueError("created_future_intent_missing")
+                        self._db.upsert_intent_evidence([{
+                            "object_type": object_type, "object_id": object_id,
+                            "evidence_type": "fact", "evidence_id": fact_id,
+                            "role": "creation", "observed_at": observed_at,
+                        } for fact_id in candidate["evidence_fact_ids"]])
+                        signal_event_ids.append(self._db.insert_user_intent_event(
+                            intent_id=object_id,
+                            event_type="created",
+                            new_payload=stored_object,
+                            source_signal_id=signal_id,
+                        ))
+                    if target:
+                        if update:
+                            # The DB accepts typed full payloads. Merge the sparse patch
+                            # first so unspecified columns and details cannot be erased.
+                            patch = update["field_updates"]
+                            payload = {key: target[key] for key in (
+                                "world_owner_entity_id", "canonical_key", "summary", "primary_domain",
+                                "time_start", "time_end", "confidence", "metadata",
+                            )}
+                            entity_field = {
+                                "goal": "owner_entity_id", "plan": "actor_entity_id",
+                                "work_item": "responsible_entity_id",
+                            }[object_type]
+                            payload[entity_field] = target[entity_field]
+                            payload.update({key: value for key, value in patch.items() if key != "details"})
+                            payload["details"] = {**target["details"], **patch.get("details", {})}
+                            if object_type == "goal":
+                                if "time_end" in patch:
+                                    payload["details"]["target_at"] = patch["time_end"]
+                                elif "target_at" in patch.get("details", {}):
+                                    payload["time_end"] = patch["details"]["target_at"]
+                            payload["status"] = update["status"]
+                            if any(payload[key] != target.get(key) for key in payload):
+                                if not self._db.update_intent_object(
+                                    object_type=object_type, object_id=target_id, payload=payload,
+                                ):
+                                    raise ValueError("future_intent_update_failed")
+                                updated_target = self._db.get_intent_object(
+                                    object_type=object_type, object_id=target_id,
+                                )
+                                if not updated_target:
+                                    raise ValueError("updated_future_intent_missing")
+                                signal_event_ids.append(self._db.insert_user_intent_event(
+                                    intent_id=target_id,
+                                    event_type="updated",
+                                    previous_payload=target,
+                                    new_payload=updated_target,
+                                    source_signal_id=signal_id,
+                                    effective_at=update["effective_at"],
+                                ))
+                        self._db.upsert_intent_evidence([{
+                            "object_type": object_type, "object_id": target_id,
+                            "evidence_type": "fact", "evidence_id": fact_id,
+                            "role": relation["relation"], "observed_at": observed_at,
+                        } for fact_id in candidate["evidence_fact_ids"]])
+            except Exception as exc:
+                report["failed_signal_ids"].append(signal_id)
+                self._log_info("memory_user_intent_update", "signal_error", {
+                    "signal_id": signal_id, "error": str(exc),
+                })
+                continue
+            report["completed_signal_ids"].append(signal_id)
+            report["intent_event_ids"].extend(signal_event_ids)
+            self._log_info("memory_user_intent_update", "future_intent_saved", {
+                "candidate_index": index, "signal_id": signal_id,
+                "intent_event_ids": signal_event_ids, **decision,
+            })
+        return report
 
     def _intent_storage_payload(self, candidate: Dict[str, Any], *, status: str) -> Dict[str, Any]:
         payload = {key: value for key, value in candidate.items() if key in {
@@ -3819,147 +3855,159 @@ class MemoryNodeManager:
             "desired_outcome", "success_criteria", "target_at", "actor_entity_id",
             "event_or_activity", "start_at", "end_at", "time_precision", "location_entity_id",
             "location_text", "responsible_entity_id", "action_text", "deliverable",
-            "responsibility_type", "due_at", "priority",
+            "responsibility_type", "due_at", "priority", "primary_domain",
         }}
+        object_type = str(candidate.get("object_type") or "")
+        if object_type == "goal":
+            payload["time_start"] = ""
+            payload["time_end"] = candidate.get("target_at") or ""
+            payload["details"] = {
+                "desired_outcome": candidate.get("desired_outcome") or "",
+                "success_criteria": candidate.get("success_criteria") or "",
+                "target_at": candidate.get("target_at") or "",
+            }
+        elif object_type == "plan":
+            payload["time_start"] = candidate.get("start_at") or ""
+            payload["time_end"] = candidate.get("end_at") or ""
+            payload["details"] = {
+                "event_or_activity": candidate.get("event_or_activity") or "",
+                "time_precision": candidate.get("time_precision") or "unknown",
+                "location_entity_id": candidate.get("location_entity_id") or 0,
+                "location_text": candidate.get("location_text") or "",
+                "participants": candidate.get("participant_names") or [],
+            }
+        elif object_type == "work_item":
+            payload["time_start"] = candidate.get("start_at") or ""
+            payload["time_end"] = candidate.get("due_at") or ""
+            payload["details"] = {
+                "action_text": candidate.get("action_text") or "",
+                "deliverable": candidate.get("deliverable") or "",
+                "responsibility_type": candidate.get("responsibility_type") or "personal_action",
+                "priority": candidate.get("priority") or "",
+                "beneficiary_entities": candidate.get("beneficiary_names") or [],
+                "delegator_entities": candidate.get("delegator_names") or [],
+                "collaborator_entities": candidate.get("collaborator_names") or [],
+                "extractor_version": "user_intent_update_v1",
+                "prompt_version": "v1",
+            }
         payload.update(status=status, confidence=candidate["confidence"], metadata={
             "source_fact_ids": candidate["evidence_fact_ids"],
+            "primary_domain": candidate["primary_domain"],
         })
-        if candidate["object_type"] == "work_item":
-            payload.update(
-                completed_at=(self._intent_effective_at(candidate) if status == "completed" else ""),
-                extractor_version="future_commitment_update_v1", prompt_version="v1",
-            )
         return payload
 
     @staticmethod
-    def _intent_effective_at(candidate: Dict[str, Any]) -> str:
-        return str(candidate.get("due_at") or candidate.get("start_at") or candidate.get("target_at") or "")
-
-    def _write_intent_entity_links(self, object_type: str, object_id: int, candidate: Dict[str, Any]) -> None:
-        names_by_role = (
-            {"actor": [candidate.get("actor_name") or ""], "participant": candidate.get("participant_names") or []}
-            if object_type == "plan" else {
-                "beneficiary": candidate.get("beneficiary_names") or [],
-                "delegator": candidate.get("delegator_names") or [],
-                "collaborator": candidate.get("collaborator_names") or [],
-            }
-        )
-        if object_type == "work_item":
-            names_by_role["responsible"] = [candidate.get("responsible_name") or ""]
-        names = [name for values in names_by_role.values() for name in values if name]
-        mapping = self._db.add_entity_names(names)
-        self._db.upsert_intent_entities(
-            object_type=object_type, object_id=object_id,
-            entities=[
-                {"entity_id": mapping[name], "role": role}
-                for role, values in names_by_role.items() for name in values
-                if name in mapping
-            ],
-        )
-
-    @staticmethod
-    def _entity_claim_types() -> set[str]:
+    def _user_claim_types() -> set[str]:
         return {
             "identity_profile", "affiliation", "relationship", "preference",
             "constraint", "behavior_pattern",
         }
 
-    def _update_memory_entity_claims(
+    def _update_memory_user_claims(
         self,
         *,
-        limit: int,
+        signal_ids: Sequence[int],
         reference_timestamp: Any,
-    ) -> Dict[str, Dict[str, Any]]:
-        """Project facts and completed episodes into traceable claim records."""
-        disabled = {
-            "enabled": 0, "updated": 0, "facts_marked_processed": 0,
+    ) -> Dict[str, Any]:
+        """Review selected claim signals against their facts and persist claims."""
+        signals = self._db.get_user_signals_by_ids(
+            "claim", signal_ids,
+        )
+        explicit_facts = self._db.get_memory_facts_by_ids(sorted({
+            int(signal["fact_id"]) for signal in signals
+        }))
+        facts_by_id = {int(fact["id"]): fact for fact in explicit_facts}
+        signals_by_id = {
+            int(item["signal_id"]): item
+            for fact in explicit_facts
+            for item in self._get_user_claim_signals_from_fact(fact)
         }
-        if not self._enable_memory_entity_claim_update:
-            return {
-                "explicit": dict(disabled),
-                "derived": dict(disabled),
-                "inductive": dict(disabled),
-            }
-
-        explicit_facts = self._db.get_unprocessed_facts(
-            processing_target="entity_claim",
-            limit=limit,
-            reference_timestamp=reference_timestamp,
+        signal_items = [
+            {"signal_id": int(row["signal_id"]), "fact": facts_by_id[int(row["fact_id"])],
+             "signal": signals_by_id[int(row["signal_id"])]}
+            for row in signals
+            if int(row["fact_id"]) in facts_by_id
+            and int(row["signal_id"]) in signals_by_id
+        ]
+        # Commit explicit results independently: a later derivation failure must
+        # neither roll them back nor make their source signals pending again.
+        with self._db.transaction():
+            explicit_report = self._update_explicit_user_claims_from_signals(signal_items)
+        missing_signal_count = len(signals) - len(signal_items)
+        if missing_signal_count:
+            explicit_report["failed_signal_count"] += missing_signal_count
+            explicit_report["completed"] = False
+        explicit_report.pop("completed", None)
+        processed_signal_ids = explicit_report.pop("processed_signal_ids", [])
+        new_claim_ids = list(explicit_report.get("new_claim_ids") or [])
+        derived_report = self._update_derived_user_claims_from_explicit_claims(
+            new_explicit_claim_ids=new_claim_ids,
         )
-        explicit_report = self._update_explicit_entity_claims_from_facts(explicit_facts)
-        explicit_completed = bool(explicit_report.pop("completed", False))
-        affected_claim_ids = explicit_report.pop("affected_claim_ids", [])
-        derived_report = self._update_derived_entity_claims_from_explicit_claims(
-            affected_claim_ids=affected_claim_ids,
-        ) if explicit_completed else {
-            "enabled": 1,
-            "seed_claim_count": 0,
-            "candidate_count": 0,
-            "updated": 0,
-            "created": 0,
-            "invalidated": 0,
-            "completed": False,
-            "error": "explicit_claim_update_incomplete",
+        all_new_claim_ids = sorted(
+            set(new_claim_ids) | set(derived_report.get("new_claim_ids") or [])
+        )
+        all_claim_relations = {
+            int(relation["relation_event_id"]): relation
+            for source_report in (explicit_report, derived_report)
+            for relation in source_report.get("claim_relations") or []
+            if int(relation.get("relation_event_id") or 0) > 0
         }
-        derived_completed = bool(derived_report.pop("completed", False))
-        # A valid empty result is a completed projection.  If either the
-        # explicit or directly-derived pass fails, leave these facts pending so
-        # the idempotent claim reconciliation can retry the full local chain.
-        if explicit_completed and derived_completed:
-            explicit_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="entity_claim",
-                fact_ids=[fact.get("id") for fact in explicit_facts],
-            )
-        else:
-            explicit_report["facts_marked_processed"] = 0
-
-        induction_seed_facts = self._db.get_unprocessed_facts(
-            processing_target="entity_claim_induction",
-            reference_timestamp=reference_timestamp,
-            limit=max(1, min(limit, 100)),
-            restrict_to_today=False,
-            require_episode=True,
-        )
-        inductive_report = self._update_inductive_entity_claims_from_facts(
-            induction_seed_facts,
-        )
-        if inductive_report.pop("completed", False):
-            inductive_report["facts_marked_processed"] = self._db.mark_facts_processed(
-                processing_target="entity_claim_induction",
-                fact_ids=[fact.get("id") for fact in induction_seed_facts],
-            )
-        else:
-            inductive_report["facts_marked_processed"] = 0
-        self._log_info("memory_entity_claim", "entity_claim_update_finish", {
-            "explicit": explicit_report,
-            "derived": derived_report,
-            "inductive": inductive_report,
-        })
         return {
             "explicit": explicit_report,
             "derived": derived_report,
-            "inductive": inductive_report,
+            "new_claim_ids": all_new_claim_ids,
+            "claim_relations": [
+                all_claim_relations[event_id] for event_id in sorted(all_claim_relations)
+            ],
+            "_completed_signal_ids": processed_signal_ids,
         }
 
-    def _claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+    def _explicit_claim_fact_prompt_view(self, fact: Dict[str, Any]) -> Dict[str, Any]:
         metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
-        return {
+        entities = list(fact.get("entities") or [])
+        has_world_owner = bool(
+            (metadata.get("has_world_owner_speaker") or metadata.get("has_world_owner_alias_reference"))
+            and any(
+                _compact_whitespace(entity).lower()
+                == self._world_owner_entity_name.lower()
+                for entity in entities
+            )
+        )
+        prompt_view = {
             "fact_id": fact.get("id"),
             "summary": fact.get("summary") or "",
             "fact_type": fact.get("fact_type") or "",
-            "entities": fact.get("entities") or [],
+            "entities": entities,
+            "world_owner_entity": (
+                self._world_owner_entity_name if has_world_owner else ""
+            ),
             "primary_entity": fact.get("primary_entity") or metadata.get("primary_entity"),
             "keywords": fact.get("keywords") or [],
             "event_time": fact.get("event_time_key") or "",
             "dialogue_time": fact.get("dialogue_time_key") or "",
         }
+        return prompt_view
 
-    def _sync_entity_claim_recall_documents(
+    def _explicit_claim_signal_prompt_view(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        signal = item["signal"]
+        return {
+            "signal_id": item["signal_id"],
+            "user_claim_signal": {
+                "subject_entity": _compact_whitespace(signal.get("subject") or ""),
+                "claim_type_hint": str(signal.get("claim_type_hint") or ""),
+                "claim_anchor": str(signal.get("claim_anchor") or ""),
+                "evidence_basis": str(signal.get("evidence_basis") or ""),
+                "confidence": float(signal.get("confidence") or 0.0),
+            },
+            "fact": self._explicit_claim_fact_prompt_view(item["fact"]),
+        }
+
+    def _sync_user_claim_recall_documents(
         self,
         claim_ids: Sequence[int],
     ) -> None:
         """Refresh projections for claims created, merged, or transitioned."""
-        claims = self._db.get_entity_claims_by_ids(claim_ids)
+        claims = self._db.get_user_claims_by_ids(claim_ids)
         entity_ids = [
             int(entity_id)
             for claim in claims
@@ -3980,7 +4028,7 @@ class MemoryNodeManager:
                 if entity_id > 0
             ]
             self._upsert_memory_recall_document(
-                object_type="entity_claim",
+                object_type="user_claim",
                 object_id=int(claim["id"]),
                 title=_compact_whitespace(claim.get("claim_text") or "")[:120],
                 summary=_compact_whitespace(claim.get("claim_text") or ""),
@@ -3990,6 +4038,7 @@ class MemoryNodeManager:
                     f"predicate: {claim.get('predicate') or ''}",
                     f"object: {names_by_id.get(object_id, '')}",
                     f"claim_type: {claim.get('claim_type') or ''}",
+                    f"primary_domain: {claim.get('primary_domain') or ''}",
                     f"claim_origin: {claim.get('claim_origin') or ''}",
                     f"status: {claim.get('status') or ''}",
                 ],
@@ -4006,21 +4055,22 @@ class MemoryNodeManager:
                 metadata={
                     "claim_origin": str(claim.get("claim_origin") or ""),
                     "claim_type": str(claim.get("claim_type") or ""),
+                    "primary_domain": str(claim.get("primary_domain") or ""),
                     "predicate": str(claim.get("predicate") or ""),
                     "projection_version": "v1",
                 },
             )
 
     @staticmethod
-    def _entity_claim_origin_priority(origin: Any) -> int:
-        """Origin is a hard reconciliation precedence, not a soft score."""
-        return {"explicit": 3, "inductive": 2, "derived": 1}.get(
+    def _user_claim_origin_priority(origin: Any) -> int:
+        """Return a deterministic ordering hint for claim-relation retrieval."""
+        return {"explicit": 2, "derived": 1}.get(
             str(origin or "").strip().lower(),
             0,
         )
 
     @staticmethod
-    def _entity_claim_storage_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    def _user_claim_storage_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
         return {
             key: value
             for key, value in candidate.items()
@@ -4030,7 +4080,7 @@ class MemoryNodeManager:
         }
 
     @staticmethod
-    def _entity_claim_support_ids(
+    def _get_user_claim_support_fact_ids(
         candidate: Dict[str, Any],
     ) -> List[int]:
         support_ids = candidate.get("support_fact_ids")
@@ -4038,15 +4088,15 @@ class MemoryNodeManager:
             support_ids = candidate.get("evidence_fact_ids") or []
         return [int(value) for value in support_ids if str(value).strip().isdigit()]
 
-    def _retrieve_related_entity_claims(
+    def _retrieve_related_user_claims(
         self,
         candidate: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """Bound relation candidates to one entity and compatible claim type."""
-        rows = self._db.get_entity_claims(
+        rows = self._db.get_user_claims(
             subject_entity_id=int(candidate["subject_entity_id"]),
             claim_type=str(candidate["claim_type"]),
-            statuses=["active", "candidate", "weakened"],
+            statuses=["active", "candidate", "weakened", "superseded"],
             limit=80,
         )
         predicate = str(candidate.get("predicate") or "")
@@ -4055,19 +4105,24 @@ class MemoryNodeManager:
             key=lambda row: (
                 str(row.get("predicate") or "") != predicate,
                 int(row.get("object_entity_id") or 0) != object_entity_id,
-                -self._entity_claim_origin_priority(row.get("claim_origin")),
+                -self._user_claim_origin_priority(row.get("claim_origin")),
                 -float(row.get("confidence") or 0.0),
             )
         )
         return rows[:24]
 
-    def _finalize_entity_claim_relation_decision(
+    def _finalize_user_claim_relation_decision(
         self,
         candidate: Dict[str, Any],
         target: Optional[Dict[str, Any]],
         semantic_decision: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Translate text-only relation into a safe origin-aware write plan."""
+        """Translate text-only claim semantics into audit/evidence actions.
+
+        This layer deliberately does not decide which claim is currently true.
+        The UserStateResolver applies origin, freshness, and context weights at
+        read time; reconciliation only records the semantic relation.
+        """
         semantic_relation = str(
             semantic_decision.get("semantic_relation")
             or semantic_decision.get("relation")
@@ -4076,49 +4131,17 @@ class MemoryNodeManager:
         decision = {
             **semantic_decision,
             "semantic_relation": semantic_relation,
-            "merge_into_target": False,
-            "candidate_status": str(candidate.get("status") or "candidate"),
-            "target_status": "",
             "target_evidence_role": "",
         }
         if not target:
             return decision
-        candidate_priority = self._entity_claim_origin_priority(
-            candidate.get("claim_origin")
-        )
-        target_priority = self._entity_claim_origin_priority(
-            target.get("claim_origin")
-        )
-        if semantic_relation == "duplicate":
-            if candidate_priority <= target_priority:
-                decision["merge_into_target"] = True
-                decision["target_evidence_role"] = (
-                    "context" if candidate_priority < target_priority else "support"
-                )
-            else:
-                # Keep a direct explicit assertion as its own, stronger claim,
-                # while using it to support the older inductive conclusion.
-                decision["target_evidence_role"] = "support"
-            return decision
-        if semantic_relation in {"supports", "refines"}:
-            decision["target_evidence_role"] = (
-                "context" if candidate_priority < target_priority else "support"
-            )
-            return decision
-        if semantic_relation not in {"contradicts", "supersedes"}:
-            return decision
-        if candidate_priority < target_priority:
-            # An inferred pattern can coexist as a tentative competing claim,
-            # but it never changes an explicit claim's state.
-            decision["candidate_status"] = "candidate"
-            return decision
-        decision["target_evidence_role"] = "counterexample"
-        decision["target_status"] = (
-            "superseded" if semantic_relation == "supersedes" else "weakened"
-        )
+        if semantic_relation in {"duplicate", "supports", "refines"}:
+            decision["target_evidence_role"] = "support"
+        elif semantic_relation in {"contradicts", "supersedes"}:
+            decision["target_evidence_role"] = "counterexample"
         return decision
 
-    def _classify_entity_claim_relations(
+    def _classify_user_claim_relations(
         self,
         candidates: Sequence[Dict[str, Any]],
         related_by_index: Dict[int, List[Dict[str, Any]]],
@@ -4129,34 +4152,32 @@ class MemoryNodeManager:
             "\n".join(str(candidate.get("claim_text") or "") for candidate in candidates)
         )
         prompt_template = (
-            ENTITY_CLAIM_RECONCILIATION_PROMPT_EN
-            if language == "en" else ENTITY_CLAIM_RECONCILIATION_PROMPT_ZH
+            USER_CLAIM_RECONCILIATION_PROMPT_EN
+            if language == "en" else USER_CLAIM_RECONCILIATION_PROMPT_ZH
         )
-        prompt_candidates = [
+        candidate_claim_groups = [
             {
                 "candidate_claim_index": index,
-                "claim_text": candidate.get("claim_text") or "",
+                "candidate_claim": {
+                    "claim_text": candidate.get("claim_text") or "",
+                },
+                "related_existing_claims": [
+                    {
+                        "id": claim.get("id"),
+                        "claim_text": claim.get("claim_text") or "",
+                    }
+                    for claim in related_by_index.get(index, [])
+                ],
             }
             for index, candidate in enumerate(candidates)
         ]
-        existing_by_id = {
-            int(claim["id"]): claim
-            for claims in related_by_index.values()
-            for claim in claims
-            if str(claim.get("id") or "").strip().isdigit()
-        }
-        raw = self._call_llm(
-            prompt_template.replace("{candidate_claims}", json.dumps(
-                prompt_candidates, ensure_ascii=False, indent=2,
-            )).replace("{existing_claims}", json.dumps(
-                [
-                    {"id": claim.get("id"), "claim_text": claim.get("claim_text") or ""}
-                    for claim in existing_by_id.values()
-                ],
+        raw = self._llm_client.call_llm(
+            prompt_template.replace("{candidate_claim_groups}", json.dumps(
+                candidate_claim_groups,
                 ensure_ascii=False, indent=2,
             ))
         )
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if not parsed or not isinstance(parsed.get("decisions"), list):
             return [[] for _candidate in candidates]
         else:
@@ -4221,14 +4242,14 @@ class MemoryNodeManager:
                 )
                 if target:
                     candidate_decisions.append(
-                        self._finalize_entity_claim_relation_decision(
+                        self._finalize_user_claim_relation_decision(
                             candidate, target, semantic_decision,
                         )
                     )
             finalized.append(candidate_decisions)
         return finalized
 
-    def _write_entity_claim_evidence(
+    def _write_user_claim_evidence(
         self,
         *,
         claim_id: int,
@@ -4251,10 +4272,10 @@ class MemoryNodeManager:
                 "observed_at": fact.get("event_time_key")
                 or fact.get("dialogue_time_key") or "",
             })
-        self._db.upsert_entity_claim_evidence(evidence)
+        self._db.upsert_user_claim_evidence(evidence)
 
     @staticmethod
-    def _entity_claim_transition_effective_at(
+    def _user_claim_transition_effective_at(
         candidate: Dict[str, Any],
         *,
         support_ids: Sequence[int],
@@ -4274,7 +4295,7 @@ class MemoryNodeManager:
         ]
         return max((value for value in observed_at if value), default="")
 
-    def _transition_entity_claim_target(
+    def _record_user_claim_relation(
         self,
         *,
         target: Dict[str, Any],
@@ -4282,62 +4303,54 @@ class MemoryNodeManager:
         candidate: Dict[str, Any],
         decision: Dict[str, Any],
         effective_at: str,
-    ) -> bool:
-        """Persist an origin-aware claim-state transition with its audit trail."""
-        target_status = str(decision.get("target_status") or "")
-        if not target_status:
-            return False
-        candidate_origin = str(candidate.get("claim_origin") or "")
-        target_origin = str(target.get("claim_origin") or "")
-        candidate_priority = self._entity_claim_origin_priority(candidate_origin)
-        target_priority = self._entity_claim_origin_priority(target_origin)
+    ) -> Optional[int]:
+        """Persist semantic claim history without resolving effective state."""
         details = {
             "trigger_claim_snapshot": {
                 "claim_text": candidate.get("claim_text") or "",
-                "claim_origin": candidate_origin,
+                "claim_origin": candidate.get("claim_origin") or "",
                 "claim_type": candidate.get("claim_type") or "",
                 "confidence": candidate.get("confidence"),
             },
             "target_claim_snapshot": {
                 "claim_text": target.get("claim_text") or "",
-                "claim_origin": target_origin,
+                "claim_origin": target.get("claim_origin") or "",
                 "claim_type": target.get("claim_type") or "",
                 "confidence": target.get("confidence"),
             },
-            "origin_priorities": {
-                "trigger": candidate_priority,
-                "target": target_priority,
-            },
         }
-        return self._db.transition_entity_claim_status(
+        return self._db.record_user_claim_relation(
             target_claim_id=int(target["id"]),
-            new_status=target_status,
             trigger_claim_id=trigger_claim_id,
             semantic_relation=str(decision.get("semantic_relation") or ""),
             effective_at=effective_at,
-            decision_source="entity_claim_reconciliation_v1:llm_semantics+origin_policy",
+            decision_source="user_claim_reconciliation_v2:llm_semantics",
             semantic_confidence=self._clamp_float(
                 decision.get("confidence"), 0.0, 1.0, 0.0,
             ),
             semantic_reason=_compact_whitespace(decision.get("reason") or "")[:240],
-            policy_reason=(
-                f"origin_precedence: trigger={candidate_origin}({candidate_priority}), "
-                f"target={target_origin}({target_priority}), "
-                f"target_status={target_status}"
-            ),
             details=details,
         )
 
-    def _reconcile_entity_claims(
+    def _reconcile_user_claims(
         self,
         candidates: Sequence[Dict[str, Any]],
         *,
         facts_by_id: Dict[int, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Resolve new candidate claims before they become durable claims."""
+        candidate_subject_ids = [
+            candidate.get("subject_entity_id") for candidate in candidates or []
+        ]
+        subject_names = self._db.get_entity_names_by_ids(candidate_subject_ids)
         unique_candidates: List[Dict[str, Any]] = []
         seen: set[Tuple[Any, ...]] = set()
         for candidate in candidates:
+            subject_id = int(candidate.get("subject_entity_id") or 0)
+            if _compact_whitespace(subject_names.get(subject_id) or "").lower() != (
+                self._world_owner_entity_name.lower()
+            ):
+                continue
             key = (
                 candidate.get("subject_entity_id"), candidate.get("claim_type"),
                 candidate.get("predicate"), candidate.get("object_entity_id") or 0,
@@ -4348,28 +4361,22 @@ class MemoryNodeManager:
             seen.add(key)
             unique_candidates.append(candidate)
         related_by_index = {
-            index: self._retrieve_related_entity_claims(candidate)
+            index: self._retrieve_related_user_claims(candidate)
             for index, candidate in enumerate(unique_candidates)
         }
-        decisions = self._classify_entity_claim_relations(
+        decisions = self._classify_user_claim_relations(
             unique_candidates, related_by_index,
         )
         applied: List[Dict[str, Any]] = []
         for index, candidate in enumerate(unique_candidates):
             candidate_decisions = decisions[index]
             candidate_origin = str(candidate.get("claim_origin") or "")
-            support_ids = self._entity_claim_support_ids(candidate)
-            effective_at = self._entity_claim_transition_effective_at(
+            support_ids = self._get_user_claim_support_fact_ids(candidate)
+            effective_at = self._user_claim_transition_effective_at(
                 candidate,
                 support_ids=support_ids,
                 facts_by_id=facts_by_id,
             )
-            candidate_status = str(candidate.get("status") or "candidate")
-            if any(
-                str(decision.get("candidate_status") or "") == "candidate"
-                for decision in candidate_decisions
-            ):
-                candidate_status = "candidate"
 
             def target_for(decision: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 target_id = decision.get("existing_claim_id")
@@ -4381,78 +4388,36 @@ class MemoryNodeManager:
                     None,
                 )
 
-            merge_decisions = [
-                decision for decision in candidate_decisions
-                if decision.get("merge_into_target") and target_for(decision)
-            ]
-            if merge_decisions:
-                primary_merge = max(
-                    merge_decisions,
-                    key=lambda decision: self._entity_claim_origin_priority(
-                        (target_for(decision) or {}).get("claim_origin")
-                    ),
-                )
-                primary_target = target_for(primary_merge)
-                assert primary_target is not None
-                claim_id = int(primary_target["id"])
-                for decision in candidate_decisions:
-                    target = target_for(decision)
-                    if not target:
-                        continue
-                    target_status = str(decision.get("target_status") or "")
-                    target_evidence_role = str(
-                        decision.get("target_evidence_role") or ""
-                    )
-                    if target_status:
-                        self._transition_entity_claim_target(
-                            target=target,
-                            trigger_claim_id=claim_id,
-                            candidate=candidate,
-                            decision=decision,
-                            effective_at=effective_at,
-                        )
-                    if target_evidence_role:
-                        self._write_entity_claim_evidence(
-                            claim_id=int(target["id"]),
-                            support_ids=support_ids,
-                            facts_by_id=facts_by_id,
-                            confidence=float(candidate.get("confidence") or 0.0),
-                            support_role=target_evidence_role,
-                        )
-                applied.append({
-                    "claim": candidate, "claim_id": claim_id, "created": False,
-                    "effective_origin": primary_target.get("claim_origin") or "",
-                    "relations": candidate_decisions, "merged": True,
-                })
-                continue
-
-            storage_payload = self._entity_claim_storage_payload(candidate)
-            storage_payload["status"] = candidate_status
-            claim_id, created = self._db.upsert_entity_claim(**storage_payload)
-            self._write_entity_claim_evidence(
+            storage_payload = self._user_claim_storage_payload(candidate)
+            claim_id, created = self._db.upsert_user_claim(**storage_payload)
+            self._write_user_claim_evidence(
                 claim_id=claim_id,
                 support_ids=support_ids,
                 facts_by_id=facts_by_id,
                 confidence=float(candidate.get("confidence") or 0.0),
             )
+            persisted_relations: List[Dict[str, Any]] = []
             for decision in candidate_decisions:
                 target = target_for(decision)
                 if not target:
                     continue
-                target_status = str(decision.get("target_status") or "")
                 target_evidence_role = str(
                     decision.get("target_evidence_role") or ""
                 )
-                if target_status:
-                    self._transition_entity_claim_target(
-                        target=target,
-                        trigger_claim_id=claim_id,
-                        candidate=candidate,
-                        decision=decision,
-                        effective_at=effective_at,
-                    )
+                relation_event_id = self._record_user_claim_relation(
+                    target=target,
+                    trigger_claim_id=claim_id,
+                    candidate=candidate,
+                    decision=decision,
+                    effective_at=effective_at,
+                )
+                if relation_event_id:
+                    persisted_relations.append({
+                        **decision,
+                        "relation_event_id": int(relation_event_id),
+                    })
                 if target_evidence_role:
-                    self._write_entity_claim_evidence(
+                    self._write_user_claim_evidence(
                         claim_id=int(target["id"]),
                         support_ids=support_ids,
                         facts_by_id=facts_by_id,
@@ -4462,10 +4427,10 @@ class MemoryNodeManager:
             applied.append({
                 "claim": candidate, "claim_id": claim_id, "created": created,
                 "effective_origin": candidate_origin,
-                "relations": candidate_decisions,
+                "relations": persisted_relations,
                 "merged": False,
             })
-        self._log_info("memory_entity_claim", "entity_claim_reconciled", {
+        self._log_info("memory_user_claim", "user_claim_reconciled", {
             "candidate_count": len(unique_candidates),
             "applied_count": len(applied),
             "relations": [
@@ -4495,88 +4460,190 @@ class MemoryNodeManager:
             if str(decision.get("existing_claim_id") or "").strip().isdigit()
             and int(decision["existing_claim_id"]) > 0
         )
-        self._sync_entity_claim_recall_documents(
+        self._sync_user_claim_recall_documents(
             sorted(recall_document_claim_ids)
         )
         return applied
 
-    def _update_explicit_entity_claims_from_facts(
+    def _update_explicit_user_claims_from_signals(
         self,
-        facts: Sequence[Dict[str, Any]],
+        signal_items: Sequence[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """Review each signal against its own fact before reconciling claims."""
         report: Dict[str, Any] = {
-            "enabled": 1, "fact_count": len(facts), "claim_count": 0,
-            "updated": 0, "created": 0, "completed": True,
+            "enabled": 1,
+            "signal_count": len(signal_items),
+            "fact_count": len({int(item["fact"]["id"]) for item in signal_items}),
+            "signal_batch_count": 0,
+            "failed_signal_count": 0,
+            "claim_count": 0,
+            "updated": 0,
+            "created": 0,
+            "merged": 0,
+            "new_claim_ids": [],
+            "claim_relations": [],
+            "processed_signal_ids": [],
+            "completed": True,
         }
-        if not facts:
+        if not signal_items:
             return report
-        prompt_language = self._resolve_prompt_language_from_text(
-            "\n".join(str(fact.get("summary") or "") for fact in facts[:20])
-        )
-        prompt_template = (
-            EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
-            if prompt_language == "en" else EXPLICIT_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
-        )
-        raw = self._call_llm(prompt_template.replace(
-            "{facts}", json.dumps(
-                [self._claim_fact_prompt_view(fact) for fact in facts[:40]],
-                ensure_ascii=False, indent=2,
-            ),
-        ))
-        parsed = self._parse_json_object_from_llm_text(raw or "")
-        if parsed is None or not isinstance(parsed.get("claims"), list):
-            report["completed"] = False
-            report["error"] = "invalid_llm_claim_response"
-            return report
-        facts_by_id = {
-            int(fact["id"]): fact for fact in facts
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        entity_ids_by_name: Dict[str, int] = {}
-        for fact in facts_by_id.values():
-            for raw_name, raw_entity_id in zip(
-                fact.get("entities") or [],
-                fact.get("entity_ids") or [],
-            ):
-                entity_name = _compact_whitespace(raw_name)
-                if not entity_name or entity_name in entity_ids_by_name:
-                    continue
-                try:
-                    entity_id = int(raw_entity_id)
-                except (TypeError, ValueError):
-                    continue
-                if entity_id > 0:
-                    entity_ids_by_name[entity_name] = entity_id
-        candidates: List[Dict[str, Any]] = []
-        for raw_claim in parsed["claims"][:32]:
-            claim = self._normalize_explicit_entity_claim(
-                raw_claim,
-                facts_by_id=facts_by_id,
-                entity_ids=entity_ids_by_name,
-            )
-            if not claim:
-                continue
-            candidates.append(claim)
-        applied = self._reconcile_entity_claims(candidates, facts_by_id=facts_by_id)
+        extraction_claim_info = self._extract_explicit_user_claims_from_signals_using_llm(signal_items)
+        report.update({
+            "signal_batch_count": extraction_claim_info["signal_batch_count"],
+            "failed_signal_count": extraction_claim_info["failed_signal_count"],
+            "claim_count": extraction_claim_info["claim_count"],
+            "processed_signal_ids": extraction_claim_info["processed_signal_ids"],
+        })
+        claim_candidates = extraction_claim_info["claim_candidates"]
+        facts_by_id = {int(item["fact"]["id"]): item["fact"] for item in signal_items}
+        applied = self._reconcile_user_claims(
+            claim_candidates, facts_by_id=facts_by_id,
+        ) if claim_candidates else []
         report["updated"] = len(applied)
         report["created"] = sum(int(item["created"]) for item in applied)
         report["merged"] = sum(int(item["merged"]) for item in applied)
-        report["claim_count"] = len(candidates)
-        report["affected_claim_ids"] = sorted({
-            int(claim_id)
-            for item in applied
-            for claim_id in (
-                item.get("claim_id"),
-                *[
-                    decision.get("existing_claim_id")
-                    for decision in item.get("relations") or []
-                ],
-            )
-            if str(claim_id or "").strip().isdigit() and int(claim_id) > 0
-        })
+        new_claim_ids: set[int] = set()
+        claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+        for applied_item in applied:
+            claim_id = int(applied_item["claim_id"])
+            new_claim_ids.add(claim_id)
+            for decision in applied_item.get("relations") or []:
+                existing_claim_id = int(decision.get("existing_claim_id") or 0)
+                if existing_claim_id <= 0 or existing_claim_id == claim_id:
+                    continue
+                semantic_relation = str(decision.get("semantic_relation") or "")
+                key = (claim_id, existing_claim_id, semantic_relation)
+                claim_relations[key] = {
+                    "relation_event_id": int(decision["relation_event_id"]),
+                    "new_claim_id": claim_id,
+                    "existing_claim_id": existing_claim_id,
+                    "semantic_relation": semantic_relation,
+                    "confidence": float(decision.get("confidence") or 0.0),
+                    "reason": str(decision.get("reason") or ""),
+                }
+        report["new_claim_ids"] = sorted(new_claim_ids)
+        report["claim_relations"] = [
+            claim_relations[key] for key in sorted(claim_relations)
+        ]
+        report["completed"] = report["failed_signal_count"] == 0
         return report
 
-    def _normalize_explicit_entity_claim(
+    def _extract_explicit_user_claims_from_signals_using_llm(
+        self,
+        signal_items: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Extract all signal batches and merge duplicate claims across batches."""
+        result: Dict[str, Any] = {
+            "signal_batch_count": 0,
+            "failed_signal_count": 0,
+            "claim_count": 0,
+            "processed_signal_ids": [],
+            "claim_candidates": [],
+        }
+        unique_claim_candidates: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        batch_size = max(
+            1, int(self._memory_cfg.get("user_claim_signal_batch_size") or 8),
+        )
+        for batch_start in range(0, len(signal_items), batch_size):
+            batch_signal_items = signal_items[batch_start:batch_start + batch_size]
+            result["signal_batch_count"] += 1
+            prompt_language = self._resolve_prompt_language_from_text(
+                "\n".join(str(item["fact"].get("summary") or "") for item in batch_signal_items)
+            )
+            prompt_template = (
+                EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_EN
+                if prompt_language == "en" else EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH
+            )
+            try:
+                raw = self._llm_client.call_llm(prompt_template.replace(
+                    "{signal_items}", json.dumps(
+                        [self._explicit_claim_signal_prompt_view(item) for item in batch_signal_items],
+                        ensure_ascii=False, indent=2,
+                    ),
+                ))
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            except Exception as exc:
+                parsed = None
+                self._log_info("memory_user_claim", "signal_batch_error", {
+                    "signal_ids": [item["signal_id"] for item in batch_signal_items],
+                    "error": str(exc),
+                })
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("results"), list):
+                result["failed_signal_count"] += len(batch_signal_items)
+                continue
+
+            results_by_id: Dict[int, List[Dict[str, Any]]] = {}
+            for raw_result in parsed["results"]:
+                if not isinstance(raw_result, dict):
+                    continue
+                try:
+                    signal_id = int(raw_result.get("signal_id"))
+                except (TypeError, ValueError):
+                    continue
+                results_by_id.setdefault(signal_id, []).append(raw_result)
+
+            for item in batch_signal_items:
+                signal_id = int(item["signal_id"])
+                results = results_by_id.get(signal_id) or []
+                if len(results) != 1 or not isinstance(results[0].get("claims"), list):
+                    result["failed_signal_count"] += 1
+                    continue
+                fact = item["fact"]
+                fact_id = int(fact["id"])
+                entity_ids_by_name = {
+                    _compact_whitespace(name): int(entity_id)
+                    for name, entity_id in zip(
+                        fact.get("entities") or [], fact.get("entity_ids") or [],
+                    )
+                    if _compact_whitespace(name) and str(entity_id).isdigit()
+                    and int(entity_id) > 0
+                }
+                signal_candidates: List[Dict[str, Any]] = []
+                valid = True
+                for raw_claim in results[0]["claims"]:
+                    if (
+                        not isinstance(raw_claim, dict)
+                        or raw_claim.get("evidence_fact_ids") != [fact_id]
+                    ):
+                        valid = False
+                        break
+                    claim = self._normalize_explicit_user_claim(
+                        raw_claim,
+                        facts_by_id={fact_id: fact},
+                        entity_ids=entity_ids_by_name,
+                    )
+                    if claim is None:
+                        valid = False
+                        break
+                    signal_candidates.append(claim)
+                if not valid:
+                    result["failed_signal_count"] += 1
+                    continue
+                result["claim_count"] += len(signal_candidates)
+                result["processed_signal_ids"].append(signal_id)
+
+                # Merge equivalent claims across every batch before reconciliation.
+                for candidate in signal_candidates:
+                    key = (
+                        candidate["subject_entity_id"], candidate["claim_type"],
+                        candidate["predicate"], candidate.get("object_entity_id") or 0,
+                        candidate["claim_text"], candidate["claim_origin"],
+                    )
+                    existing = unique_claim_candidates.get(key)
+                    if existing is None:
+                        unique_claim_candidates[key] = candidate
+                        continue
+                    existing["evidence_fact_ids"] = list(dict.fromkeys(
+                        [*existing["evidence_fact_ids"], *candidate["evidence_fact_ids"]]
+                    ))
+                    existing["metadata"]["source_fact_count"] = len(existing["evidence_fact_ids"])
+                    existing["confidence"] = max(existing["confidence"], candidate["confidence"])
+                    if candidate["status"] == "active":
+                        existing["status"] = "active"
+        result["claim_candidates"] = list(unique_claim_candidates.values())
+        return result
+
+    def _normalize_explicit_user_claim(
         self,
         raw: Any,
         *,
@@ -4586,21 +4653,36 @@ class MemoryNodeManager:
         if not isinstance(raw, dict):
             return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in self._entity_claim_types() - {"behavior_pattern"}:
-            return None
-        subject = _compact_whitespace(raw.get("subject_entity") or "")
-        subject_id = entity_ids.get(subject)
-        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
-        if not subject_id or not predicate:
+        if claim_type not in self._user_claim_types():
             return None
         evidence_ids = list(dict.fromkeys(
             int(value) for value in (raw.get("evidence_fact_ids") or [])
             if str(value).strip().isdigit() and int(value) in facts_by_id
         ))[:12]
-        if not evidence_ids or not all(
-            subject in (facts_by_id[fact_id].get("entities") or [])
+        if not evidence_ids:
+            return None
+        subject = _compact_whitespace(raw.get("subject_entity") or "")
+        if self._is_world_owner_entity_reference(subject):
+            subject = self._world_owner_entity_name
+        if subject.lower() != self._world_owner_entity_name.lower():
+            return None
+        # A claim can only be grounded in facts whose source metadata
+        # explicitly identifies the wearer, and whose normalized entities
+        # retain that exact subject.
+        if not all(
+            isinstance(facts_by_id[fact_id].get("metadata"), dict)
+            and bool(
+                facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
+                or facts_by_id[fact_id]["metadata"].get("has_world_owner_alias_reference")
+            )
+            and subject in (facts_by_id[fact_id].get("entities") or [])
             for fact_id in evidence_ids
         ):
+            return None
+        subject_id = entity_ids.get(subject)
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
+        if not subject_id or not predicate or not primary_domain:
             return None
         object_name = _compact_whitespace(raw.get("object_entity") or "")
         object_id = entity_ids.get(object_name) if object_name else None
@@ -4608,7 +4690,13 @@ class MemoryNodeManager:
         if not object_id and not raw_claim_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        claim_text = self._normalize_entity_claim_text(
+        has_wearer_evidence = any(
+            facts_by_id[fact_id]["metadata"].get("has_world_owner_speaker")
+            for fact_id in evidence_ids
+        )
+        if not has_wearer_evidence:
+            confidence = min(confidence, 0.65)
+        claim_text = self._normalize_user_claim_text(
             raw_claim_text,
             subject=subject,
             predicate=predicate,
@@ -4623,165 +4711,222 @@ class MemoryNodeManager:
             "claim_text": claim_text,
             "claim_type": claim_type,
             "claim_origin": "explicit",
-            "status": "active" if confidence >= self._entity_claim_explicit_min_confidence else "candidate",
+            "primary_domain": primary_domain,
+            "status": (
+                "active"
+                if has_wearer_evidence and confidence >= self._user_claim_explicit_min_confidence
+                else "candidate"
+            ),
             "confidence": confidence,
             "valid_from": _compact_whitespace(raw.get("valid_from") or ""),
             "valid_to": _compact_whitespace(raw.get("valid_to") or ""),
-            "extractor_version": "entity_claim_explicit_v1",
+            "extractor_version": "user_claim_explicit_v1",
             "prompt_version": "v1",
             "metadata": {"source_fact_count": len(evidence_ids)},
             "evidence_fact_ids": evidence_ids,
         }
 
-    def _update_derived_entity_claims_from_explicit_claims(
+    def _update_derived_user_claims_from_explicit_claims(
         self,
         *,
-        affected_claim_ids: Sequence[int],
+        new_explicit_claim_ids: Sequence[int],
     ) -> Dict[str, Any]:
         """Derive local conclusions from this batch's explicit-claim changes.
 
-        The LLM proposes only premise-linked conclusions.  Entity IDs,
-        premise activity, fact traceability, lifecycle transitions, and writes
-        remain deterministic program responsibilities.
+        The LLM proposes only premise-linked conclusions. Entity IDs,
+        premise membership, fact traceability, and writes remain deterministic
+        program responsibilities.
         """
-        affected_ids = list(dict.fromkeys(
+        explicit_claim_ids = list(dict.fromkeys(
             int(value)
-            for value in affected_claim_ids or []
+            for value in new_explicit_claim_ids or []
             if str(value).strip().isdigit() and int(value) > 0
         ))
         report: Dict[str, Any] = {
             "enabled": 1,
-            "affected_claim_count": len(affected_ids),
+            "input_explicit_claim_count": len(explicit_claim_ids),
             "seed_claim_count": 0,
-            "entity_group_count": 0,
+            "processed_seed_claim_count": 0,
+            "successful_seed_claim_count": 0,
             "input_claim_count": 0,
             "candidate_count": 0,
             "updated": 0,
             "created": 0,
-            "invalidated": 0,
             "suppressed": 0,
+            "new_claim_ids": [],
+            "claim_relations": [],
+            "failed_seed_claim_ids": [],
+            "failures": [],
             "completed": True,
         }
-        if not affected_ids:
+        if not explicit_claim_ids:
             return report
-
-        # A premise may have been superseded during explicit reconciliation.
-        # Invalidate its old proof before optionally creating a new proof from
-        # the replacement explicit claim in this same pass.
-        report["invalidated"] = self._invalidate_derived_claims_for_inactive_premises(
-            affected_ids
-        )
+        changed_claims = self._db.get_user_claims_by_ids(explicit_claim_ids)
+        world_owner_entity_id = self._intent_world_owner_entity_id()
         seed_claims = [
             claim
-            for claim in self._db.get_entity_claims_by_ids(affected_ids)
+            for claim in changed_claims
             if claim.get("claim_origin") == "explicit"
             and claim.get("status") == "active"
+            and int(claim.get("subject_entity_id") or 0) == world_owner_entity_id
         ]
         report["seed_claim_count"] = len(seed_claims)
         if not seed_claims:
             return report
 
-        changed_by_entity: Dict[int, List[Dict[str, Any]]] = {}
-        for claim in seed_claims:
-            endpoint_entity_ids = {
-                int(entity_id)
-                for entity_id in (
-                    claim.get("subject_entity_id"),
-                    claim.get("object_entity_id"),
-                )
-                if str(entity_id or "").strip().isdigit() and int(entity_id) > 0
-            }
-            for entity_id in endpoint_entity_ids:
-                changed_by_entity.setdefault(entity_id, []).append(claim)
-        report["entity_group_count"] = len(changed_by_entity)
-        for entity_id, changed_claims in changed_by_entity.items():
+        new_derived_claim_ids: set[int] = set()
+        claim_relations: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+        for seed_claim in seed_claims:
             related_claims = self._retrieve_related_derived_explicit_claims(
-                entity_id=entity_id,
-                changed_claims=changed_claims,
+                seed_claim=seed_claim,
+                batch_seed_claims=seed_claims,
+                world_owner_entity_id=world_owner_entity_id,
             )
-            report["input_claim_count"] += len(changed_claims) + len(related_claims)
-            outcome = self._extract_derived_entity_claims(
-                changed_claims=changed_claims,
-                related_claims=related_claims,
-            )
-            if outcome is None:
+            report["processed_seed_claim_count"] += 1
+            report["input_claim_count"] += 1 + len(related_claims)
+            failure: Dict[str, Any] = {}
+            claim_report: Dict[str, Any] = {}
+            try:
+                outcome = self._extract_derived_user_claims(
+                    changed_claims=[seed_claim],
+                    related_claims=related_claims,
+                )
+                if outcome is None:
+                    failure = {"reason": "invalid_llm_derived_claim_response"}
+                elif outcome:
+                    with self._db.transaction():
+                        claim_report = self._apply_derived_user_claim_candidates(
+                            raw_candidates=outcome,
+                            changed_claims=[seed_claim],
+                            related_claims=related_claims,
+                        )
+            except sqlite3.Error:
+                # Storage/infrastructure failures are not invalid LLM outputs.
+                raise
+            except Exception as exc:
+                failure = {
+                    "reason": "derived_claim_processing_error",
+                    "error_type": type(exc).__name__,
+                }
+                self._logger.exception(
+                    "Derived user claim processing failed seed_claim_id=%s", seed_claim["id"],
+                )
+            if failure:
                 report["completed"] = False
-                report["error"] = "invalid_llm_derived_claim_response"
-                report["failed_entity_id"] = entity_id
-                return report
+                report["failed_seed_claim_ids"].append(int(seed_claim["id"]))
+                failure["seed_claim_id"] = int(seed_claim["id"])
+                report["failures"].append(failure)
+                self._log_info("memory_user_claim", "derived_seed_failed", failure)
+                continue
+            report["successful_seed_claim_count"] += 1
             report["candidate_count"] += len(outcome)
             if not outcome:
                 continue
-            group_report = self._apply_derived_entity_claim_candidates(
-                raw_candidates=outcome,
-                changed_claims=changed_claims,
-                related_claims=related_claims,
-            )
             for key in ("updated", "created", "suppressed"):
-                report[key] += int(group_report[key])
+                report[key] += int(claim_report[key])
+            new_derived_claim_ids.update(
+                int(value)
+                for value in claim_report.get("new_claim_ids") or []
+                if int(value) > 0
+            )
+            for relation in claim_report.get("claim_relations") or []:
+                key = (
+                    int(relation["new_claim_id"]),
+                    int(relation["existing_claim_id"]),
+                    str(relation["semantic_relation"]),
+                )
+                claim_relations[key] = relation
+        report["new_claim_ids"] = sorted(new_derived_claim_ids)
+        report["claim_relations"] = [
+            claim_relations[key] for key in sorted(claim_relations)
+        ]
         return report
-
-    def _invalidate_derived_claims_for_inactive_premises(
-        self,
-        premise_claim_ids: Sequence[int],
-    ) -> int:
-        """Propagate an explicit-premise lifecycle change to derived claims."""
-        affected_derived_ids = self._db.invalidate_entity_claim_derivations_for_premises(
-            premise_claim_ids
-        )
-        invalidated_claim_ids = self._db.get_entity_claim_ids_without_active_derivations(
-            affected_derived_ids
-        )
-        changed_ids: List[int] = []
-        for claim in self._db.get_entity_claims_by_ids(invalidated_claim_ids):
-            if self._db.transition_entity_claim_status(
-                target_claim_id=int(claim["id"]),
-                new_status="invalidated",
-                semantic_relation="premise_invalidated",
-                decision_source="derived_claim_premise_lifecycle_v1",
-                policy_reason="all_derivation_premises_inactive",
-            ):
-                changed_ids.append(int(claim["id"]))
-        if changed_ids:
-            self._sync_entity_claim_recall_documents(changed_ids)
-        return len(changed_ids)
 
     def _retrieve_related_derived_explicit_claims(
         self,
         *,
-        entity_id: int,
-        changed_claims: Sequence[Dict[str, Any]],
+        seed_claim: Dict[str, Any],
+        batch_seed_claims: Sequence[Dict[str, Any]],
+        world_owner_entity_id: int,
     ) -> List[Dict[str, Any]]:
-        """Load historical active explicit claims touching the anchor entity."""
-        changed_claim_ids = {
-            int(claim["id"])
-            for claim in changed_claims
-            if str(claim.get("id") or "").strip().isdigit()
-        }
+        """Find premises for one new claim without grouping by its subject."""
+        seed_claim_id = int(seed_claim["id"])
+        object_entity_id = int(seed_claim.get("object_entity_id") or 0)
+        primary_domain = str(seed_claim.get("primary_domain") or "")
+        predicate = str(seed_claim.get("predicate") or "")
         claims_by_id: Dict[int, Dict[str, Any]] = {}
-        for claim in self._db.get_entity_claims(
-            entity_id=entity_id,
-            claim_origin="explicit",
-            statuses=["active"],
-            limit=32,
-        ):
-            claim_id = int(claim["id"])
-            if claim_id not in changed_claim_ids:
-                claims_by_id[claim_id] = claim
-        return sorted(
-            claims_by_id.values(),
-            key=lambda claim: -int(claim.get("id") or 0),
-        )[:32]
+        batch_claim_ids = {int(claim["id"]) for claim in batch_seed_claims}
 
-    def _apply_derived_entity_claim_candidates(
+        def add_claims(claims: Sequence[Dict[str, Any]]) -> None:
+            for claim in claims:
+                claim_id = int(claim["id"])
+                if (
+                    claim_id != seed_claim_id
+                    and claim.get("claim_origin") == "explicit"
+                    and claim.get("status") == "active"
+                    and int(claim.get("subject_entity_id") or 0)
+                    == world_owner_entity_id
+                ):
+                    claims_by_id[claim_id] = claim
+
+        # Other claims created in the same batch may be necessary premises
+        # even when they refer to different objects.
+        add_claims(batch_seed_claims)
+        search_filters: List[Dict[str, Any]] = []
+        if object_entity_id and object_entity_id != world_owner_entity_id:
+            search_filters.append({"entity_id": object_entity_id})
+        if primary_domain and primary_domain != "general":
+            search_filters.append({"primary_domain": primary_domain})
+        if predicate:
+            search_filters.append({"predicate": predicate})
+        # Keep a small recent owner-wide pool for cross-object and
+        # cross-predicate deductions that the narrower filters cannot find.
+        search_filters.append({})
+        for filters in search_filters:
+            add_claims(self._db.get_user_claims(
+                subject_entity_id=world_owner_entity_id,
+                claim_origin="explicit",
+                statuses=["active"],
+                limit=64,
+                **filters,
+            ))
+
+        def relevance(claim: Dict[str, Any]) -> Tuple[bool, bool, bool, bool, bool, str, int]:
+            claim_object_id = int(claim.get("object_entity_id") or 0)
+            return (
+                bool(object_entity_id and claim_object_id == object_entity_id),
+                bool(predicate and claim.get("predicate") == predicate),
+                bool(primary_domain and claim.get("primary_domain") == primary_domain),
+                claim.get("claim_type") == seed_claim.get("claim_type"),
+                int(claim["id"]) in batch_claim_ids,
+                str(claim.get("updated_at") or ""),
+                int(claim["id"]),
+            )
+
+        batch_related = sorted(
+            (claim for claim in claims_by_id.values() if int(claim["id"]) in batch_claim_ids),
+            key=relevance,
+            reverse=True,
+        )[:8]
+        historical_related = sorted(
+            (claim for claim in claims_by_id.values() if int(claim["id"]) not in batch_claim_ids),
+            key=relevance,
+            reverse=True,
+        )[:32 - len(batch_related)]
+        return [*batch_related, *historical_related]
+
+    def _apply_derived_user_claim_candidates(
         self,
         *,
         raw_candidates: Sequence[Dict[str, Any]],
         changed_claims: Sequence[Dict[str, Any]],
         related_claims: Sequence[Dict[str, Any]],
-    ) -> Dict[str, int]:
+    ) -> Dict[str, Any]:
         """Validate, reconcile, and record one subject's LLM conclusions."""
-        report = {"updated": 0, "created": 0, "suppressed": 0}
+        report: Dict[str, Any] = {
+            "updated": 0, "created": 0, "suppressed": 0,
+            "new_claim_ids": [], "claim_relations": [],
+        }
         input_claims = [*changed_claims, *related_claims]
         input_by_id = {int(claim["id"]): claim for claim in input_claims}
         changed_claim_ids = {int(claim["id"]) for claim in changed_claims}
@@ -4797,7 +4942,7 @@ class MemoryNodeManager:
         candidates = [
             candidate
             for raw_claim in raw_candidates
-            if (candidate := self._normalize_derived_entity_claim(
+            if (candidate := self._normalize_derived_user_claim(
                 raw_claim,
                 input_claims_by_id=input_by_id,
                 new_claim_ids=changed_claim_ids,
@@ -4817,11 +4962,11 @@ class MemoryNodeManager:
             for fact in self._db.get_memory_facts_by_ids(evidence_fact_ids)
             if str(fact.get("id") or "").strip().isdigit()
         }
-        applied = self._reconcile_entity_claims(candidates, facts_by_id=facts_by_id)
+        applied = self._reconcile_user_claims(candidates, facts_by_id=facts_by_id)
         persisted_claims = {
             int(claim["id"]): claim
             for item in applied
-            for claim in self._db.get_entity_claims_by_ids([item["claim_id"]])
+            for claim in self._db.get_user_claims_by_ids([item["claim_id"]])
             if str(claim.get("id") or "").strip().isdigit()
         }
         persisted_derived_ids: List[int] = []
@@ -4833,7 +4978,7 @@ class MemoryNodeManager:
                 continue
             candidate = item["claim"]
             premise_ids = list(candidate["premise_claim_ids"])
-            derivation_id = self._db.upsert_entity_claim_derivation(
+            derivation_id = self._db.upsert_user_claim_derivation(
                 claim_id=claim_id,
                 rule_id="llm_direct_entailment",
                 rule_version="v1",
@@ -4844,20 +4989,34 @@ class MemoryNodeManager:
                 metadata={
                     "prompt_version": "v1",
                     "premise_claim_ids": premise_ids,
-                    "generator": "derived_entity_claim_extraction",
+                    "generator": "derived_user_claim_extraction",
                 },
             )
-            self._db.replace_entity_claim_derivation_premises(
+            self._db.replace_user_claim_derivation_premises(
                 derivation_id=derivation_id,
                 premise_claim_ids=premise_ids,
             )
             persisted_derived_ids.append(claim_id)
+            report["new_claim_ids"].append(claim_id)
+            for decision in item.get("relations") or []:
+                existing_claim_id = int(decision.get("existing_claim_id") or 0)
+                if existing_claim_id <= 0 or existing_claim_id == claim_id:
+                    continue
+                report["claim_relations"].append({
+                    "relation_event_id": int(decision["relation_event_id"]),
+                    "new_claim_id": claim_id,
+                    "existing_claim_id": existing_claim_id,
+                    "semantic_relation": str(decision.get("semantic_relation") or ""),
+                    "confidence": float(decision.get("confidence") or 0.0),
+                    "reason": str(decision.get("reason") or ""),
+                })
             report["created"] += int(item.get("created") or 0)
             report["updated"] += 1
         if persisted_derived_ids:
-            self._sync_entity_claim_recall_documents(
+            self._sync_user_claim_recall_documents(
                 sorted(set(persisted_derived_ids))
             )
+        report["new_claim_ids"] = sorted(set(report["new_claim_ids"]))
         return report
 
     def _derived_claim_prompt_view(
@@ -4876,13 +5035,14 @@ class MemoryNodeManager:
             "object_entity_id": object_id,
             "object_entity": entity_names.get(object_id, ""),
             "claim_type": claim.get("claim_type") or "",
+            "primary_domain": claim.get("primary_domain") or "",
             "claim_text": claim.get("claim_text") or "",
             "valid_from": claim.get("valid_from") or "",
             "valid_to": claim.get("valid_to") or "",
             "confidence": float(claim.get("confidence") or 0.0),
         }
 
-    def _extract_derived_entity_claims(
+    def _extract_derived_user_claims(
         self,
         *,
         changed_claims: Sequence[Dict[str, Any]],
@@ -4902,10 +5062,10 @@ class MemoryNodeManager:
             "\n".join(str(claim.get("claim_text") or "") for claim in input_claims)
         )
         prompt_template = (
-            DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
-            if language == "en" else DERIVED_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+            DERIVED_USER_CLAIM_EXTRACTION_PROMPT_EN
+            if language == "en" else DERIVED_USER_CLAIM_EXTRACTION_PROMPT_ZH
         )
-        raw = self._call_llm(prompt_template.replace(
+        raw = self._llm_client.call_llm(prompt_template.replace(
             "{changed_claims}",
             json.dumps([
                 self._derived_claim_prompt_view(
@@ -4924,12 +5084,12 @@ class MemoryNodeManager:
                 for claim in related_claims
             ], ensure_ascii=False, indent=2),
         ))
-        parsed = self._parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
         if parsed is None or not isinstance(parsed.get("claims"), list):
             return None
         return [item for item in parsed["claims"][:16] if isinstance(item, dict)]
 
-    def _normalize_derived_entity_claim(
+    def _normalize_derived_user_claim(
         self,
         raw: Dict[str, Any],
         *,
@@ -4947,8 +5107,15 @@ class MemoryNodeManager:
             object_entity_id and object_entity_id not in entity_ids
         ):
             return None
+        if _compact_whitespace(
+            entity_names.get(subject_entity_id) or ""
+        ).lower() != self._world_owner_entity_name.lower():
+            return None
         claim_type = str(raw.get("claim_type") or "").strip().lower()
         if claim_type not in {"affiliation", "relationship", "constraint"}:
+            return None
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        if not primary_domain:
             return None
         predicate = re.sub(
             r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower(),
@@ -4988,7 +5155,7 @@ class MemoryNodeManager:
             self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7),
             premise_confidence,
         )
-        if confidence < self._entity_claim_derived_min_confidence:
+        if confidence < self._user_claim_derived_min_confidence:
             return None
         valid_from, valid_to = self._derived_claim_validity_bounds(premises)
         if valid_from and valid_to and valid_from > valid_to:
@@ -4996,13 +5163,13 @@ class MemoryNodeManager:
         support_fact_ids = sorted({
             fact_id
             for premise_id in premise_ids
-            for fact_id in self._db.get_entity_claim_evidence_fact_ids([premise_id]).get(
+            for fact_id in self._db.get_user_claim_evidence_fact_ids([premise_id]).get(
                 premise_id, []
             )
         })
         if not support_fact_ids:
             return None
-        claim_text = self._normalize_entity_claim_text(
+        claim_text = self._normalize_user_claim_text(
             raw.get("claim_text") or "",
             subject=entity_names.get(subject_entity_id, ""),
             predicate=predicate,
@@ -5017,11 +5184,12 @@ class MemoryNodeManager:
             "claim_text": claim_text,
             "claim_type": claim_type,
             "claim_origin": "derived",
+            "primary_domain": primary_domain,
             "status": "active",
             "confidence": confidence,
             "valid_from": valid_from,
             "valid_to": valid_to,
-            "extractor_version": "entity_claim_derived_v1",
+            "extractor_version": "user_claim_derived_v1",
             "prompt_version": "v1",
             "metadata": {
                 "derivation_type": "llm_direct_entailment",
@@ -5048,129 +5216,386 @@ class MemoryNodeManager:
         })
         return (starts[-1] if starts else "", ends[0] if ends else "")
 
-    def _update_inductive_entity_claims_from_facts(
-        self,
-        seed_facts: Sequence[Dict[str, Any]],
+    def _update_user_observed_patterns_from_action_signals(
+        self, signal_ids: Sequence[int],
     ) -> Dict[str, Any]:
-        """Use new facts to trigger bounded, exact-group evidence expansion."""
+        """Update nearby patterns first, then discover patterns from action history."""
+        seed_signals = self._db.get_user_action_signals_by_ids(signal_ids)
         report: Dict[str, Any] = {
-            "enabled": 1, "seed_fact_count": len(seed_facts), "candidate_count": 0,
-            "updated": 0, "created": 0, "completed": True,
+            "candidate_count": 0, "updated": 0, "created": 0,
+            "new_pattern_ids": [], "completed": True,
+            "similar_action_batches": 0, "relations_recorded": 0,
+            "direct_support_signal_count": 0,
         }
-        if not seed_facts:
+        if not seed_signals:
             return report
-        groups: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
-        for fact in seed_facts:
-            fact_id = int(fact.get("id") or 0)
-            if fact_id <= 0:
-                continue
-            for signal_mapping in self._entity_claim_signals_from_fact(fact):
-                key = (
-                    int(signal_mapping["subject_entity_id"]),
-                    str(signal_mapping["claim_type_hint"]),
-                    str(signal_mapping["claim_anchor_key"]),
+        subject_id = int(seed_signals[0]["subject_entity_id"])
+        history = self._db.get_user_action_signals()
+        pool = {int(row["signal_id"]): row for row in history}
+        pool.update({int(row["signal_id"]): row for row in seed_signals})
+        vectors = self._user_action_vectors_for_signals(list(pool.values()))
+        existing_patterns = self._db.get_user_observed_patterns(
+            subject_entity_id=subject_id, limit=None,
+        )
+        facts_by_id = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids(
+                [int(signal["fact_id"]) for signal in seed_signals]
+            )
+        }
+        # A pattern is retrieved directly from its own text and supporting
+        # actions. Discovery's historical-signal cap must not hide it.
+        related_by_seed: Dict[Tuple[int, ...], List[Dict[str, Any]]] = {}
+        patterns_by_id = {int(pattern["id"]): pattern for pattern in existing_patterns}
+        for signal in seed_signals:
+            related = self._retrieve_similar_user_observed_patterns(
+                signal=signal, patterns=existing_patterns, signals_by_id=pool,
+                vectors=vectors,
+            )
+            if related:
+                key = tuple(int(pattern["id"]) for pattern in related)
+                related_by_seed.setdefault(key, []).append(signal)
+        supported_signal_ids: set[int] = set()
+        for pattern_ids, related_signals in related_by_seed.items():
+            for offset in range(0, len(related_signals), 8):
+                direct_update = self._update_observed_patterns_from_new_action_signals(
+                    new_signals=related_signals[offset:offset + 8],
+                    existing_patterns=[patterns_by_id[value] for value in pattern_ids],
+                    facts_by_id=facts_by_id,
                 )
-                group = groups.setdefault(key, {
-                    "subject": signal_mapping["subject"],
-                    "subject_entity_id": int(signal_mapping["subject_entity_id"]),
-                    "claim_type_hint": signal_mapping["claim_type_hint"],
-                    "claim_anchor": signal_mapping["claim_anchor"],
-                    "claim_anchor_key": signal_mapping["claim_anchor_key"],
-                    "seed_facts_by_id": {},
-                })
-                group["seed_facts_by_id"][fact_id] = fact
-        report["candidate_count"] = len(groups)
-        for group in list(groups.values())[:12]:
-            historical_facts = self._db.memory_facts_for_entity_claim_signal_group(
-                subject_entity_id=int(group["subject_entity_id"]),
-                claim_type_hint=str(group["claim_type_hint"]),
-                claim_anchor_key=str(group["claim_anchor_key"]),
-                limit=max(64, self._entity_claim_induction_evidence_limit * 4),
-            )
-            evidence_facts = self._select_inductive_entity_claim_evidence_facts(
-                group=group,
-                historical_facts=historical_facts,
-            )
-            distinct_episodes = {
-                int(fact["episode_id"]) for fact in evidence_facts
-                if str(fact.get("episode_id") or "").strip().isdigit()
+                if direct_update is None:
+                    report.update(completed=False, error="invalid_action_pattern_relation_response")
+                    return report
+                supported_signal_ids.update(direct_update["supported_signal_ids"])
+                report["updated"] += len(direct_update["updated_pattern_ids"])
+                report["relations_recorded"] += direct_update["relations_recorded"]
+        report["direct_support_signal_count"] = len(supported_signal_ids)
+
+        unresolved = [
+            signal for signal in seed_signals
+            if int(signal["signal_id"]) not in supported_signal_ids
+        ]
+        seed_ids = {int(signal["signal_id"]) for signal in seed_signals}
+        neighborhoods = self._retrieve_similar_user_action_signal_batches(
+            seeds=unresolved,
+            history=[row for signal_id, row in pool.items() if signal_id not in seed_ids],
+            vectors=vectors,
+        )
+        report["similar_action_batches"] = len(neighborhoods)
+        for ordered, new_signal_ids in neighborhoods:
+            facts_by_id = {
+                int(fact["id"]): fact
+                for fact in self._db.get_memory_facts_by_ids(
+                    [int(signal["fact_id"]) for signal in ordered]
+                )
             }
-            time_windows = {
-                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")[:10]
-                for fact in evidence_facts
-                if str(fact.get("event_time_key") or fact.get("dialogue_time_key") or "")
-            }
-            if (
-                len(evidence_facts) < self._entity_claim_induction_min_support_facts
-                or len(distinct_episodes) < self._entity_claim_induction_min_episodes
-                or len(time_windows) < self._entity_claim_induction_min_time_windows
-            ):
+            if len(ordered) < self._user_observed_pattern_min_support_signals:
                 continue
-            outcome = self._extract_inductive_entity_claims(
-                group=group, facts=evidence_facts,
+            report["candidate_count"] += 1
+            patterns = self._extract_user_observed_patterns(
+                subject_entity_id=subject_id,
+                new_signal_ids=new_signal_ids,
+                signals=ordered,
+                facts_by_id=facts_by_id,
             )
-            if outcome is None:
-                report["completed"] = False
-                report["error"] = "invalid_llm_induction_response"
+            if patterns is None:
+                report.update(completed=False, error="invalid_observed_pattern_response")
                 return report
-            by_id = {int(fact["id"]): fact for fact in evidence_facts}
-            applied = self._reconcile_entity_claims(outcome, facts_by_id=by_id)
-            for item in applied:
-                claim = item["claim"]
-                if item["effective_origin"] != "inductive":
-                    continue
-                support_ids = self._entity_claim_support_ids(claim)
-                if not support_ids:
-                    continue
-                claim_id = int(item["claim_id"])
-                support_summary = self._db.get_entity_claim_support_fact_summary(
-                    claim_id
+            for pattern in patterns:
+                applied = self._reconcile_user_observed_pattern(
+                    pattern, subject_entity_id=subject_id,
                 )
-                if int(support_summary["support_count"]) <= 0:
-                    continue
-                self._db.upsert_entity_claim_induction(
-                    claim_id=claim_id,
-                    condition_text=str(claim.get("metadata", {}).get("condition_text") or ""),
-                    support_count=int(support_summary["support_count"]),
-                    first_observed_at=str(support_summary["first_observed_at"]),
-                    last_observed_at=str(support_summary["last_observed_at"]),
-                )
-            report["updated"] += len(applied)
-            report["created"] += sum(int(item["created"]) for item in applied)
+                if applied is None:
+                    report.update(completed=False, error="invalid_pattern_reconciliation")
+                    return report
+                report["created"] += int(applied["created"])
+                report["updated"] += int(not applied["created"])
+                report["relations_recorded"] += int(applied["relations_recorded"])
+                if applied["created"]:
+                    report["new_pattern_ids"].append(int(applied["pattern_id"]))
+        report["new_pattern_ids"] = sorted(set(report["new_pattern_ids"]))
         return report
 
-    def _fact_entity_claim_signal_mapping_updates(
+    def _update_observed_patterns_from_new_action_signals(
+        self, *, new_signals: Sequence[Dict[str, Any]],
+        existing_patterns: Sequence[Dict[str, Any]],
+        facts_by_id: Dict[int, Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Classify new behavior against existing patterns before discovery."""
+        result: Dict[str, Any] = {
+            "supported_signal_ids": set(), "updated_pattern_ids": set(),
+            "relations_recorded": 0,
+        }
+        if not new_signals or not existing_patterns:
+            return result
+        def representative_ids(pattern: Dict[str, Any]) -> List[int]:
+            ids = pattern.get("support_signal_ids") or []
+            return ids if len(ids) <= 4 else [ids[0], *ids[-3:]]
+
+        evidence_ids = [
+            signal_id
+            for pattern in existing_patterns
+            for signal_id in representative_ids(pattern)
+        ]
+        evidence_signals = self._db.get_user_action_signals_by_ids(evidence_ids)
+        evidence_facts = {
+            int(fact["id"]): fact
+            for fact in self._db.get_memory_facts_by_ids([
+                int(signal["fact_id"]) for signal in evidence_signals
+            ])
+        }
+        evidence_by_id = {
+            int(signal["signal_id"]): signal for signal in evidence_signals
+        }
+
+        def signal_view(signal: Dict[str, Any], fact: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "signal_id": int(signal["signal_id"]),
+                "action_text": signal.get("action_text") or "",
+                "action_kind": signal.get("action_kind") or "",
+                "event_time": signal.get("event_time_key") or "",
+                "location": signal.get("location") or "",
+                "fact_id": int(signal["fact_id"]),
+                "fact_summary": fact.get("summary") or "",
+                "dialogue_time": fact.get("dialogue_time_key") or "",
+            }
+
+        new_by_id = {int(signal["signal_id"]): signal for signal in new_signals}
+        pattern_by_id = {int(pattern["id"]): pattern for pattern in existing_patterns}
+        language = self._resolve_prompt_language_from_text(
+            "\n".join(str(signal.get("action_text") or "") for signal in new_signals)
+        )
+        template = (
+            USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_EN
+            if language == "en" else USER_OBSERVED_PATTERN_SIGNAL_RELATION_PROMPT_ZH
+        )
+        raw = self._llm_client.call_llm(
+            template.replace("{new_signals}", json.dumps([
+                signal_view(signal, facts_by_id.get(int(signal["fact_id"])) or {})
+                for signal in new_signals
+            ], ensure_ascii=False, indent=2)).replace("{existing_patterns}", json.dumps([
+                {
+                    "id": int(pattern["id"]),
+                    "pattern_text": pattern.get("pattern_text") or "",
+                    "condition_text": pattern.get("condition_text") or "",
+                    "confidence": pattern.get("confidence"),
+                    "supporting_actions": [
+                        signal_view(evidence_by_id[signal_id], evidence_facts.get(
+                            int(evidence_by_id[signal_id]["fact_id"])
+                        ) or {})
+                        for signal_id in representative_ids(pattern)
+                        if signal_id in evidence_by_id
+                    ],
+                }
+                for pattern in existing_patterns
+            ], ensure_ascii=False, indent=2))
+        )
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        if not parsed or not isinstance(parsed.get("decisions"), list):
+            return None
+        decisions: Dict[Tuple[int, int], Dict[str, Any]] = {}
+        for item in parsed["decisions"]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                signal_id = int(item.get("signal_id"))
+                pattern_id = int(item.get("existing_pattern_id"))
+            except (TypeError, ValueError):
+                continue
+            relation = str(item.get("semantic_relation") or "").strip().lower()
+            if (
+                signal_id not in new_by_id or pattern_id not in pattern_by_id
+                or relation not in {"supports", "refines", "contradicts", "unrelated"}
+            ):
+                continue
+            confidence = self._clamp_float(item.get("confidence"), 0.0, 1.0, 0.0)
+            if confidence < 0.7 or relation == "unrelated":
+                continue
+            key = (signal_id, pattern_id)
+            if key not in decisions or confidence > decisions[key]["confidence"]:
+                decisions[key] = {
+                    "semantic_relation": relation,
+                    "confidence": confidence,
+                    "reason": _compact_whitespace(item.get("reason") or "")[:240],
+                }
+        with self._db.transaction():
+            for (signal_id, pattern_id), decision in decisions.items():
+                signal = new_by_id[signal_id]
+                snapshot = signal_view(
+                    signal, facts_by_id.get(int(signal["fact_id"])) or {},
+                )
+                if decision["semantic_relation"] == "supports":
+                    added = self._db.add_user_observed_pattern_signals(
+                        pattern_id=pattern_id, signal_ids=[signal_id],
+                    )
+                    if added:
+                        self._db.refresh_user_observed_pattern(
+                            pattern_id=pattern_id,
+                            confidence=float(pattern_by_id[pattern_id]["confidence"]),
+                        )
+                        result["updated_pattern_ids"].add(pattern_id)
+                    result["supported_signal_ids"].add(signal_id)
+                    if not added:
+                        continue
+                result["relations_recorded"] += int(
+                    self._db.record_user_observed_pattern_relation(
+                        target_pattern_id=pattern_id, trigger_pattern_id=None,
+                        semantic_relation=decision["semantic_relation"],
+                        support_signal_ids=[signal_id],
+                        candidate_snapshot=snapshot,
+                        semantic_confidence=decision["confidence"],
+                        semantic_reason=decision["reason"],
+                    )
+                )
+        return result
+
+    def _user_action_vectors_for_signals(
+        self, signals: Sequence[Dict[str, Any]],
+    ) -> Dict[int, np.ndarray]:
+        """Read cached action vectors and embed only missing action texts."""
+        self._ensure_embedding_client()
+        assert self._embedding_client is not None
+        dimension = self._embedding_client.dimension
+        vectors: Dict[int, np.ndarray] = {}
+        missing: List[Dict[str, Any]] = []
+        for signal in signals:
+            signal_id = int(signal["signal_id"])
+            blob = signal.get("action_text_embedding")
+            vector = np.frombuffer(blob, dtype=np.float32) if blob else None
+            if vector is not None and vector.size == dimension and np.all(np.isfinite(vector)):
+                vectors[signal_id] = vector
+            else:
+                missing.append(signal)
+        if missing:
+            embedded = self._embedding_client.embed_batch(
+                str(signal.get("action_text") or "") for signal in missing
+            )
+            updates: List[Tuple[int, np.ndarray]] = []
+            for signal, vector in zip(missing, embedded):
+                if vector is None:
+                    continue
+                array = np.asarray(vector, dtype=np.float32)
+                if array.size != dimension or not np.all(np.isfinite(array)):
+                    continue
+                signal_id = int(signal["signal_id"])
+                vectors[signal_id] = array
+                updates.append((signal_id, array))
+            if updates:
+                self._db.set_user_action_signal_embeddings(updates)
+        return vectors
+
+    @staticmethod
+    def _user_action_signal_similarity(
+        left: Dict[str, Any], right: Dict[str, Any],
+        vectors: Dict[int, np.ndarray],
+    ) -> float:
+        lexical = action_lexical_similarity(
+            left.get("action_text"), right.get("action_text"),
+        )
+        left_vector = vectors.get(int(left["signal_id"]))
+        right_vector = vectors.get(int(right["signal_id"]))
+        semantic = (
+            max(0.0, _cal_embedding_cosine_similarity(left_vector, right_vector))
+            if left_vector is not None and right_vector is not None else 0.0
+        )
+        return max(lexical, semantic * 0.82)
+
+    def _retrieve_similar_user_observed_patterns(
+        self, *, signal: Dict[str, Any],
+        patterns: Sequence[Dict[str, Any]],
+        signals_by_id: Dict[int, Dict[str, Any]],
+        vectors: Dict[int, np.ndarray],
+    ) -> List[Dict[str, Any]]:
+        """Retrieve existing patterns independently of discovery neighborhoods."""
+        ranked: List[Tuple[float, Dict[str, Any]]] = []
+        for pattern in patterns:
+            score = action_lexical_similarity(
+                signal.get("action_text"), pattern.get("pattern_text"),
+            )
+            for support_id in pattern.get("support_signal_ids") or []:
+                support = signals_by_id.get(int(support_id))
+                if support is not None:
+                    score = max(score, self._user_action_signal_similarity(
+                        signal, support, vectors,
+                    ))
+            if score >= 0.60:
+                ranked.append((score, pattern))
+        ranked.sort(key=lambda item: (-item[0], int(item[1]["id"])))
+        return [pattern for _, pattern in ranked[:8]]
+
+    def _retrieve_similar_user_action_signal_batches(
+        self, *, seeds: Sequence[Dict[str, Any]],
+        history: Sequence[Dict[str, Any]], vectors: Dict[int, np.ndarray],
+    ) -> List[Tuple[List[Dict[str, Any]], set[int]]]:
+        """Build novel-pattern batches from similar actions, without pattern quotas."""
+        if not seeds:
+            return []
+        capacity = max(1, self._user_observed_pattern_signal_limit)
+        seed_ids = {int(row["signal_id"]) for row in seeds}
+        historical = [
+            row for row in history if int(row["signal_id"]) not in seed_ids
+        ]
+        batches: List[Tuple[List[Dict[str, Any]], set[int]]] = []
+        remaining = list(seeds)
+        while remaining:
+            anchor = remaining.pop(0)
+            grouped = [anchor]
+            still_unmatched = []
+            for candidate in remaining:
+                if (
+                    len(grouped) < capacity
+                    and self._user_action_signal_similarity(anchor, candidate, vectors) >= 0.60
+                ):
+                    grouped.append(candidate)
+                else:
+                    still_unmatched.append(candidate)
+            remaining = still_unmatched
+            ranked_history = sorted(
+                (
+                    (
+                        max(self._user_action_signal_similarity(seed, row, vectors)
+                            for seed in grouped),
+                        row,
+                    )
+                    for row in historical
+                ),
+                key=lambda item: (-item[0], -int(item[1]["signal_id"])),
+            )
+            neighbors = [
+                row for score, row in ranked_history if score >= 0.60
+            ][:max(0, capacity - len(grouped))]
+            batches.append((
+                [*grouped, *neighbors],
+                {int(row["signal_id"]) for row in grouped},
+            ))
+        return batches
+
+    def _fact_user_claim_signal_mapping_updates(
         self,
         fact_id: int,
         fact: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        """Project one fact's induction-eligible signals into exact group keys."""
+        """Persist every normalized user-claim signal for one fact."""
         updates: List[Dict[str, Any]] = []
-        raw_signals = self._normalize_entity_claim_signal(
-            fact.get("entity_claim_signal"),
+        raw_signals = self._normalize_user_claim_signal(
+            fact.get("user_claim_signals"),
+            allows_world_owner_reference=(
+                isinstance(fact.get("metadata"), dict)
+                and bool(fact["metadata"].get("has_world_owner_speaker")
+                         or fact["metadata"].get("has_world_owner_alias_reference"))
+            ),
+            owner_aliases=fact.get("resolved_world_owner_aliases") or [],
         )
         for signal in raw_signals:
             claim_type_hint = str(signal.get("claim_type_hint") or "").lower()
-            signal_kind = str(signal.get("signal_kind") or "").lower()
-            if claim_type_hint not in {"preference", "behavior_pattern"}:
+            subject_entity = self._subject_entity_for_user_claim_signal(signal, fact)
+            if not subject_entity:
                 continue
-            if signal_kind not in {"explicit_assertion", "pattern_observation"}:
-                continue
-            names = self._entities_for_entity_claim_signal(signal, fact)
-            if not names:
-                continue
-            entity_name = names[0]
-            signal_entity = signal.get("entity")
-            entity_type = (
-                self._normalize_entity_type(signal_entity.get("type"))
-                if isinstance(signal_entity, dict)
-                else "OTHER"
-            )
             entity_mapping = self._db.upsert_entity_nodes([{
-                "name": entity_name,
-                "type": entity_type,
+                "name": subject_entity,
+                "type": "PERSON",
             }])
-            if entity_name not in entity_mapping:
+            if subject_entity not in entity_mapping:
                 continue
             claim_anchor = _compact_whitespace(signal.get("claim_anchor") or "")
             if not claim_anchor:
@@ -5178,39 +5603,102 @@ class MemoryNodeManager:
             claim_anchor_key = self._generate_topic_name_key(claim_anchor)
             if not claim_anchor_key:
                 continue
+            evidence_basis = _compact_whitespace(
+                signal.get("evidence_basis") or ""
+            )
+            signal_fingerprint = hashlib.sha256(
+                "\x1f".join((
+                    claim_type_hint,
+                    claim_anchor_key,
+                    evidence_basis.lower(),
+                )).encode("utf-8")
+            ).hexdigest()[:16]
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
-                    f"{int(entity_mapping[entity_name])}|{claim_type_hint}|"
-                    f"{claim_anchor_key}"
+                    f"{int(entity_mapping[subject_entity])}|{claim_type_hint}|"
+                    f"{claim_anchor_key}|{signal_fingerprint}"
                 ),
-                "subject": entity_name,
-                "subject_entity_id": int(entity_mapping[entity_name]),
+                "subject": subject_entity,
+                "subject_entity_id": int(entity_mapping[subject_entity]),
                 "claim_type_hint": claim_type_hint,
-                "signal_kind": signal_kind,
                 "claim_anchor": claim_anchor,
                 "claim_anchor_key": claim_anchor_key,
+                "evidence_basis": evidence_basis,
                 "confidence": float(signal.get("confidence") or 0.0),
             })
-        return updates or [{
-            "fact_id": int(fact_id),
-            "signal_key": "__fact__",
-        }]
+        return updates
 
-    def _fact_future_commitment_signal_mapping_updates(
+    def _fact_user_action_signal_updates(
+        self,
+        *,
+        fact_id: int,
+        fact: Dict[str, Any],
+        owner_entity_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Prepare persisted action evidence without routing it to claims."""
+        if self._world_owner_entity_name not in (fact.get("entities") or []):
+            return []
+        updates: List[Dict[str, Any]] = []
+        for signal in fact.get("user_action_signals") or []:
+            if not isinstance(signal, dict):
+                continue
+            action_kind = str(signal.get("action_kind") or "")
+            action_text = _compact_whitespace(signal.get("action_text") or "")
+            owner_evidence_type = str(signal.get("owner_evidence_type") or "")
+            if (
+                signal.get("subject_entity") != self._world_owner_entity_name
+                or action_kind not in {"action", "choice", "participation"}
+                or not action_text
+                or owner_evidence_type not in {
+                    "self_statement", "confirmed_response", "third_party_report",
+                }
+            ):
+                continue
+            fingerprint = hashlib.sha256(
+                "\x1f".join((
+                    action_kind,
+                    action_text.lower(),
+                    owner_evidence_type,
+                    str(signal.get("owner_evidence_text") or "").lower(),
+                    str(signal.get("other_evidence_text") or "").lower(),
+                )).encode("utf-8")
+            ).hexdigest()[:16]
+            updates.append({
+                "fact_id": int(fact_id),
+                "signal_key": f"{owner_entity_id}|{action_kind}|{fingerprint}",
+                "subject_entity_id": int(owner_entity_id),
+                "action_kind": action_kind,
+                "action_text": action_text,
+                "event_time_key": str(fact.get("event_time_key") or ""),
+                "time_confidence": str(
+                    (fact.get("metadata") or {}).get("time_confidence") or "unknown"
+                ),
+                "location": str((fact.get("metadata") or {}).get("where") or ""),
+                "owner_evidence_type": owner_evidence_type,
+                "owner_evidence_text": signal.get("owner_evidence_text") or "",
+                "other_evidence_text": signal.get("other_evidence_text") or "",
+                "evidence_basis": signal.get("evidence_basis") or "",
+                "confidence": float(signal.get("confidence") or 0.0),
+            })
+        return updates
+
+    def _fact_user_intent_signal_mapping_updates(
         self,
         fact_id: int,
         fact: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         """Project one fact's normalized prospective signals into DB rows."""
         updates: List[Dict[str, Any]] = []
-        raw_signals = self._normalize_future_commitment_signals(
-            fact.get("future_commitment_signals"),
+        raw_signals = self._normalize_user_intent_signals(
+            fact.get("user_intent_signals"),
             fallback_entity=fact.get("primary_entity"),
             allows_world_owner_reference=(
                 isinstance(fact.get("metadata"), dict)
-                and bool(fact["metadata"].get("has_world_owner_interaction"))
+                and bool(fact["metadata"].get("has_world_owner_speaker")
+                         or fact["metadata"].get("has_world_owner_alias_reference"))
             ),
+            owner_aliases=fact.get("resolved_world_owner_aliases") or [],
         )
         fact_entities_by_name = {
             str(descriptor["name"]).lower(): descriptor
@@ -5226,189 +5714,320 @@ class MemoryNodeManager:
             entity_mapping = self._db.upsert_entity_nodes([entity_descriptor])
             if subject_name not in entity_mapping:
                 continue
-            future_commitment_anchor = _compact_whitespace(
-                signal.get("future_commitment_anchor") or ""
+            user_intent_anchor = _compact_whitespace(
+                signal.get("user_intent_anchor") or ""
             )
-            future_commitment_anchor_key = self._generate_topic_name_key(future_commitment_anchor)
-            if not future_commitment_anchor or future_commitment_anchor_key == "general":
+            user_intent_anchor_key = self._generate_topic_name_key(user_intent_anchor)
+            if not user_intent_anchor or user_intent_anchor_key == "general":
                 continue
             updates.append({
                 "fact_id": int(fact_id),
                 "signal_key": (
-                    f"{int(entity_mapping[subject_name])}|{signal['evidence_kind']}|"
-                    f"{future_commitment_anchor_key}"
+                    f"{int(entity_mapping[subject_name])}|{signal['signal_purpose']}|"
+                    f"{user_intent_anchor_key}|"
+                    f"{','.join(sorted(signal['candidate_object_types']))}"
                 ),
                 "subject_entity_id": int(entity_mapping[subject_name]),
-                "evidence_kind": signal["evidence_kind"],
+                "signal_purpose": signal["signal_purpose"],
                 "candidate_object_types": signal["candidate_object_types"],
                 "user_role": signal["user_role"],
-                "future_commitment_anchor": future_commitment_anchor,
-                "future_commitment_anchor_key": future_commitment_anchor_key,
+                "user_intent_anchor": user_intent_anchor,
+                "user_intent_anchor_key": user_intent_anchor_key,
                 "assertion_source": signal["assertion_source"],
-                "explicitness": signal["explicitness"],
                 "evidence_basis": signal["evidence_basis"],
                 "confidence": signal["confidence"],
             })
-        return updates or [{
-            "fact_id": int(fact_id),
-            "signal_key": "__fact__",
-        }]
+        return updates
 
-    def _select_inductive_entity_claim_evidence_facts(
+    def _extract_user_observed_patterns(
         self,
         *,
-        group: Dict[str, Any],
-        historical_facts: Sequence[Dict[str, Any]],
-    ) -> List[Dict[str, Any]]:
-        """Keep new group facts, then add bounded episode-diverse history."""
-        seed_by_id = dict(group.get("seed_facts_by_id") or {})
-        candidates_by_id = {
-            int(fact["id"]): fact
-            for fact in [*seed_by_id.values(), *historical_facts]
-            if str(fact.get("id") or "").strip().isdigit()
-        }
-        seed_ids = set(seed_by_id)
-
-        ordered = sorted(
-            candidates_by_id.values(),
-            key=lambda fact: (
-                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or ""),
-                int(fact.get("id") or 0),
-            ),
-            reverse=True,
-        )
-        ordered.sort(
-            key=lambda fact: int(fact.get("id") or 0) not in seed_ids
-        )
-        selected: List[Dict[str, Any]] = []
-        selected_ids: set[int] = set()
-        selected_episodes: set[int] = set()
-        for fact in ordered:
-            fact_id = int(fact["id"])
-            episode_id = int(fact.get("episode_id") or 0)
-            if episode_id > 0 and episode_id in selected_episodes:
-                continue
-            selected.append(fact)
-            selected_ids.add(fact_id)
-            if episode_id > 0:
-                selected_episodes.add(episode_id)
-            if len(selected) >= self._entity_claim_induction_evidence_limit:
-                break
-        if len(selected) < self._entity_claim_induction_evidence_limit:
-            for fact in ordered:
-                fact_id = int(fact["id"])
-                if fact_id in selected_ids:
-                    continue
-                selected.append(fact)
-                selected_ids.add(fact_id)
-                if len(selected) >= self._entity_claim_induction_evidence_limit:
-                    break
-        return sorted(
-            selected,
-            key=lambda fact: (
-                str(fact.get("event_time_key") or fact.get("dialogue_time_key") or ""),
-                int(fact.get("id") or 0),
-            ),
-        )
-
-    def _extract_inductive_entity_claims(
-        self,
-        *,
-        group: Dict[str, Any],
-        facts: Sequence[Dict[str, Any]],
+        subject_entity_id: int,
+        new_signal_ids: set[int],
+        signals: Sequence[Dict[str, Any]],
+        facts_by_id: Dict[int, Dict[str, Any]],
     ) -> Optional[List[Dict[str, Any]]]:
         language = self._resolve_prompt_language_from_text(
-            "\n".join(str(fact.get("summary") or "") for fact in facts[:16])
+            "\n".join(str(signal.get("action_text") or "") for signal in signals)
         )
         prompt_template = (
-            INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_EN
-            if language == "en" else INDUCTIVE_ENTITY_CLAIM_EXTRACTION_PROMPT_ZH
+            USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_EN
+            if language == "en" else USER_OBSERVED_PATTERN_EXTRACTION_PROMPT_ZH
         )
-        raw = self._call_llm(
-            prompt_template.replace("{induction_target}", json.dumps({
-                "subject_entity": group["subject"],
-                "claim_type_hint": group["claim_type_hint"],
-                "claim_anchor": group["claim_anchor"],
-            }, ensure_ascii=False, indent=2)).replace("{facts}", json.dumps([
-                self._claim_fact_prompt_view(fact) for fact in facts[:32]
+        raw = self._llm_client.call_llm(
+            prompt_template.replace("{pattern_target}", json.dumps({
+                "subject_entity": self._world_owner_entity_name,
+                "subject_entity_id": subject_entity_id,
+                "world_owner_entity": self._world_owner_entity_name,
+                "new_signal_ids": sorted(new_signal_ids),
+            }, ensure_ascii=False, indent=2)).replace("{action_signals}", json.dumps([
+                {
+                    "signal_id": int(signal["signal_id"]),
+                    "action_kind": signal.get("action_kind") or "",
+                    "event_time": signal.get("event_time_key") or "",
+                    "action_text": signal.get("action_text") or "",
+                    "location": signal.get("location") or "",
+                    "owner_evidence_type": signal.get("owner_evidence_type") or "",
+                    "owner_evidence_text": signal.get("owner_evidence_text") or "",
+                    "other_evidence_text": signal.get("other_evidence_text") or "",
+                    "fact_id": int(signal["fact_id"]),
+                    "fact_summary": (
+                        facts_by_id.get(int(signal["fact_id"])) or {}
+                    ).get("summary") or "",
+                    "dialogue_time": (
+                        facts_by_id.get(int(signal["fact_id"])) or {}
+                    ).get("dialogue_time_key") or "",
+                }
+                for signal in signals
             ], ensure_ascii=False, indent=2))
         )
-        parsed = self._parse_json_object_from_llm_text(raw or "")
-        if parsed is None or not isinstance(parsed.get("claims"), list):
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        if parsed is None or not isinstance(parsed.get("patterns"), list):
             return None
-        facts_by_id = {
-            int(fact["id"]): fact for fact in facts
-            if str(fact.get("id") or "").strip().isdigit()
-        }
+        available_signal_ids = {int(signal["signal_id"]) for signal in signals}
         result: List[Dict[str, Any]] = []
-        for raw_claim in parsed["claims"][:4]:
-            claim = self._normalize_inductive_entity_claim(
-                raw_claim, group=group, facts_by_id=facts_by_id,
+        for raw_pattern in parsed["patterns"][:4]:
+            pattern = self._normalize_user_observed_pattern(
+                raw_pattern,
+                subject_entity_id=subject_entity_id,
+                new_signal_ids=new_signal_ids,
+                available_signal_ids=available_signal_ids,
             )
-            if claim:
-                result.append(claim)
+            if pattern:
+                result.append(pattern)
         return result
 
-    def _normalize_inductive_entity_claim(
+    def _normalize_user_observed_pattern(
         self,
         raw: Any,
         *,
-        group: Dict[str, Any],
-        facts_by_id: Dict[int, Dict[str, Any]],
+        subject_entity_id: int,
+        new_signal_ids: set[int],
+        available_signal_ids: set[int],
     ) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
             return None
-        claim_type = str(raw.get("claim_type") or "").strip().lower()
-        if claim_type not in {"preference", "behavior_pattern"}:
+        primary_domain = self._normalize_primary_domain(raw.get("primary_domain"))
+        if not primary_domain:
             return None
-        if _compact_whitespace(raw.get("subject_entity") or "") != group["subject"]:
-            return None
-        predicate = re.sub(r"[^a-z0-9_]+", "_", str(raw.get("predicate") or "").lower()).strip("_")
-        if predicate not in {"prefers", "dislikes", "usually_does", "avoids", "has_routine"}:
-            return None
-        support_ids = list(dict.fromkeys(
-            int(value) for value in (raw.get("support_fact_ids") or [])
-            if str(value).strip().isdigit() and int(value) in facts_by_id
-        ))[:24]
-        episode_ids = {
-            int(facts_by_id[fact_id]["episode_id"]) for fact_id in support_ids
-            if str(facts_by_id[fact_id].get("episode_id") or "").strip().isdigit()
-        }
-        windows = {
-            str(facts_by_id[fact_id].get("event_time_key") or facts_by_id[fact_id].get("dialogue_time_key") or "")[:10]
-            for fact_id in support_ids
-        } - {""}
         if (
-            len(support_ids) < self._entity_claim_induction_min_support_facts
-            or len(episode_ids) < self._entity_claim_induction_min_episodes
-            or len(windows) < self._entity_claim_induction_min_time_windows
+            _compact_whitespace(raw.get("subject_entity") or "")
+            != self._world_owner_entity_name
         ):
             return None
-        raw_claim_text = _compact_whitespace(raw.get("claim_text") or "")
-        if not raw_claim_text:
+        signal_ids = list(dict.fromkeys(
+            int(value) for value in (raw.get("support_signal_ids") or [])
+            if str(value).strip().isdigit() and int(value) in available_signal_ids
+        ))[:24]
+        if (
+            len(signal_ids) < self._user_observed_pattern_min_support_signals
+            or not new_signal_ids.intersection(signal_ids)
+        ):
+            return None
+        pattern_text = _compact_whitespace(raw.get("pattern_text") or "")[:480]
+        if not pattern_text:
             return None
         confidence = self._clamp_float(raw.get("confidence"), 0.0, 1.0, 0.7)
-        claim_text = self._normalize_entity_claim_text(
-            raw_claim_text,
-            subject=group["subject"],
-            predicate=predicate,
-        )
         return {
-            "subject_entity_id": group["subject_entity_id"], "predicate": predicate,
-            "claim_text": claim_text,
-            "claim_type": claim_type, "claim_origin": "inductive",
-            "status": "active",
+            "pattern_text": pattern_text,
+            "condition_text": _compact_whitespace(raw.get("condition_text") or "")[:240],
+            "primary_domain": primary_domain,
             "confidence": confidence,
-            "extractor_version": "entity_claim_induction_v1", "prompt_version": "v1",
-            "metadata": {
-                "condition_text": _compact_whitespace(raw.get("condition_text") or ""),
-                "claim_anchor": group["claim_anchor"],
-            },
-            "support_fact_ids": support_ids,
+            "support_signal_ids": signal_ids,
         }
 
+    def _reconcile_user_observed_pattern(
+        self, pattern: Dict[str, Any], *, subject_entity_id: int,
+    ) -> Optional[Dict[str, Any]]:
+        """Reuse an equivalent pattern or create a new one with relation events."""
+        existing = self._db.get_user_observed_patterns(
+            subject_entity_id=subject_entity_id, limit=200,
+        )
+        # Domain is a preference for the shortlist, not an exclusion: a pattern
+        # can be assigned to a different domain in a later extraction.
+        ranked = sorted(existing, key=lambda row: (
+            int(row.get("primary_domain") == pattern["primary_domain"]),
+            action_lexical_similarity(
+                pattern["pattern_text"], row.get("pattern_text"),
+            ),
+        ), reverse=True)
+        related = ranked[:16]
+        relations = self._classify_user_observed_pattern_relations(pattern, related)
+        if relations is None:
+            return None
+        existing_by_id = {int(row["id"]): row for row in related}
+        merge_relations = [
+            item for item in relations
+            if item["semantic_relation"] in {"duplicate", "supports"}
+        ]
+        if merge_relations:
+            selected = max(merge_relations, key=lambda item: (
+                item["confidence"],
+                float(existing_by_id[item["existing_pattern_id"]].get("confidence") or 0.0),
+            ))
+            pattern_id = selected["existing_pattern_id"]
+            with self._db.transaction():
+                added = self._db.add_user_observed_pattern_signals(
+                    pattern_id=pattern_id, signal_ids=pattern["support_signal_ids"],
+                )
+                self._db.refresh_user_observed_pattern(
+                    pattern_id=pattern_id, confidence=pattern["confidence"],
+                )
+                recorded_count = 0
+                for relation in relations:
+                    relation_type = relation["semantic_relation"]
+                    target_id = relation["existing_pattern_id"]
+                    if relation_type == "unrelated" or (
+                        relation_type in {"duplicate", "supports"}
+                        and (target_id != pattern_id or not added)
+                    ):
+                        continue
+                    recorded_count += int(self._db.record_user_observed_pattern_relation(
+                        target_pattern_id=target_id,
+                        trigger_pattern_id=(pattern_id if target_id != pattern_id else None),
+                        semantic_relation=relation_type,
+                        support_signal_ids=pattern["support_signal_ids"],
+                        candidate_snapshot=pattern,
+                        semantic_confidence=relation["confidence"],
+                        semantic_reason=relation["reason"],
+                    ))
+            return {"pattern_id": pattern_id, "created": False,
+                    "relations_recorded": recorded_count}
+
+        pattern_key = hashlib.sha256(json.dumps({
+            "pattern_text": pattern["pattern_text"].casefold(),
+            "condition_text": pattern["condition_text"].casefold(),
+            "primary_domain": pattern["primary_domain"],
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        with self._db.transaction():
+            pattern_id, created = self._db.upsert_user_observed_pattern(
+                subject_entity_id=subject_entity_id, pattern_key=pattern_key,
+                pattern_text=pattern["pattern_text"],
+                condition_text=pattern["condition_text"],
+                primary_domain=pattern["primary_domain"],
+                confidence=pattern["confidence"],
+            )
+            added = self._db.add_user_observed_pattern_signals(
+                pattern_id=pattern_id, signal_ids=pattern["support_signal_ids"],
+            )
+            recorded_count = 0
+            if not created and added:
+                recorded_count += int(self._db.record_user_observed_pattern_relation(
+                    target_pattern_id=pattern_id,
+                    trigger_pattern_id=None,
+                    semantic_relation="supports",
+                    support_signal_ids=pattern["support_signal_ids"],
+                    candidate_snapshot=pattern,
+                    semantic_confidence=pattern["confidence"],
+                    semantic_reason="New action signals supported the existing pattern key.",
+                ))
+            for relation in relations:
+                if relation["semantic_relation"] not in {"refines", "contradicts"}:
+                    continue
+                if relation["existing_pattern_id"] == pattern_id:
+                    continue
+                recorded_count += int(self._db.record_user_observed_pattern_relation(
+                    target_pattern_id=relation["existing_pattern_id"],
+                    trigger_pattern_id=pattern_id,
+                    semantic_relation=relation["semantic_relation"],
+                    support_signal_ids=pattern["support_signal_ids"],
+                    candidate_snapshot=pattern,
+                    semantic_confidence=relation["confidence"],
+                    semantic_reason=relation["reason"],
+                ))
+        return {"pattern_id": pattern_id, "created": created,
+                "relations_recorded": recorded_count}
+
+    def _classify_user_observed_pattern_relations(
+        self, candidate: Dict[str, Any], existing: Sequence[Dict[str, Any]],
+    ) -> Optional[List[Dict[str, Any]]]:
+        if not existing:
+            return []
+        evidence_ids = list(candidate["support_signal_ids"][-8:])
+        evidence_ids.extend(
+            signal_id
+            for row in existing
+            for signal_id in (row.get("support_signal_ids") or [])[-4:]
+        )
+        signals_by_id = {
+            int(row["signal_id"]): row
+            for row in self._db.get_user_action_signals_by_ids(evidence_ids)
+        }
+        facts_by_id = {
+            int(row["id"]): row
+            for row in self._db.get_memory_facts_by_ids([
+                int(signal["fact_id"]) for signal in signals_by_id.values()
+            ])
+        }
+
+        def evidence_view(signal_ids: Sequence[int], limit: int) -> List[Dict[str, Any]]:
+            result: List[Dict[str, Any]] = []
+            for signal_id in signal_ids[-limit:]:
+                signal = signals_by_id.get(int(signal_id))
+                if signal is None:
+                    continue
+                result.append({
+                    "signal_id": int(signal_id),
+                    "action_text": signal.get("action_text") or "",
+                    "event_time": signal.get("event_time_key") or "",
+                    "location": signal.get("location") or "",
+                    "fact_summary": (
+                        facts_by_id.get(int(signal["fact_id"])) or {}
+                    ).get("summary") or "",
+                })
+            return result
+
+        language = self._resolve_prompt_language_from_text(
+            candidate["pattern_text"],
+        )
+        template = (
+            USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_EN
+            if language == "en" else USER_OBSERVED_PATTERN_RECONCILIATION_PROMPT_ZH
+        )
+        raw = self._llm_client.call_llm(
+            template.replace("{candidate_pattern}", json.dumps(
+                {**candidate, "supporting_actions": evidence_view(
+                    candidate["support_signal_ids"], 8,
+                )}, ensure_ascii=False, indent=2,
+            )).replace("{existing_patterns}", json.dumps([
+                {
+                    "id": row["id"], "pattern_text": row["pattern_text"],
+                    "condition_text": row.get("condition_text") or "",
+                    "primary_domain": row.get("primary_domain") or "",
+                    "support_signal_ids": row.get("support_signal_ids") or [],
+                    "supporting_actions": evidence_view(
+                        row.get("support_signal_ids") or [], 4,
+                    ),
+                }
+                for row in existing
+            ], ensure_ascii=False, indent=2))
+        )
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        if not parsed or not isinstance(parsed.get("relations"), list):
+            return None
+        allowed_ids = {int(row["id"]) for row in existing}
+        allowed_relations = {"duplicate", "supports", "refines", "contradicts", "unrelated"}
+        result: List[Dict[str, Any]] = []
+        for item in parsed["relations"]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                target_id = int(item.get("existing_pattern_id"))
+            except (TypeError, ValueError):
+                continue
+            relation = str(item.get("semantic_relation") or "").strip().lower()
+            if target_id not in allowed_ids or relation not in allowed_relations:
+                continue
+            result.append({
+                "existing_pattern_id": target_id,
+                "semantic_relation": relation,
+                "confidence": self._clamp_float(item.get("confidence"), 0.0, 1.0, 0.7),
+                "reason": _compact_whitespace(item.get("reason") or "")[:240],
+            })
+        return result
+
     @staticmethod
-    def _normalize_entity_claim_text(
+    def _normalize_user_claim_text(
         value: Any,
         *,
         subject: str,
@@ -5422,22 +6041,19 @@ class MemoryNodeManager:
         target = _compact_whitespace(object_name)
         return _compact_whitespace(f"{subject} {predicate} {target}")[:480]
 
-    def _log_future_commitment_facts_loaded(
+    def _log_user_intent_signals_loaded(
         self,
-        processing_target: str,
-        facts: List[Dict[str, Any]],
-        limit: int,
+        signal_items: Sequence[Dict[str, Any]],
         reference_timestamp: Any,
     ) -> None:
-        """Log the independent fact batch consumed by future-commitment update."""
-        self._log_info("memory_future_commitment_update", "facts_loaded", {
-            "processing_target": processing_target,
-            "fact_count": len(facts),
-            "fact_ids": [fact.get("id") for fact in facts],
-            "limit": limit,
+        """Log each intent signal together with the fact supporting its extraction."""
+        self._log_info("memory_user_intent_update", "signals_loaded", {
+            "signal_count": len(signal_items),
+            "signal_ids": [item["signal_id"] for item in signal_items],
             "reference_timestamp": reference_timestamp,
-            "time_start": facts[0].get("dialogue_time_key") if facts else "",
-            "time_end": facts[-1].get("dialogue_time_key") if facts else "",
+            "signal_items": [
+                self._user_intent_signal_prompt_view(item) for item in signal_items
+            ],
         })
 
     @staticmethod
@@ -5445,6 +6061,14 @@ class MemoryNodeManager:
         text = _compact_whitespace(value).lower()
         text = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", text)
         return text or "general"
+
+    @staticmethod
+    def _normalize_primary_domain(value: Any) -> str:
+        """Return a controlled semantic domain or an empty invalid marker."""
+        domain = re.sub(
+            r"[^a-z]+", "_", str(value or "").strip().lower(),
+        ).strip("_")
+        return domain if domain in _PRIMARY_DOMAINS else ""
 
     @staticmethod
     def _normalize_unique_labels(
@@ -5609,7 +6233,7 @@ class MemoryNodeManager:
         allow_substring: bool = True,
         minimum_pair_score: float = 0.5,
     ) -> Dict[str, Any]:
-        """Extract one candidate's canonical topic values and score overlap."""
+        """Extract one candidate's fact topic and score its overlap."""
         raw = (
             candidate.get("_hydrated")
             if isinstance(candidate.get("_hydrated"), dict)
@@ -5626,8 +6250,7 @@ class MemoryNodeManager:
             if topic and topic not in topic_values:
                 topic_values.append(topic)
 
-        extend_values(raw.get("fact_root_topic"))
-        extend_values(raw.get("fact_aspect_topic"))
+        extend_values(raw.get("fact_topic"))
 
         overlap = self._recall_calculate_search_terms_overlap_with_topic_values(
             query_terms,
@@ -5720,122 +6343,29 @@ class MemoryNodeManager:
             "keyword_values": keyword_values,
         }
 
-    def _entity_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def _get_user_claim_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Read claim-level signals from their normalized fact mapping rows."""
         fact_id = int(fact.get("id") or 0)
         if fact_id <= 0:
             return []
         return list(
-            self._db.get_fact_entity_claim_signal_mappings(fact_id).values()
+            self._db.get_fact_user_claim_signals(fact_id).values()
         )
 
-    def _future_commitment_signals_from_fact(self, fact: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Read prospective evidence solely from its normalized mapping rows."""
-        fact_id = int(fact.get("id") or 0)
-        if fact_id <= 0:
-            return []
-        return list(
-            self._db.get_fact_future_commitment_signal_mappings(fact_id).values()
-        )
-
-    def _entities_for_entity_claim_signal(
+    def _subject_entity_for_user_claim_signal(
         self,
         signal: Dict[str, Any],
         fact: Dict[str, Any],
-    ) -> List[str]:
-        """Return the signal entity only when it is a fact entity."""
-        entity = signal.get("entity")
-        if isinstance(entity, dict):
-            name = _compact_whitespace(entity.get("name") or entity.get("text") or "")
-        else:
-            name = _compact_whitespace(entity)
-        if not name:
-            return []
+    ) -> str:
+        """Return the wearer subject only when it is a fact entity."""
+        name = _compact_whitespace(signal.get("subject_entity") or "")
+        if name.lower() != self._world_owner_entity_name.lower():
+            return ""
         for fact_entity in fact.get("entities") or []:
             canonical_name = _compact_whitespace(fact_entity)
             if canonical_name and canonical_name.lower() == name.lower():
-                return [canonical_name]
-        return []
-
-    def _should_route_fact_to_future_commitment_update(self, fact: Dict[str, Any]) -> bool:
-        """Return whether a fact merits semantic review by the intent task.
-
-        This is deliberately a high-recall, deterministic intake gate.  It does
-        not classify a fact as a goal, plan, or work item, and it must not make
-        database changes.  A future intent-extraction task will make that
-        decision using the fact, its source context, and related active objects.
-        """
-        if not isinstance(fact, dict):
-            return False
-        summary = _compact_whitespace(fact.get("summary") or fact.get("text") or "")
-        if not summary:
-            return False
-
-        fact_type = self._normalize_fact_type(fact.get("fact_type"))
-        if fact_type == "recommendation":
-            # Assistant suggestions are not user intent unless a separate fact
-            # records the user's explicit acceptance or commitment.
-            return False
-
-        text = summary.lower()
-
-        lifecycle_markers = (
-            "已完成", "完成了", "做完", "办完", "已经发", "已发", "提交了",
-            "已提交", "取消", "不做了", "不去了", "改期", "改到", "延期", "推迟",
-            "延后", "提前", "受阻", "卡住", "无法", "没法", "等待确认", "等待资料",
-            "completed", "finished", "done", "sent", "submitted", "cancelled",
-            "canceled", "rescheduled", "postponed", "delayed", "blocked",
-            "cannot proceed", "waiting for confirmation",
-        )
-        if any(marker in text for marker in lifecycle_markers):
-            return True
-
-        if fact_type == "commitment":
-            return True
-
-        goal_markers = (
-            "长期目标", "目标是", "目标为", "希望达到", "希望实现", "争取", "致力于",
-            "今年完成", "今年实现", "年内完成", "未来要实现", "want to achieve",
-            "hope to achieve", "aim to", "goal is", "long-term goal", "work toward",
-        )
-        if any(marker in text for marker in goal_markers):
-            return True
-
-        responsibility_markers = (
-            "需要完成", "必须", "负责", "答应", "承诺", "交付", "提交",
-            "交给", "让我", "分配给我", "安排我", "请提醒", "帮我提醒",
-            "need to", "have to", "must", "responsible for", "committed to",
-            "promised to", "deliver", "submit", "assigned me", "remind me",
-        )
-        if any(marker in text for marker in responsibility_markers):
-            return True
-
-        future_time_markers = (
-            "明天", "后天", "今晚", "明晚", "下周", "下个月", "明年", "本周",
-            "这周", "周一", "周二", "周三", "周四", "周五", "周六", "周日", "周末",
-            "tomorrow", "tonight", "next week", "next month", "next year",
-            "this week", "on monday", "on tuesday", "on wednesday", "on thursday",
-            "on friday", "this weekend",
-        )
-        future_activity_markers = (
-            "前往", "去", "参加", "出席", "开会", "会面", "见面", "拜访", "出差",
-            "旅行", "约", "预约", "安排", "活动", "会议", "飞", "乘车",
-            "travel", "go to", "attend", "meet", "visit", "schedule", "book",
-            "appointment", "trip", "flight", "meeting",
-        )
-        if (
-            any(marker in text for marker in future_time_markers)
-            and any(marker in text for marker in future_activity_markers)
-        ):
-            return True
-
-        decision_markers = (
-            "决定", "打算", "准备", "计划", "将要", "要去", "要做",
-            "decided", "planning to", "plan to", "going to", "will ",
-        )
-        return fact_type in {"decision", "action", "instruction"} and any(
-            marker in text for marker in decision_markers
-        )
+                return canonical_name
+        return ""
 
     @staticmethod
     def _is_low_value_followup_question(text: str) -> bool:
@@ -6044,9 +6574,6 @@ class MemoryNodeManager:
                     "match": match_details,
                     "bm25_raw_score": item.get("_bm25_score"),
                     "bm25_score": item.get("_recall_bm25_score"),
-                    "episode_seed_targets": list(
-                        item.get("_stage2_episode_seed_targets") or []
-                    ),
                     "accepted": decision.get("accepted"),
                     "decision_reason": decision_reason,
                 })
@@ -6368,7 +6895,7 @@ class MemoryNodeManager:
         tags: Optional[List[str]] = None,
         time_end: Optional[str] = None,
         recall_mode: str = "normal",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> Dict[str, Any]:
         requested_recall_mode = str(recall_mode or "normal").strip().lower()
         started_at = time.monotonic()
@@ -6516,13 +7043,11 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         candidate_limits: Dict[str, int],
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve Stage 1 direct seeds for permitted object types.
 
-        Episode documents are intentionally not permitted here. They remain a
-        stored projection but only participate later as fact-association
-        boundaries.
+        User-activity observations are not recall documents in this version.
         """
         seed_search_terms = self._recall_stage1_build_seed_search_terms(
             terms=terms,
@@ -6549,7 +7074,7 @@ class MemoryNodeManager:
         candidate_limits: Dict[str, int],
         candidate_source: str,
         prospective_query_profile: Optional[Dict[str, Any]] = None,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve direct seeds from the shared document projection.
 
@@ -6557,14 +7082,13 @@ class MemoryNodeManager:
         returned, while derived-memory projections can become candidates
         directly.  For an explicit prospective time-slot query, prospective
         object types use a strict time browse instead of lexical terms.
-        Episode is deliberately excluded because it is only a fact-association
-        boundary.
+        User-activity observations are deliberately excluded in this version.
         """
         direct_types = list(dict.fromkeys(
             str(value or "").strip().lower()
             for value in direct_object_types or []
             if str(value or "").strip().lower()
-            in {"fact", "entity_claim", "goal", "plan", "work_item"}
+            in {"fact", "user_claim", "goal", "plan", "work_item"}
         ))
         db = database or self._db
         is_prospective_time_slot_query = bool(
@@ -6628,7 +7152,7 @@ class MemoryNodeManager:
     ) -> Sequence[str]:
         """Keep Stage 1 focused on currently answerable derived objects."""
         return {
-            "entity_claim": ("active",),
+            "user_claim": ("active",),
             "goal": ("active",),
             "plan": ("planned", "rescheduled"),
             "work_item": ("open", "blocked"),
@@ -6833,7 +7357,7 @@ class MemoryNodeManager:
         modes = set(query_modes or [])
         object_types = ["fact"]
         if "knowledge" in modes:
-            object_types.append("entity_claim")
+            object_types.append("user_claim")
         if "prospective" in modes:
             object_types.extend(("goal", "plan", "work_item"))
         return object_types
@@ -6842,7 +7366,7 @@ class MemoryNodeManager:
     def _normalize_recall_object_types(value: Any) -> List[str]:
         """Normalize LLM-routed Stage 2 object types without excluding facts."""
         allowed_types = {
-            "fact", "entity_claim", "goal", "plan", "work_item",
+            "fact", "user_claim", "goal", "plan", "work_item",
         }
         raw_values = value if isinstance(value, (list, tuple, set)) else []
         object_types = ["fact"]
@@ -6886,7 +7410,7 @@ class MemoryNodeManager:
         reference_time: str,
         temporal_mode: str = "dialogue_time",
         prompt_language: str = "zh",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> Dict[str, Any]:
         """Run a deterministic, no-LLM recall path for high-confidence hits.
 
@@ -6920,9 +7444,6 @@ class MemoryNodeManager:
         )
         seed_candidate_limits = candidate_limits["seed_limits"]
         selected_candidate_limits = candidate_limits["selected_limits"]
-        association_per_relation_limit = candidate_limits[
-            "association_per_relation_limit"
-        ]
         query_entity_names = self._recall_stage1_resolve_query_entity_names(
             query=original_query,
             database=database,
@@ -6976,9 +7497,6 @@ class MemoryNodeManager:
         association_candidates = (
             self._retrieve_association_candidates_using_seed_candidates(
                 seed_candidates=direct_candidates,
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-                limit=association_per_relation_limit,
                 candidate_source_prefix="stage1",
                 database=database,
             )
@@ -7055,7 +7573,7 @@ class MemoryNodeManager:
     ) -> Dict[str, int]:
         counts = {
             "fact": 0,
-            "entity_claim": 0,
+            "user_claim": 0,
             "goal": 0,
             "plan": 0,
             "work_item": 0,
@@ -7137,17 +7655,8 @@ class MemoryNodeManager:
             raise ValueError(f"Unsupported recall stage: {stage_name}")
         association_candidates = list(association_candidates or [])
         expanded_candidates = list(expanded_candidates or [])
-        association_by_relation = {"same_episode": 0}
-        for candidate in association_candidates:
-            relation = str(
-                candidate.get("_recall_association_relation")
-                or ""
-            )
-            if relation in association_by_relation:
-                association_by_relation[relation] += 1
         payload: Dict[str, Any] = {
             "association_candidate_count": len(association_candidates),
-            "association_by_relation": association_by_relation,
             "expanded_candidate_count": len(expanded_candidates),
             "expanded_by_level": self._recall_count_candidates_by_level(
                 expanded_candidates
@@ -7250,19 +7759,12 @@ class MemoryNodeManager:
         self,
         *,
         seed_candidates: Sequence[Dict[str, Any]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        limit: int,
         candidate_source_prefix: str = "stage1",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve all fact associations for accepted direct candidates.
 
-        This is the association orchestrator only.  The two relation families
-        deliberately remain separate: derived-memory evidence is retrieved
-        from explicit mappings, while fact-to-fact expansion uses shared
-        episode membership.  Episode documents themselves are never
-        candidates.
+        Claim and intent candidates expand only to their mapped fact evidence.
         """
         db = database or self._db
         document_evidence_candidates = (
@@ -7272,133 +7774,28 @@ class MemoryNodeManager:
                 database=db,
             )
         )
-        same_episode_candidates = (
-            self._retrieve_same_episode_fact_association_candidates(
-                seed_candidates=seed_candidates,
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-                limit=limit,
-                candidate_source_prefix=candidate_source_prefix,
-                database=db,
-            )
-        )
-        return [*document_evidence_candidates, *same_episode_candidates]
-
-    def _retrieve_same_episode_fact_association_candidates(
-        self,
-        *,
-        seed_candidates: Sequence[Dict[str, Any]],
-        temporal_bounds: RecallTimeBounds,
-        temporal_mode: str,
-        limit: int,
-        candidate_source_prefix: str,
-        database: SessionDB,
-    ) -> List[Dict[str, Any]]:
-        """Expand accepted fact seeds with other facts in the same episode."""
-        fact_seed_candidates = [
-            candidate
-            for candidate in seed_candidates or []
-            if str(candidate.get("index_level") or "") == "fact"
-        ]
-        seed_scores: Dict[int, float] = {}
-        for candidate in fact_seed_candidates or []:
-            try:
-                fact_id = int(candidate.get("target_id"))
-            except (TypeError, ValueError):
-                continue
-            seed_scores[fact_id] = max(
-                seed_scores.get(fact_id, 0.0),
-                self._clamp_float(candidate.get("_recall_score"), 0.0, 1.0, 0.0),
-            )
-        if not seed_scores:
-            return []
-
-        per_relation_limit = max(1, int(limit or 24))
-        related_scores: Dict[int, Tuple[str, float]] = {}
-        for pair in database.related_fact_pairs_by_episode_fact_ids(
-            list(seed_scores),
-            limit=per_relation_limit,
-        ):
-            seed_score = seed_scores.get(int(pair["seed_fact_id"]), 0.0)
-            propagated_score = round(
-                seed_score * self._recall_fact_association_decay("same_episode"),
-                4,
-            )
-            related_fact_id = int(pair["related_fact_id"])
-            existing = related_scores.get(related_fact_id)
-            if existing is None or propagated_score > existing[1]:
-                related_scores[related_fact_id] = (
-                    "same_episode",
-                    propagated_score,
-                )
-        if not related_scores:
-            return []
-
-        expanded: List[Dict[str, Any]] = []
-        for fact in database.get_memory_facts_by_ids(list(related_scores)):
-            fact_id = int(fact.get("id") or 0)
-            relation_info = related_scores.get(fact_id)
-            if not relation_info:
-                continue
-            relation, propagated_score = relation_info
-            candidate = self._make_recall_document_candidate(
-                row=fact,
-                object_type="fact",
-                candidate_source=(
-                    f"{candidate_source_prefix}_episode_association"
-                ),
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-            )
-            if not candidate:
-                continue
-            candidate["_recall_association_score"] = propagated_score
-            candidate["_recall_association_relation"] = relation
-            candidate["_recall_score"] = propagated_score
-            candidate["evidence"] = ["associative_recall"]
-            candidate["matched"] = True
-            candidate["candidate_score_threshold"] = 0.0
-            candidate["filter_reason"] = ""
-            candidate["has_strong_anchor"] = False
-            candidate["strong_anchor_reasons"] = []
-            match_details_key = (
-                "_recall_stage2_match_details"
-                if candidate_source_prefix == "stage2"
-                else "_recall_fast_match_details"
-            )
-            candidate[match_details_key] = {
-                "topic_match_info": {},
-                "entity_match_info": {},
-                "time_score_info": {},
-                "score_components": {},
-            }
-            candidate["_recall_decision"] = {
-                "accepted": True,
-                "decision_reason": "accepted_associative_recall",
-            }
-            expanded.append(candidate)
-        return expanded
+        return document_evidence_candidates
 
     def _retrieve_evidence_fact_association_candidates(
         self,
         *,
         direct_candidates: Sequence[Dict[str, Any]],
         candidate_source_prefix: str,
-        database: SessionDB,
+        database: UserMemoryDB,
     ) -> List[Dict[str, Any]]:
         """Expand claim/prospective candidates to their mapped fact evidence."""
         claim_candidates = [
             candidate for candidate in direct_candidates or []
-            if str(candidate.get("index_level") or "") == "entity_claim"
+            if str(candidate.get("index_level") or "") == "user_claim"
         ]
-        future_commitment_candidates = [
+        user_intent_candidates = [
             candidate for candidate in direct_candidates or []
             if str(candidate.get("index_level") or "")
             in {"goal", "plan", "work_item"}
         ]
         evidence_by_fact_id: Dict[int, Tuple[str, float]] = {}
 
-        claim_evidence = database.get_entity_claim_evidence_fact_ids(
+        claim_evidence = database.get_user_claim_evidence_fact_ids(
             [candidate.get("target_id") for candidate in claim_candidates],
             limit=max(24, len(claim_candidates) * 4),
         )
@@ -7422,11 +7819,11 @@ class MemoryNodeManager:
                     str(candidate.get("index_level") or ""),
                     int(candidate.get("target_id") or 0),
                 )
-                for candidate in future_commitment_candidates
+                for candidate in user_intent_candidates
             ],
-            limit=max(24, len(future_commitment_candidates) * 4),
+            limit=max(24, len(user_intent_candidates) * 4),
         )
-        for candidate in future_commitment_candidates:
+        for candidate in user_intent_candidates:
             key = (
                 str(candidate.get("index_level") or ""),
                 int(candidate.get("target_id") or 0),
@@ -7487,12 +7884,6 @@ class MemoryNodeManager:
             candidates.append(candidate)
         return candidates
 
-    def _recall_fact_association_decay(self, relation: str) -> float:
-        """Return the configured score decay for one fact association edge."""
-        return {
-            "same_episode": self._recall_stage1_episode_propagation_decay,
-        }.get(relation, self._recall_stage1_association_propagation_decay)
-
     @staticmethod
     def _recall_stage1_candidate_limits(
         *,
@@ -7502,8 +7893,7 @@ class MemoryNodeManager:
 
         ``top_k`` controls the fact quota. Derived objects receive small,
         independent quotas only when the Stage 1 query route requests them.
-        Episode is intentionally absent: it is an association boundary, not a
-        direct-recall candidate type.
+        Activity observations are deliberately not direct-recall candidates.
         """
         k = max(1, int(top_k or 1))
         seed_per_level_limit = max(8, min(24, k * 2))
@@ -7513,16 +7903,14 @@ class MemoryNodeManager:
             # Stage 1 latency or candidate pool for contextual wording.
             "seed_limits": {
                 "fact": seed_per_level_limit,
-                "entity_claim": max(4, min(12, k)),
+                "user_claim": max(4, min(12, k)),
                 "goal": max(4, min(10, k)),
                 "plan": max(4, min(12, k)),
                 "work_item": max(4, min(12, k)),
             },
-            # The association loader applies this limit to same-episode facts.
-            "association_per_relation_limit": max(4, min(12, k)),
             "selected_limits": {
                 "fact": k,
-                "entity_claim": max(2, min(4, k)),
+                "user_claim": max(2, min(4, k)),
                 "goal": max(2, min(3, k)),
                 "plan": max(2, min(4, k)),
                 "work_item": max(2, min(4, k)),
@@ -7870,7 +8258,7 @@ class MemoryNodeManager:
             and status_eligible
             and bool(time_score_info.get("within_temporal_bounds"))
         ):
-            strong_anchor_reasons.append("temporal_future_commitment_match")
+            strong_anchor_reasons.append("temporal_user_intent_match")
         has_strong_anchor = bool(strong_anchor_reasons)
         fast_match_details = {
             # Preserve the same detail shape consumed by the Stage 1 evidence
@@ -8082,10 +8470,10 @@ class MemoryNodeManager:
         modes = set(query_modes or [])
         direct_claim_candidates = [
             candidate for candidate in candidates or []
-            if str(candidate.get("index_level") or "") == "entity_claim"
+            if str(candidate.get("index_level") or "") == "user_claim"
             and not candidate.get("_recall_association_relation")
         ]
-        direct_future_commitment_candidates = [
+        direct_user_intent_candidates = [
             candidate for candidate in candidates or []
             if str(candidate.get("index_level") or "")
             in {"goal", "plan", "work_item"}
@@ -8101,10 +8489,10 @@ class MemoryNodeManager:
             if str(candidate.get("_recall_association_relation") or "")
             == "intent_evidence"
         )
-        has_temporal_future_commitment_match = any(
-            "temporal_future_commitment_match"
+        has_temporal_user_intent_match = any(
+            "temporal_user_intent_match"
             in (candidate.get("strong_anchor_reasons") or [])
-            for candidate in direct_future_commitment_candidates
+            for candidate in direct_user_intent_candidates
         )
         # A future-oriented question can intentionally omit the subject of
         # the planned object (for example, "我明天要去哪里？").  In that
@@ -8115,21 +8503,21 @@ class MemoryNodeManager:
             lexical_query_term_coverage_sufficient
             or (
                 "prospective" in modes
-                and has_temporal_future_commitment_match
+                and has_temporal_user_intent_match
             )
         )
         has_primary_query_coverage = bool(
             matched_topic_term_keys
             or matched_high_value_entities
-            or has_temporal_future_commitment_match
+            or has_temporal_user_intent_match
         )
         knowledge_evidence_sufficient = (
             "knowledge" not in modes
             or bool(direct_claim_candidates and claim_evidence_count)
         )
-        future_commitment_evidence_sufficient = (
+        user_intent_evidence_sufficient = (
             "prospective" not in modes
-            or bool(direct_future_commitment_candidates and intent_evidence_count)
+            or bool(direct_user_intent_candidates and intent_evidence_count)
         )
         trusted = (
             bool(candidates)
@@ -8137,7 +8525,7 @@ class MemoryNodeManager:
             and query_term_coverage_sufficient
             and query_entity_coverage_sufficient
             and knowledge_evidence_sufficient
-            and future_commitment_evidence_sufficient
+            and user_intent_evidence_sufficient
         )
         return {
             "trusted": trusted,
@@ -8164,13 +8552,13 @@ class MemoryNodeManager:
             "entity_coverage": round(entity_coverage, 4),
             "query_entity_coverage_sufficient": query_entity_coverage_sufficient,
             "query_modes": sorted(modes),
-            "direct_entity_claim_count": len(direct_claim_candidates),
+            "direct_user_claim_count": len(direct_claim_candidates),
             "claim_evidence_count": claim_evidence_count,
             "knowledge_evidence_sufficient": knowledge_evidence_sufficient,
-            "direct_future_commitment_count": len(direct_future_commitment_candidates),
+            "direct_user_intent_count": len(direct_user_intent_candidates),
             "intent_evidence_count": intent_evidence_count,
-            "future_commitment_evidence_sufficient": future_commitment_evidence_sufficient,
-            "has_temporal_future_commitment_match": has_temporal_future_commitment_match,
+            "user_intent_evidence_sufficient": user_intent_evidence_sufficient,
+            "has_temporal_user_intent_match": has_temporal_user_intent_match,
         }
 
     @staticmethod
@@ -8198,7 +8586,7 @@ class MemoryNodeManager:
         self,
         *,
         query: str,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[str]:
         """Resolve entity anchors explicitly present in the query."""
         db = database or self._db
@@ -8695,7 +9083,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         seed_channel_limits: Dict[str, Dict[str, int]],
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve and deduplicate all direct Stage 2 seed channels.
 
@@ -8753,7 +9141,7 @@ class MemoryNodeManager:
         temporal_mode: str,
         candidate_limits: Dict[str, int],
         candidate_source: str,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> List[Dict[str, Any]]:
         """Retrieve full-corpus embedding seeds from recall documents.
 
@@ -8768,7 +9156,7 @@ class MemoryNodeManager:
             str(value or "").strip().lower()
             for value in direct_object_types or []
             if str(value or "").strip().lower()
-            in {"fact", "entity_claim", "goal", "plan", "work_item"}
+            in {"fact", "user_claim", "goal", "plan", "work_item"}
         ))
         db = database or self._db
         candidates: List[Dict[str, Any]] = []
@@ -8886,7 +9274,7 @@ class MemoryNodeManager:
         temporal_mode: str = "dialogue_time",
         stage1_report: Optional[Dict[str, Any]] = None,
         prompt_language: str = "zh",
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> str:
         """Run the existing LLM and semantic-search recall pipeline.
 
@@ -9000,9 +9388,6 @@ class MemoryNodeManager:
         )
         seed_channel_limits = candidate_limits["seed_channel_limits"]
         selected_candidate_limits = candidate_limits["selected_limits"]
-        association_per_relation_limit = candidate_limits[
-            "association_per_relation_limit"
-        ]
         self._log_info("memory_recall_stage2", "query_analyzed", {
             "query_analysis_info": query_analysis_info,
             "temporal_resolution": temporal_resolution,
@@ -9060,9 +9445,6 @@ class MemoryNodeManager:
         association_candidates = (
             self._retrieve_association_candidates_using_seed_candidates(
                 seed_candidates=direct_candidates,
-                temporal_bounds=temporal_bounds,
-                temporal_mode=temporal_mode,
-                limit=association_per_relation_limit,
                 candidate_source_prefix="stage2",
                 database=database,
             )
@@ -9106,7 +9488,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str,
         per_type_limit: int,
-        database: SessionDB,
+        database: UserMemoryDB,
     ) -> List[Dict[str, Any]]:
         """Build and normalize candidates from one recall-document result set."""
         rows = list(rows or [])
@@ -9136,7 +9518,7 @@ class MemoryNodeManager:
         temporal_bounds: RecallTimeBounds,
         temporal_mode: str = "dialogue_time",
         entity_names_by_id: Optional[Dict[int, str]] = None,
-        database: Optional[SessionDB] = None,
+        database: Optional[UserMemoryDB] = None,
     ) -> Optional[Dict[str, Any]]:
         """Convert a hydrated recall object into the shared candidate shape."""
         object_type = str(
@@ -9178,7 +9560,6 @@ class MemoryNodeManager:
             if query_end and time_start and time_start > str(query_end):
                 return None
             hydrated = dict(row)
-            hydrated.pop("episode_id", None)
             hydrated.pop("embedding", None)
             hydrated.pop("identity_text_embedding", None)
             hydrated.pop("canonical_name_embedding", None)
@@ -9211,10 +9592,10 @@ class MemoryNodeManager:
             }
 
         target_table_by_type = {
-            "entity_claim": "memory_entity_claims",
-            "goal": "memory_goals",
-            "plan": "memory_plans",
-            "work_item": "memory_work_items",
+            "user_claim": "memory_user_claims",
+            "goal": "memory_user_intent_items",
+            "plan": "memory_user_intent_items",
+            "work_item": "memory_user_intent_items",
         }
         target_table = target_table_by_type.get(object_type)
         if not target_table:
@@ -9223,6 +9604,48 @@ class MemoryNodeManager:
             target_id = int(row.get("object_id"))
         except (TypeError, ValueError):
             return None
+        if object_type == "user_claim":
+            if database is None:
+                return None
+            stored_claims = database.get_user_claims_by_ids([target_id])
+            if not stored_claims:
+                return None
+            subject_id = int(stored_claims[0].get("subject_entity_id") or 0)
+            subject_name = database.get_entity_names_by_ids([subject_id]).get(
+                subject_id, ""
+            )
+            # Ignore legacy rows outside the user-self claim scope without
+            # destructively rewriting a user's existing database.
+            if _compact_whitespace(subject_name).lower() != (
+                self._world_owner_entity_name.lower()
+            ):
+                return None
+        if object_type in {"goal", "plan", "work_item"}:
+            if database is None:
+                return None
+            intent_row = database.get_intent_object(
+                object_type=object_type,
+                object_id=target_id,
+            )
+            if not intent_row:
+                return None
+            hydrated_intent = dict(intent_row)
+            hydrated_intent["object_id"] = target_id
+            intent_metadata = dict(hydrated_intent.get("metadata") or {})
+            document_metadata = row.get("metadata")
+            if isinstance(document_metadata, dict):
+                intent_metadata.update(document_metadata)
+            hydrated_intent["metadata"] = intent_metadata
+            hydrated_intent.update({
+                key: value
+                for key, value in row.items()
+                if key in {
+                    "title", "identity_text", "identity_text_embedding",
+                    "entity_ids", "topic_keys", "importance", "_bm25_score",
+                    "_recall_temporal_match",
+                }
+            })
+            row = hydrated_intent
         time_start = self._normalize_event_time_text(row.get("time_start"))
         time_end = self._normalize_event_time_text(row.get("time_end")) or time_start
         query_start, query_end = temporal_bounds or (None, None)
@@ -9587,8 +10010,8 @@ class MemoryNodeManager:
             .replace("{query}", str(query or ""))
             .replace("{reference_time}", str(reference_time or ""))
         )
-        result = self._call_llm(prompt)
-        parsed = self._parse_json_object_from_llm_text(result or "")
+        result = self._llm_client.call_llm(prompt)
+        parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
         return parsed if isinstance(parsed, dict) else {}
 
     def _build_recall_search_terms(
@@ -9863,8 +10286,7 @@ class MemoryNodeManager:
                 "dialogue_time": "dialogue_time",
                 "event_time": "event_time",
                 "summary": "summary",
-                "fact_root_topic": "fact_root_topic",
-                "fact_aspect_topic": "fact_aspect_topic",
+                "fact_topic": "fact_topic",
                 "claim": "claim",
                 "claim_origin": "claim_origin",
                 "status": "status",
@@ -9877,8 +10299,7 @@ class MemoryNodeManager:
                 "dialogue_time": "对话时间",
                 "event_time": "事件时间",
                 "summary": "摘要",
-                "fact_root_topic": "事实根主题",
-                "fact_aspect_topic": "事实方面主题",
+                "fact_topic": "事实主题",
                 "claim": "主张",
                 "claim_origin": "来源",
                 "status": "状态",
@@ -9915,9 +10336,9 @@ class MemoryNodeManager:
                         f"   {labels['dialogue_time']}: {dialogue_time}",
                         f"   {labels['event_time']}: {event_time}",
                         f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
-                        f"   {labels['fact_root_topic']}: {raw.get('fact_root_topic') or ''}; {labels['fact_aspect_topic']}: {raw.get('fact_aspect_topic') or ''}",
+                        f"   {labels['fact_topic']}: {raw.get('fact_topic') or ''}",
                     ]
-                elif group_key == "entity_claim":
+                elif group_key == "user_claim":
                     block_lines = [
                         f"{index}. {labels['claim']}",
                         f"   {labels['summary']}: {raw.get('summary') or entry.get('summary_for_retrieval') or ''}",
@@ -10005,27 +10426,6 @@ class MemoryNodeManager:
         topics.append(keywords[0])
         return list(dict.fromkeys(topics))[:3]
     
-    def _infer_fact_type(self, text: str, *, speaker: str) -> str:
-        lower = str(text or "").lower()
-        if any(word in lower for word in ("prefer", "favorite", "like", "dislike", "would rather")):
-            return "preference"
-        if any(word in lower for word in ("decided", "i'll", "i will", "plan to", "going to")):
-            return "decision" if speaker == "user" else "recommendation"
-        if any(word in lower for word in ("need to", "have to", "should", "todo", "pick up", "return")):
-            return "action"
-        if any(word in lower for word in ("recommend", "suggest", "consider", "try")):
-            return "recommendation"
-        if "?" in text:
-            return "request"
-        return "context"
-
-    @staticmethod
-    def _normalize_priority(value: Any) -> int:
-        try:
-            return max(0, min(100, int(round(float(value)))))
-        except (TypeError, ValueError):
-            return 70
-
     @staticmethod
     def _normalize_fact_type(value: Any) -> str:
         text = str(value or "context").strip().lower()
@@ -10207,7 +10607,7 @@ class MemoryNodeManager:
         seed_per_channel_limit = max(6, min(16, int(math.ceil(k * 1.5))))
         seed_limits = {
             "fact": seed_per_channel_limit,
-            "entity_claim": max(4, min(10, k)),
+            "user_claim": max(4, min(10, k)),
             "goal": max(4, min(8, k)),
             "plan": max(4, min(10, k)),
             "work_item": max(4, min(10, k)),
@@ -10220,8 +10620,6 @@ class MemoryNodeManager:
                 "stage2_lexical": dict(seed_limits),
                 "stage2_embedding": dict(seed_limits),
             },
-            # Applied to same-episode fact expansion.
-            "association_per_relation_limit": max(4, min(12, k)),
             "selected_limits": {
                 "fact": k,
             },

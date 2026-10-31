@@ -38,9 +38,9 @@ def _load_project_config() -> Dict[str, Any]:
 
         config_path = Path(__file__).resolve().parents[2] / "config.yaml"
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        manager_config = loaded.get("memory_manager")
-        if isinstance(manager_config, dict) and isinstance(manager_config.get("embedding"), dict):
-            return dict(manager_config["embedding"])
+        pwm_config = loaded.get("personal_world_model")
+        if isinstance(pwm_config, dict) and isinstance(pwm_config.get("embedding_model"), dict):
+            return dict(pwm_config["embedding_model"])
     except Exception:
         pass
     return {}
@@ -89,6 +89,11 @@ class EmbeddingClient:
     @property
     def dimension(self) -> int:
         return self._dim
+
+    @property
+    def batch_size(self) -> int:
+        """Maximum inputs in one provider-side embedding request."""
+        return self._batch_size
 
     def embed_text(self, text: str) -> Optional[np.ndarray]:
         if self._provider == "openai" and self._api_key:

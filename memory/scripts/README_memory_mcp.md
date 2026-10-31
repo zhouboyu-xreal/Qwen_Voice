@@ -1,7 +1,7 @@
 # Agent Memory MCP Server
 
 `memory_mcp_server.py` exposes the existing `MemoryRuntime` through the MCP
-stdio transport. The server owns one `SessionDB`, `MemoryNodeManager`, and
+stdio transport. The server owns one `UserMemoryDB`, `MemoryNodeManager`, and
 `MemoryRuntime` for its entire process lifetime.
 
 ## Start

@@ -20,13 +20,10 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory.memory_manager import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL,
-    MemoryOperationReporter,
-)
-from memory.memory_runtime import MemoryRuntime
-from memory.config import split_memory_config
+from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from task_scheduler import TaskOperationReporter
+from config import split_memory_config
+from pwm_manager import PersonWorldModel
 
 
 DEFAULT_TEXTGRID = (
@@ -61,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--textgrid", type=Path, default=DEFAULT_TEXTGRID)
     parser.add_argument("--output-root-dir", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--db-name", default="memory.db")
+    parser.add_argument("--db-name", default="user_memory.db")
     parser.add_argument(
         "--segment-limit",
         type=int,
@@ -86,11 +83,13 @@ def main() -> None:
     args = parse_args()
     config = load_project_config(args.config)
     (
+        llm_config,
+        embedding_config,
         memory_runtime_config,
+        task_scheduling_config,
         memory_manager_config,
+        user_state_config,
     ) = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
     if args.disable_llm:
         llm_config["llm_api_key"] = ""
     memory_input_config = memory_runtime_config.setdefault(
@@ -135,6 +134,7 @@ def main() -> None:
     segments = load_textgrid_segments(textgrid_path)
     if not segments:
         raise RuntimeError(f"No non-empty intervals found in TextGrid: {textgrid_path}")
+    segments = normalize_textgrid_speakers(segments)
     if args.segment_limit < 0:
         raise ValueError("--segment-limit must be greater than or equal to 0")
     source_segment_count = len(segments)
@@ -156,6 +156,10 @@ def main() -> None:
         args.log_level,
     )
     db_path = output_dir / args.db_name
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
     transcript_path = output_dir / "transcript.txt"
     report_path = output_dir / "report.json"
 
@@ -171,16 +175,19 @@ def main() -> None:
     llm_config["llm_api_key"] = args.llm_api_key or llm_config.get("llm_api_key") or ""
     llm_config["llm_api_key"] = expand_env_refs(llm_config["llm_api_key"])
 
-    operation_reporter = MemoryOperationReporter()
-    runtime = MemoryRuntime(
-        db_path=db_path,
+    operation_reporter = TaskOperationReporter()
+    pwm = PersonWorldModel(
         memory_runtime_config=memory_runtime_config,
         memory_manager_config=memory_manager_config,
+        user_state_config=user_state_config,
+        llm_model_config=llm_config,
+        embedding_model_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
         operation_reporter=operation_reporter,
         logger=memory_logger,
     )
 
-    input_report = runtime.accept_memory_input(
+    input_report = pwm.accept_memory_input(
         transcript_segments=memory_segments,
         tags=["Eval_Ali", textgrid_path.stem],
         ambient_recording_enabled=True,
@@ -192,42 +199,42 @@ def main() -> None:
             len(memory_segments),
         )
 
-    finalization = runtime.finalize_memory_session(
+    finalization = pwm.finalize_memory_session(
         reason="ali_eval_complete",
         tags=["Eval_Ali", textgrid_path.stem],
     )
     final_input_flush = dict(finalization.get("input_flush") or {})
-    episode_summary_result = dict(finalization.get("episode_summary_trigger") or {})
-    entity_claim_submit = dict(
-        (finalization.get("derived_tasks") or {}).get("entity_claim") or {}
-    )
-    future_commitment_submit = dict(
-        (finalization.get("derived_tasks") or {}).get("future_commitment") or {}
-    )
+    user_activity_result = dict(finalization.get("user_activity") or {})
     queued_memory_store_count += int(bool(final_input_flush.get("queued")))
 
-    if (
-        queued_memory_store_count
-        or episode_summary_result.get("queued")
-        or entity_claim_submit.get("queued")
-        or future_commitment_submit.get("queued")
-    ) and not runtime.wait_for_memory_tasks():
+    if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Timed out while draining queued memory tasks")
 
+    followup_dispatch_result = (
+        operation_reporter.latest_report("memory_flush_fact_followups") or {}
+    )
+    followup_tasks = followup_dispatch_result.get("fact_followup_tasks") or {}
     store_operation_report = operation_reporter.operation_report("memory_fact_extraction")
-    entity_claim_result = (
-        operation_reporter.latest_report("memory_entity_claim_update")
-        or entity_claim_submit
+    user_claim_result = (
+        operation_reporter.latest_report("memory_user_claim_update")
+        or followup_tasks.get("memory_user_claim_update") or {}
     )
-    future_commitment_result = (
-        operation_reporter.latest_report("memory_future_commitment_update")
-        or future_commitment_submit
+    user_intent_result = (
+        operation_reporter.latest_report("memory_user_intent_update")
+        or followup_tasks.get("memory_user_intent_update") or {}
     )
+    user_state_results = {
+        task_kind: operation_reporter.latest_report(task_kind)
+        for task_kind in (
+            "user_state_update_from_user_claims",
+            "user_state_update_from_user_threads",
+            "user_state_update_from_user_observed_patterns",
+        )
+    }
     logging.info(
-        "Transcript input complete segments=%s pending=%s queued_memory_stores=%s "
+        "Transcript input complete segments=%s queued_memory_stores=%s "
         "stored_memory_stores=%s",
         len(memory_segments),
-        len(runtime._memory_context_manager.pending_unit_snapshot()),
         queued_memory_store_count,
         store_operation_report["succeeded"],
     )
@@ -246,13 +253,14 @@ def main() -> None:
         "memory_operation_report": operation_reporter.snapshot(),
         "ambient_recording_enabled": True,
         "session_start": session_start.isoformat(),
-        "episode_summary_result": episode_summary_result,
-        "entity_claim_result": entity_claim_result,
-        "future_commitment_result": future_commitment_result,
+        "user_activity_result": user_activity_result,
+        "user_claim_result": user_claim_result,
+        "user_intent_result": user_intent_result,
+        "user_state_results": user_state_results,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)
-    runtime.close()
+    pwm.close()
     memory_logger.removeHandler(memory_log_handler)
     memory_log_handler.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -364,6 +372,31 @@ def load_textgrid_segments(textgrid_path: Path) -> List[TextGridSegment]:
         pending_start = None
         pending_end = None
     return sorted(segments, key=lambda item: (item.start_s, item.end_s, item.speaker))
+
+
+def normalize_textgrid_speakers(
+    segments: Sequence[TextGridSegment],
+) -> List[TextGridSegment]:
+    """Reserve the known wearer label and number the other TextGrid speakers."""
+    wearer_speaker = "N_SPK8013"
+    other_speakers = sorted({
+        segment.speaker for segment in segments
+        if segment.speaker != wearer_speaker
+    })
+    speaker_mapping = {wearer_speaker: "speaker_用户本人"}
+    speaker_mapping.update({
+        speaker: f"speaker_{index}"
+        for index, speaker in enumerate(other_speakers, 1)
+    })
+    return [
+        TextGridSegment(
+            speaker=speaker_mapping[segment.speaker],
+            start_s=segment.start_s,
+            end_s=segment.end_s,
+            text=segment.text,
+        )
+        for segment in segments
+    ]
 
 
 def unescape_text(value: str) -> str:

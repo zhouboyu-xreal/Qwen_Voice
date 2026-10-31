@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Exercise the qwen-audio-agent MemoryRuntime sidecar with CLongEval data.
+"""Exercise the qwen-audio-agent memory sidecar with CLongEval data.
 
-This is an integration runner, rather than a direct ``MemoryRuntime`` test.
+This is a JSONL sidecar integration runner, not a direct in-process PWM test.
 It writes each parsed CLongEval context through the JSONL protocol used by
 ``AgentMemoryProvider``::
 
     observe -> flush -> close -> restart -> recall
 
-Closing the first process is intentional: ``MemoryRuntime.close()`` drains its
-store/reflect task queues, so recall in the restarted process observes a
+Closing the first process is intentional: the sidecar drains its queued
+memory tasks, so recall in the restarted process observes a
 durable, deterministic database instead of racing asynchronous extraction.
 """
 

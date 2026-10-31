@@ -1,18 +1,22 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections import deque
+import logging
 import re
+from time import perf_counter
 from typing import Any, Deque, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .embedding_client import EmbeddingClient
+from embedding_client import EmbeddingClient
 from .memory_types import MemoryUnit
 from .utils import _as_embedding_vector, _cal_embedding_cosine_similarity, _sigmoid, _centroid, _cohesion
 from .memory_manager import (
     _compact_whitespace,
     _to_timestamp_text,
 )
+
+logger = logging.getLogger(__name__)
 
 INTERACTION_TOKEN_RE = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9_.$'-]+|[^\s]")
 
@@ -69,12 +73,10 @@ class FactExtractionWindowConfig:
     target_sealed_tokens: int = 1200
     max_sealed_chapters: int = 5
     max_sealed_tokens: int = 1800
-    preceding_context_max_units: int = 3
-    preceding_context_max_tokens: int = 400
 
 
 @dataclass
-class EpisodeSummaryConfig:
+class UserActivityConfig:
     max_duration_seconds: float = 1800.0
     max_tokens: int = 6000
     min_tokens_for_duration: int = 1000
@@ -85,13 +87,13 @@ class MemoryContextMangerConfig:
     fact_extraction: FactExtractionWindowConfig = field(
         default_factory=FactExtractionWindowConfig,
     )
-    episode_summary: EpisodeSummaryConfig = field(
-        default_factory=EpisodeSummaryConfig,
+    user_activity: UserActivityConfig = field(
+        default_factory=UserActivityConfig,
     )
 
 
 @dataclass
-class EpisodeSummaryBoundaryDecision:
+class UserActivityBoundaryDecision:
     should_trigger: bool = False
     reason: str = "append"
     accumulated_tokens: int = 0
@@ -135,7 +137,7 @@ def _estimate_interaction_token_count(text: str) -> int:
 def _unit_text_from_turn(turn: Dict[str, Any]) -> str:
     user_text = _compact_whitespace(turn.get("user_message") or "")
     assistant_text = _compact_whitespace(turn.get("assistant_response") or "")
-    return f"用户本人：{user_text}\n助手：{assistant_text}".strip()
+    return f"speaker_用户本人：{user_text}\nspeaker_助手：{assistant_text}".strip()
 
 def _clipped(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
@@ -203,12 +205,12 @@ def build_memory_context_manager_config(
     fact_extraction_trigger_config = memory_input_config.get("fact_extraction_trigger")
     if not isinstance(fact_extraction_trigger_config, dict):
         fact_extraction_trigger_config = {}
-    episode_summary_trigger_config = memory_input_config.get("episode_summary_trigger")
-    if not isinstance(episode_summary_trigger_config, dict):
-        episode_summary_trigger_config = {}
+    user_activity_trigger_config = memory_input_config.get("user_activity_trigger")
+    if not isinstance(user_activity_trigger_config, dict):
+        user_activity_trigger_config = {}
     return MemoryContextMangerConfig(
         fact_extraction=_build_fact_extraction_window_config(fact_extraction_trigger_config or {}),
-        episode_summary=_build_episode_summary_config(episode_summary_trigger_config or {}),
+        user_activity=_build_user_activity_config(user_activity_trigger_config or {}),
     )
 
 
@@ -238,14 +240,6 @@ def _build_fact_extraction_window_config(
     max_tokens = max(
         target_tokens,
         int(extraction_config.get("max_sealed_tokens", 1800)),
-    )
-    preceding_context_max_units = max(
-        0,
-        int(extraction_config.get("preceding_context_max_units", 3)),
-    )
-    preceding_context_max_tokens = max(
-        0,
-        int(extraction_config.get("preceding_context_max_tokens", 400)),
     )
     return FactExtractionWindowConfig(
         threshold=float(extraction_config.get("threshold", 0.60)),
@@ -306,27 +300,25 @@ def _build_fact_extraction_window_config(
         target_sealed_tokens=target_tokens,
         max_sealed_chapters=max_chapters,
         max_sealed_tokens=max_tokens,
-        preceding_context_max_units=preceding_context_max_units,
-        preceding_context_max_tokens=preceding_context_max_tokens,
     )
 
 
-def _build_episode_summary_config(
-    episode_summary_config: Dict[str, Any],
-) -> EpisodeSummaryConfig:
-    """Build episode-summary limits from episode-summary settings."""
-    return EpisodeSummaryConfig(
+def _build_user_activity_config(
+    user_activity_config: Dict[str, Any],
+) -> UserActivityConfig:
+    """Build limits for the longer user-activity observation window."""
+    return UserActivityConfig(
         max_duration_seconds=max(
             0.0,
-            float(episode_summary_config.get("max_duration_seconds", 1800.0)),
+            float(user_activity_config.get("max_duration_seconds", 1800.0)),
         ),
         max_tokens=max(
             0,
-            int(episode_summary_config.get("max_tokens", 6000)),
+            int(user_activity_config.get("max_tokens", 6000)),
         ),
         min_tokens_for_duration=max(
             0,
-            int(episode_summary_config.get("min_tokens_for_duration", 1000)),
+            int(user_activity_config.get("min_tokens_for_duration", 1000)),
         ),
     )
 
@@ -394,12 +386,12 @@ def convert_interaction_turn_to_online_unit(
     ended_ats: List[str] = []
     if user_message:
         texts.append(user_message)
-        speakers.append("用户本人")
+        speakers.append("speaker_用户本人")
         started_ats.append(user_started_at)
         ended_ats.append(user_ended_at)
     if assistant_response:
         texts.append(assistant_response)
-        speakers.append("助手")
+        speakers.append("speaker_助手")
         started_ats.append(assistant_started_at)
         ended_ats.append(assistant_ended_at)
     return MemoryUnit(
@@ -603,9 +595,9 @@ class MemoryContextManager:
         self._preceding_context_units: List[MemoryUnit] = []
         self._awaiting_ambient_unit_buffer: List[MemoryUnit] = []
         self._ambient_asr_watermark: Optional[datetime] = None
-        self._episode_started_at: Optional[datetime] = None
-        self._episode_latest_at: Optional[datetime] = None
-        self._episode_token_count = 0
+        self._user_activity_started_at: Optional[datetime] = None
+        self._user_activity_latest_at: Optional[datetime] = None
+        self._user_activity_token_count = 0
 
     def _insert_pending_unit(
         self,
@@ -647,9 +639,10 @@ class MemoryContextManager:
             return self._fact_task_decision_without_new_sealed_chapter(
                 chapter_boundary_decision,
             )
-        incoming_unit.embedding = _as_embedding_vector(
-            self.embedding_client.embed_text(incoming_unit.text),
-        )
+        if incoming_unit.embedding is None:
+            incoming_unit.embedding = _as_embedding_vector(
+                self.embedding_client.embed_text(incoming_unit.text),
+            )
         chapter_boundary_decision = self._evaluate_incoming_unit_for_chapter(
             incoming_unit,
         )
@@ -691,20 +684,49 @@ class MemoryContextManager:
         intentionally accepts the remaining ASR-delay risk rather than
         leaving an input unit unpersisted.
 
-        The iterator deliberately does not accumulate decisions. Its caller
-        can evaluate a newly sealed chapter while later waiting units are
-        still being embedded and scored.
+        Embed only one covered prefix of at most the client's batch_size at
+        a time, then yield decisions individually. The caller can submit and
+        clear sealed chapters before the next unit is evaluated. Unconsumed
+        units stay buffered, including their precomputed vectors.
         """
         while self._awaiting_ambient_unit_buffer:
-            unit = self._awaiting_ambient_unit_buffer[0]
-            if not force and not self._ambient_asr_covers_unit(unit):
+            batch_units: List[MemoryUnit] = []
+            for unit in self._awaiting_ambient_unit_buffer[:self.embedding_client.batch_size]:
+                if not force and not self._ambient_asr_covers_unit(unit):
+                    break
+                batch_units.append(unit)
+            if not batch_units:
                 break
-            self._awaiting_ambient_unit_buffer.pop(0)
-            decision = self.insert_incoming_unit(
-                unit,
-                ambient_recording_enabled=not force,
+            self._embed_memory_units_batch(batch_units)
+            for _ in batch_units:
+                unit = self._awaiting_ambient_unit_buffer.pop(0)
+                decision = self.insert_incoming_unit(
+                    unit,
+                    ambient_recording_enabled=not force,
+                )
+                yield unit, decision
+
+    def _embed_memory_units_batch(self, units: Sequence[MemoryUnit]) -> None:
+        """Precompute missing unit vectors; failed items retain single-call fallback."""
+        missing_units = [unit for unit in units if unit.embedding is None]
+        if not missing_units:
+            return
+        started_at = perf_counter()
+        vectors = self.embedding_client.embed_batch(unit.text for unit in missing_units)
+        for unit, vector in zip(missing_units, vectors):
+            unit.embedding = _as_embedding_vector(vector)
+        missing_count = sum(unit.embedding is None for unit in missing_units)
+        logger.info(
+            "memory input batch embedding units=%s requested=%s reused=%s "
+            "missing=%s elapsed_ms=%.3f",
+            len(units), len(missing_units), len(units) - len(missing_units),
+            missing_count, (perf_counter() - started_at) * 1000,
+        )
+        if missing_count:
+            logger.warning(
+                "memory input batch embedding missing=%s; using per-unit fallback",
+                missing_count,
             )
-            yield unit, decision
 
     def process_awaiting_ambient_units(
         self,
@@ -764,43 +786,20 @@ class MemoryContextManager:
         self._sealed_chapter_buffers.clear()
 
     def preceding_context_units_snapshot(self) -> List[MemoryUnit]:
-        """Return the prior fact task's bounded trailing task units."""
+        """Return the last complete chapter from the previous submitted batch."""
         return list(self._preceding_context_units)
 
     def record_preceding_context_units(
         self,
         units: Sequence[MemoryUnit],
     ) -> None:
-        """Replace the next task's auxiliary context with this batch's tail.
+        """Replace auxiliary context with all units of the submitted last chapter.
 
-        The context is deliberately non-accumulating: it provides only the
-        immediately preceding local discourse, rather than becoming a second
-        history buffer.  Units are selected from newest to oldest under both
-        configured bounds, then restored to chronological order.
+        The caller supplies only the last chapter after its batch is accepted.
+        Preserve its order and completeness without unit/token truncation or
+        accumulation across batches.
         """
-        config = self.config.fact_extraction
-        max_units = max(0, int(config.preceding_context_max_units))
-        max_tokens = max(0, int(config.preceding_context_max_tokens))
-        if max_units <= 0 or max_tokens <= 0:
-            self._preceding_context_units.clear()
-            return
-
-        selected_reversed: List[MemoryUnit] = []
-        selected_tokens = 0
-        for unit in reversed(list(units or [])):
-            if len(selected_reversed) >= max_units:
-                break
-            token_count = max(0, unit.token_count)
-            if selected_reversed and selected_tokens + token_count > max_tokens:
-                break
-            if not selected_reversed and token_count > max_tokens:
-                # Preserve one complete trailing unit rather than splitting a
-                # semantic unit solely to satisfy an approximate token count.
-                selected_reversed.append(unit)
-                break
-            selected_reversed.append(unit)
-            selected_tokens += token_count
-        self._preceding_context_units = list(reversed(selected_reversed))
+        self._preceding_context_units = list(units)
 
     def _sealed_buffer_statistics(self) -> Tuple[int, int]:
         """Return the current sealed chapter count and token count."""
@@ -864,55 +863,55 @@ class MemoryContextManager:
         self,
         units: Sequence[MemoryUnit],
     ) -> None:
-        """Record successfully queued task units in the episode window."""
+        """Record successfully queued fact units in the activity window."""
         for unit in units:
             token_count = max(0, unit.token_count)
             if token_count <= 0:
                 continue
             started_at = self._parse_timestamp(unit.start_time)
             ended_at = self._parse_timestamp(unit.end_time)
-            if self._episode_started_at is None and started_at is not None:
-                self._episode_started_at = started_at
+            if self._user_activity_started_at is None and started_at is not None:
+                self._user_activity_started_at = started_at
             latest_at = ended_at or started_at
             if latest_at is not None and (
-                self._episode_latest_at is None or latest_at > self._episode_latest_at
+                self._user_activity_latest_at is None or latest_at > self._user_activity_latest_at
             ):
-                self._episode_latest_at = latest_at
-            self._episode_token_count += token_count
+                self._user_activity_latest_at = latest_at
+            self._user_activity_token_count += token_count
 
-    def reset_episode_summary_window(self) -> None:
-        self._episode_started_at = None
-        self._episode_latest_at = None
-        self._episode_token_count = 0
+    def reset_user_activity_window(self) -> None:
+        self._user_activity_started_at = None
+        self._user_activity_latest_at = None
+        self._user_activity_token_count = 0
 
-    def has_pending_episode_summary_units(self) -> bool:
-        """Whether successfully queued fact units await episode summarization."""
-        return self._episode_token_count > 0
+    def has_pending_user_activity_units(self) -> bool:
+        """Whether successfully queued fact units await activity observation."""
+        return self._user_activity_token_count > 0
 
-    def evaluate_episode_summary_trigger_decision(self) -> EpisodeSummaryBoundaryDecision:
-        token_count = self._episode_token_count
+    def evaluate_user_activity_trigger_decision(self) -> UserActivityBoundaryDecision:
+        token_count = self._user_activity_token_count
         if token_count <= 0:
-            return EpisodeSummaryBoundaryDecision(accumulated_tokens=token_count)
+            return UserActivityBoundaryDecision(accumulated_tokens=token_count)
         if (
-            self.config.episode_summary.max_tokens > 0
-            and token_count >= self.config.episode_summary.max_tokens
+            self.config.user_activity.max_tokens > 0
+            and token_count >= self.config.user_activity.max_tokens
         ):
-            return EpisodeSummaryBoundaryDecision(True, "max_tokens", token_count)
-        if self._episode_started_at is None or self._episode_latest_at is None:
-            return EpisodeSummaryBoundaryDecision(False, "append", token_count)
+            return UserActivityBoundaryDecision(True, "max_tokens", token_count)
+        if self._user_activity_started_at is None or self._user_activity_latest_at is None:
+            return UserActivityBoundaryDecision(False, "append", token_count)
         elapsed_seconds = max(
             0.0,
-            (self._episode_latest_at - self._episode_started_at).total_seconds(),
+            (self._user_activity_latest_at - self._user_activity_started_at).total_seconds(),
         )
         if (
-            self.config.episode_summary.max_duration_seconds > 0
-            and elapsed_seconds >= self.config.episode_summary.max_duration_seconds
-            and token_count >= self.config.episode_summary.min_tokens_for_duration
+            self.config.user_activity.max_duration_seconds > 0
+            and elapsed_seconds >= self.config.user_activity.max_duration_seconds
+            and token_count >= self.config.user_activity.min_tokens_for_duration
         ):
-            return EpisodeSummaryBoundaryDecision(
+            return UserActivityBoundaryDecision(
                 True, "max_duration", token_count, elapsed_seconds,
             )
-        return EpisodeSummaryBoundaryDecision(False, "append", token_count, elapsed_seconds)
+        return UserActivityBoundaryDecision(False, "append", token_count, elapsed_seconds)
 
     def _evaluate_incoming_unit_for_chapter(
         self,

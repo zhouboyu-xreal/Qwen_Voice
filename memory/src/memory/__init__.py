@@ -2,16 +2,17 @@
 
 This package intentionally keeps the public names used by the voice_recording
 evaluation scripts, while the internal storage model is a single memory line:
-episodes -> facts -> states -> index entries.
+source units -> facts and user-activity observations -> indexed memory.
 """
 
-from .memory_database import SessionDB
-from .memory_manager import MemoryNodeManager, MemoryOperationReporter
+from .memory_database import UserMemoryDB
+from .memory_manager import MemoryNodeManager
+from task_scheduler import TaskOperationReporter
 from .memory_runtime import MemoryRuntime
 
 __all__ = [
     "MemoryNodeManager",
-    "MemoryOperationReporter",
+    "TaskOperationReporter",
     "MemoryRuntime",
-    "SessionDB",
+    "UserMemoryDB",
 ]

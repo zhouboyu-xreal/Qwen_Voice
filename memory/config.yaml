@@ -138,78 +138,17 @@ memory_mcp_server:
   log_level: INFO
   queue_timeout: 30.0
 
-memory_runtime:
-  memory_output_language_mode: zh
-  transcript_unit_aggregation:
-    segment_merge_max_gap_seconds: 1.0
-    min_transcript_unit_tokens: 40
-    max_transcript_unit_tokens: 120
-    max_transcript_unit_duration_seconds: 20.0
-    short_fragment_max_tokens: 8
-
-  memory_context_manager:
-    fact_extraction_trigger:
-      # Semantic boundaries close chapters. Fact extraction waits until
-      # multiple closed chapters provide a sufficiently complete context.
-      min_sealed_chapters: 2
-      target_sealed_tokens: 1200
-      max_sealed_chapters: 5
-      max_sealed_tokens: 1800
-      # Tail of the last accepted fact window, used only to resolve the
-      # following window's local discourse context.
-      preceding_context_max_units: 3
-      preceding_context_max_tokens: 400
-
-      max_pending_units: 40
-      max_pending_tokens: 1000
-      min_pending_units: 4
-      min_pending_tokens: 200
-      enforce_min_pending_tokens: true
-      max_time_gap_seconds: 60.0
-      min_boundary_scoring_incoming_tokens: 5
-      rolling_window_enabled: true
-      rolling_window_tail_units: 3
-
-      threshold: 0.6
-      bias: -1.1
-      surprise_history_window: 64
-      min_surprise_history: 5
-      robust_surprise_weight: 0.8
-      absolute_surprise_weight: 0.8
-      cohesion_drop_weight: 0.8
-      length_weight: 0.4
-    episode_summary_trigger:
-      max_duration_seconds: 1800.0
-      max_tokens: 6000
-      min_tokens_for_duration: 1000
-  derived_task_scheduling:
-    # Interaction batches remain more responsive than ambient input, but a
-    # derived task still needs multiple committed batches and signal-bearing
-    # facts. Signal counts themselves are diagnostic only: one fact may emit
-    # several signals in a single extraction result.
-    entity_claim_min_signal_batches: 4
-    entity_claim_min_signal_facts: 8
-    interaction_entity_claim_min_signal_batches: 3
-    interaction_entity_claim_min_signal_facts: 5
-    future_commitment_min_signal_batches: 4
-    future_commitment_min_signal_facts: 5
-    interaction_future_commitment_min_signal_batches: 3
-    interaction_future_commitment_min_signal_facts: 3
-  log_segmentation_decisions: true
-
-memory_manager:
-  memory_enabled: true
-  enable_memory_entity_claim_update: true
-  enable_memory_future_commitment_update: true
-  llm:
+personal_world_model:
+  llm_model:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash
     llm_base_url: https://api.deepseek.com
     llm_api_key: ${DEEPSEEK_API_KEY}
     llm_timeout: 120
+    llm_max_tokens: 8192
     llm_thinking: disabled
     llm_json_mode: true
-  embedding:
+  embedding_model:
     enabled: true
     provider: openai
     model: embedding-3
@@ -219,42 +158,127 @@ memory_manager:
     dimensions: 2048
     normalize: true
     batch_size: 32
+  memory_runtime:
+    transcript_unit_aggregation:
+      segment_merge_max_gap_seconds: 1.0
+      min_transcript_unit_tokens: 40
+      max_transcript_unit_tokens: 120
+      max_transcript_unit_duration_seconds: 20.0
+      short_fragment_max_tokens: 8
 
-  task_queue_maxsize: 100
+    memory_context_manager:
+      fact_extraction_trigger:
+        # Semantic boundaries close chapters. Fact extraction waits until
+        # multiple closed chapters provide a sufficiently complete context.
+        # Coalesce multiple chapters into a larger fact evidence window.
+        min_sealed_chapters: 2
+        target_sealed_tokens: 2000
+        max_sealed_chapters: 8
+        max_sealed_tokens: 3200
+        max_pending_units: 40
+        max_pending_tokens: 1000
+        min_pending_units: 4
+        min_pending_tokens: 400
+        enforce_min_pending_tokens: true
+        max_time_gap_seconds: 60.0
+        min_boundary_scoring_incoming_tokens: 5
+        rolling_window_enabled: true
+        rolling_window_tail_units: 3
 
-  entity_claim_limit: 100
-  future_commitment_limit: 100
-  entity_claim_explicit_min_confidence: 0.72
-  entity_claim_derived_min_confidence: 0.75
-  entity_claim_signal_max_per_fact: 3
-  entity_claim_induction_min_support_facts: 3
-  entity_claim_induction_min_episodes: 3
-  entity_claim_induction_min_time_windows: 2
-  entity_claim_induction_evidence_limit: 16
+        threshold: 0.6
+        bias: -1.1
+        surprise_history_window: 64
+        min_surprise_history: 5
+        robust_surprise_weight: 0.8
+        absolute_surprise_weight: 0.8
+        cohesion_drop_weight: 0.8
+        length_weight: 0.4
+      user_activity_trigger:
+        max_duration_seconds: 1800.0
+        max_tokens: 6000
+        min_tokens_for_duration: 1000
   
-  recall:  
-    recall_top_k: 8
-    recall_budget: mid
-    recall_mode: normal
-    recall_detailed_logging: true
-    recall_stage1:
-      recall_stage1_entity_matched_score: 0.30
-      recall_stage1_topic_overlap_score_weight: 0.54
-      recall_stage1_keyword_overlap_score_weight: 0.12
-      recall_stage1_time_score_weight: 0.12
-      recall_stage1_contextual_time_score_multiplier: 2.0
-      recall_stage1_actionable_min_importance: 0.75
-      recall_stage1_evidence_profile_min_term_coverage: 0.5
-    recall_stage2:
-      recall_stage2_fact_min_embedding_similarity: 0.30
-      recall_stage2_state_min_embedding_similarity: 0.25
-      recall_stage2_fact_strong_embedding_similarity: 0.45
-      recall_stage2_state_strong_embedding_similarity: 0.40
-      recall_stage2_strong_topic_pair_score: 0.90
-      recall_stage2_keyword_match_score_weight: 0.12
-      recall_stage2_bm25_score_weight: 0.2
-      recall_stage2_entity_matched_score: 0.20
-      recall_stage2_time_score_weight: 0.12
-      recall_stage2_contextual_time_score_multiplier: 2.0
-    recall_fact_time_score_half_life_seconds: 604800
-    recall_persistent_state_time_score_half_life_seconds: 7776000
+  task_scheduling:
+    task_queue_maxsize: 100
+    enable_user_prediction: true
+    enable_user_proactive_policy_evaluation: true
+    # Forecast behavior within this horizon; do not gate on intent deadlines.
+    user_prediction_horizon_hours: 6
+    enable_memory_user_claim_update: true
+    enable_memory_user_observed_pattern_update: true
+    enable_memory_user_intent_update: true
+    enable_memory_user_thread_update: true
+    enable_memory_user_state_update: true
+    # Interaction batches remain more responsive than ambient input, but a
+    # fact follow-up task still needs multiple committed batches and signal-bearing
+    # facts. Signal counts themselves are diagnostic only: one fact may emit
+    # several signals in a single extraction result.
+    user_claim_min_signal_batches: 4
+    user_claim_min_signal_facts: 8
+    interaction_user_claim_min_signal_batches: 3
+    interaction_user_claim_min_signal_facts: 5
+    user_intent_min_signal_batches: 4
+    user_intent_min_signal_facts: 5
+    interaction_user_intent_min_signal_batches: 3
+    interaction_user_intent_min_signal_facts: 3
+    # Action signals are grouped into independent occurrences only when this
+    # separate observed-pattern follow-up task runs.
+    user_action_min_signal_batches: 4
+    user_action_min_signal_facts: 8
+    interaction_user_action_min_signal_batches: 3
+    interaction_user_action_min_signal_facts: 5
+    # Claim-to-state projection is evaluated every 30 minutes. Distinct changed
+    # claims carry over between windows; low-volume changes flush after 2 hours.
+    user_state_claim_window_seconds: 1800
+    user_state_claim_min_changed_claims: 3
+    user_state_claim_max_wait_seconds: 7200
+    user_state_claim_batch_limit: 80
+
+  memory_manager:
+    memory_enabled: true
+    memory_prompt_language_mode: zh
+    user_memory_database_path: 
+    user_claim_signal_batch_size: 8
+    user_intent_signal_batch_size: 8
+    # Activities are batched for membership judgment, then matter updates.
+    user_thread_activity_batch_size: 8
+    user_thread_candidate_limit: 12
+    user_thread_event_context_limit: 16
+    user_claim_explicit_min_confidence: 0.72
+    user_claim_derived_min_confidence: 0.75
+    user_claim_signal_max_per_fact: 3
+    user_observed_pattern_min_support_signals: 3
+    user_observed_pattern_signal_limit: 32
+
+    recall:  
+      recall_top_k: 8
+      recall_budget: mid
+      recall_mode: normal
+      recall_detailed_logging: true
+      recall_stage1:
+        recall_stage1_entity_matched_score: 0.30
+        recall_stage1_topic_overlap_score_weight: 0.54
+        recall_stage1_keyword_overlap_score_weight: 0.12
+        recall_stage1_time_score_weight: 0.12
+        recall_stage1_contextual_time_score_multiplier: 2.0
+        recall_stage1_actionable_min_importance: 0.75
+        recall_stage1_evidence_profile_min_term_coverage: 0.5
+      recall_stage2:
+        recall_stage2_fact_min_embedding_similarity: 0.30
+        recall_stage2_state_min_embedding_similarity: 0.25
+        recall_stage2_fact_strong_embedding_similarity: 0.45
+        recall_stage2_state_strong_embedding_similarity: 0.40
+        recall_stage2_strong_topic_pair_score: 0.90
+        recall_stage2_keyword_match_score_weight: 0.12
+        recall_stage2_bm25_score_weight: 0.2
+        recall_stage2_entity_matched_score: 0.20
+        recall_stage2_time_score_weight: 0.12
+        recall_stage2_contextual_time_score_multiplier: 2.0
+      recall_fact_time_score_half_life_seconds: 604800
+      recall_persistent_state_time_score_half_life_seconds: 7776000
+
+  user_state:
+    user_model_database_path: 
+    user_state_update_limit: 80
+    prompt_language_mode: zh
+

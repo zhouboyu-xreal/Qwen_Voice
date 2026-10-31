@@ -25,7 +25,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.config import split_memory_config
+from config import load_voice_runtime_config
 from voice.prewake_context import PreWakeContextRuntime, format_prewake_context_prompt
 
 
@@ -193,10 +193,7 @@ def main() -> int:
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     config = _load_config(args.config.expanduser().resolve())
-    _runtime_config, _manager_config, voice_config = split_memory_config(
-        config,
-        include_voice_runtime=True,
-    )
+    voice_config = load_voice_runtime_config(config)
     service = PreWakeContextService(voice_config, logger)
     logger.info("prewake sidecar started config=%s log_path=%s", args.config, log_path)
     methods = {

@@ -2,7 +2,7 @@
 """Run project memory retrieval on LongMemEval and emit evaluator JSONL.
 
 This script builds an isolated memory DB per benchmark instance, replays the
-timestamped history into ``MemoryNodeManager``, runs reflection, recalls memory
+timestamped history through ``PersonWorldModel``, completes follow-up tasks, recalls memory
 for the benchmark question, and uses a reader LLM to produce a final
 ``hypothesis`` answer.
 
@@ -34,13 +34,10 @@ for import_root in (SRC_ROOT, REPO_ROOT):
     if str(import_root) not in sys.path:
         sys.path.insert(0, str(import_root))
 
-from memory.memory_manager import (
-    DEFAULT_LLM_BASE_URL,
-    DEFAULT_LLM_MODEL,
-    MemoryOperationReporter,
-)
-from memory.memory_runtime import MemoryRuntime
-from memory.config import split_memory_config
+from llm_client import DEFAULT_LLM_BASE_URL, DEFAULT_LLM_MODEL
+from task_scheduler import TaskOperationReporter
+from pwm_manager import PersonWorldModel
+from config import split_memory_config
 from memory.utils import _as_embedding_vector
 import memory.memory_database as memory_database_module
 
@@ -146,12 +143,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Language used for MemoryNodeManager prompt instructions.",
     )
-    parser.add_argument(
-        "--memory-output-language",
-        choices=("source", "en", "zh"),
-        default=None,
-        help="Language used for generated memory free-text fields.",
-    )
     parser.add_argument("--reader-model")
     parser.add_argument("--reader-base-url")
     parser.add_argument("--reader-api-key")
@@ -167,7 +158,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--recall-top-k",
         type=int,
-        default=8,
+        default=None,
         help="Top-k passed to the memory runtime recall.",
     )
     parser.add_argument(
@@ -178,7 +169,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--recall-mode",
-        default="normal",
+        default=None,
         choices=["stage1", "stage2", "normal"],
         help="Recall path passed to the memory runtime.",
     )
@@ -192,29 +183,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--enable-reflect",
-        action="store_true",
-        help='Enable reflect',
-    )
-    parser.add_argument(
         "--enable-feedback-analysis",
         action="store_true",
         help=(
             "Enable interpretation-feedback analysis and related recall-event "
             "tracking inside MemoryNodeManager during benchmark replay/recall."
         ),
-    )
-    parser.add_argument(
-        "--reflect-every-sessions",
-        type=int,
-        default=1,
-        help="Run reflect after every N replayed sessions. Default: 1.",
-    )
-    parser.add_argument(
-        "--reflect-limit",
-        type=int,
-        default=100,
-        help="Limit passed to memory reflection.",
     )
     parser.add_argument(
         "--fact-extraction-interval",
@@ -300,8 +274,7 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    runtime_config, manager_config = split_memory_config(config)
-    llm_config = manager_config["llm"]
+    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config = split_memory_config(config)
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
@@ -343,18 +316,18 @@ def resolve_llm_args(args: argparse.Namespace) -> None:
             or "source"
         )
     )
-    args.memory_output_language = (
-        args.memory_output_language
-        or str(
-            runtime_config.get("memory_output_language_mode")
-            or manager_config.get("memory_output_language_mode")
-            or manager_config.get("output_language_mode")
-            or "source"
-        )
-    )
+    recall_config = manager_config.get("recall")
+    if not isinstance(recall_config, dict):
+        recall_config = {}
     args.recall_budget = (
         args.recall_budget
-        or str(manager_config.get("recall_budget") or "mid")
+        or str(recall_config.get("recall_budget") or "mid")
+    )
+    args.recall_top_k = args.recall_top_k or int(
+        recall_config.get("recall_top_k") or 8
+    )
+    args.recall_mode = args.recall_mode or str(
+        recall_config.get("recall_mode") or "normal"
     )
 
     args.reader_model = (
@@ -652,11 +625,19 @@ def session_turn_pairs(session: Sequence[Dict[str, Any]]) -> Tuple[List[Tuple[st
 
 def prepare_runtime_configs(
     args: argparse.Namespace,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    memory_runtime_config, memory_manager_config = split_memory_config(config)
-    llm_config = memory_manager_config["llm"]
-    embedding_config = memory_manager_config["embedding"]
+    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
+    recall_config = memory_manager_config.setdefault("recall", {})
+    recall_config["recall_top_k"] = int(
+        args.recall_top_k or recall_config.get("recall_top_k") or 8
+    )
+    recall_config["recall_budget"] = str(
+        args.recall_budget or recall_config.get("recall_budget") or "mid"
+    )
+    recall_config["recall_mode"] = str(
+        args.recall_mode or recall_config.get("recall_mode") or "normal"
+    )
     memory_input_config = memory_runtime_config.setdefault(
         "memory_context_manager",
         {},
@@ -694,12 +675,17 @@ def prepare_runtime_configs(
     llm_config["llm_thinking"] = str(args.llm_thinking)
     llm_config["llm_json_mode"] = bool(args.llm_json_mode)
     memory_manager_config["memory_prompt_language_mode"] = str(args.memory_prompt_language)
-    memory_manager_config["memory_output_language_mode"] = str(args.memory_output_language)
-    memory_runtime_config["memory_output_language_mode"] = str(args.memory_output_language)
     memory_manager_config["enable_interpretation_feedback"] = bool(
         args.enable_feedback_analysis
     )
-    return memory_runtime_config, memory_manager_config, llm_config, embedding_config
+    return (
+        memory_runtime_config,
+        memory_manager_config,
+        llm_config,
+        embedding_config,
+        task_scheduling_config,
+        user_state_config,
+    )
 
 
 def validate_runtime(manager: Any) -> None:
@@ -770,7 +756,7 @@ def validate_runtime(manager: Any) -> None:
 
 def db_counts(db: Any) -> Dict[str, int]:
     tables = {
-        "episodes": "memory_episodes",
+        "user_activities": "memory_user_activity_items",
         "facts": "memory_facts",
         "entities": "memory_entity_nodes",
     }
@@ -1058,12 +1044,9 @@ def answer_question_with_reader(
 
 def replay_sessions_into_memory(
     *,
-    runtime: MemoryRuntime,
+    pwm: PersonWorldModel,
     item: Dict[str, Any],
     sessions: Sequence[Tuple[str, datetime, List[Dict[str, Any]], int]],
-    enable_reflect: bool,
-    reflect_every_sessions: int,
-    reflect_limit: int,
 ) -> SessionReplayStats:
     seen_timestamps: set[str] = set()
     turn_pairs_total = 0
@@ -1081,9 +1064,12 @@ def replay_sessions_into_memory(
                 session_dt + timedelta(seconds=pair_index),
                 seen_keys=seen_timestamps,
             )
-            runtime.accept_single_interaction_turn(
-                user_message,
-                assistant_response,
+            pwm.accept_memory_input(
+                interaction_turn={
+                    "user_message": user_message,
+                    "assistant_response": assistant_response,
+                    "turn_timestamp": turn_dt,
+                },
                 tags=[
                     "longmemeval",
                     f"question_type:{item.get('question_type')}",
@@ -1091,43 +1077,13 @@ def replay_sessions_into_memory(
                     f"session_id:{session_id}",
                     f"session_index:{session_position}",
                 ],
-                turn_timestamp=turn_dt,
             )
-
-        if enable_reflect and session_position % reflect_every_sessions == 0:
-            reflect_ts = normalize_unique_timestamp(
-                session_dt + timedelta(seconds=max(len(pairs), 1)),
-                seen_keys=seen_timestamps,
-            )
-            reflect_submit = runtime.trigger_memory_reflect(
-                limit=reflect_limit,
-                reflect_timestamp=reflect_ts,
-            )
-            if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
-                raise RuntimeError("Timed out while draining queued memory reflect")
-    
-    if enable_reflect and sessions:
-        final_ts = normalize_unique_timestamp(
-            sessions[-1][1] + timedelta(seconds=3599),
-            seen_keys=seen_timestamps,
-        )
-        reflect_submit = runtime.trigger_memory_reflect(
-            limit=reflect_limit,
-            reflect_timestamp=final_ts,
-        )
-        if reflect_submit.get("queued") and not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining queued memory reflect")
-    
-    if runtime.has_pending_interaction_turns():
-        pending_before_flush = len(runtime.get_pending_interaction_turns())
-        if not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining queued memory stores")
-        if runtime.has_pending_interaction_turns():
-            logging.warning(
-                "Replay finished with %s pending turns still buffered. "
-                "The final batch could not be force-stored.",
-                pending_before_flush,
-            )
+    pwm.finalize_memory_session(
+        reason="longmemeval_history_complete",
+        tags=["longmemeval", f"question_id:{item.get('question_id')}"],
+    )
+    if not pwm.wait_for_memory_tasks():
+        raise RuntimeError("Timed out while draining queued memory tasks")
 
     return SessionReplayStats(
         turn_pairs_total=turn_pairs_total,
@@ -1145,6 +1101,8 @@ def build_instance_memory_context(
     memory_manager_config: Dict[str, Any],
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
+    task_scheduling_config: Dict[str, Any],
+    user_state_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     question_id = str(item.get("question_id") or "unknown_question")
     question = str(item.get("question") or "").strip()
@@ -1155,18 +1113,25 @@ def build_instance_memory_context(
     question_state_dir = args.state_dir / question_id
     question_state_dir.mkdir(parents=True, exist_ok=True)
     db_path = question_state_dir / "memory.db"
+    memory_manager_config["user_memory_database_path"] = str(db_path)
+    user_state_config["user_model_database_path"] = str(
+        db_path.with_name("user_model.db")
+    )
 
-    runtime: Optional[MemoryRuntime] = None
+    pwm: Optional[PersonWorldModel] = None
     try:
-        operation_reporter = MemoryOperationReporter()
-        runtime = MemoryRuntime(
-            db_path=db_path,
+        operation_reporter = TaskOperationReporter()
+        pwm = PersonWorldModel(
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
+            user_state_config=user_state_config,
+            llm_model_config=llm_config,
+            embedding_model_config=embedding_config,
+            task_scheduling_config=task_scheduling_config,
             operation_reporter=operation_reporter,
         )
-        db = runtime.database
-        manager = runtime.manager
+        db = pwm.database
+        manager = pwm.memory_manager
         validate_runtime(manager)
 
         all_sessions = sorted_history_sessions(item)
@@ -1179,30 +1144,39 @@ def build_instance_memory_context(
         if int(args.max_sessions) > 0:
             sessions = sessions[: int(args.max_sessions)]
         replay_stats = replay_sessions_into_memory(
-            runtime=runtime,
+            pwm=pwm,
             item=item,
             sessions=sessions,
-            enable_reflect=args.enable_reflect,
-            reflect_every_sessions=max(1, int(args.reflect_every_sessions)),
-            reflect_limit=int(args.reflect_limit),
         )
-        if not runtime.flush_pending_memory_inputs():
-            raise RuntimeError("Timed out while draining queued memory stores")
+        if not pwm.wait_for_memory_tasks():
+            raise RuntimeError("Timed out while draining queued memory tasks")
         memory_operation_report = operation_reporter.snapshot()
         operation_counts = memory_operation_report.get("counts") or {}
         store_operation_report = operation_counts.get("memory_fact_extraction") or {}
-        reflect_operation_report = operation_counts.get("memory_reflect") or {}
+        post_store_reports = [
+            operation_counts.get(kind) or {}
+            for kind in (
+                "memory_user_claim_update",
+                "memory_user_intent_update",
+                "user_state_update_from_user_claims",
+                "user_state_update_from_user_threads",
+                "user_state_update_from_user_observed_patterns",
+            )
+        ]
         replay_stats = SessionReplayStats(
             turn_pairs_total=replay_stats.turn_pairs_total,
             stored_pairs=int(store_operation_report.get("succeeded") or 0),
             skipped_assistant_only=replay_stats.skipped_assistant_only,
             orphan_user_chunks=replay_stats.orphan_user_chunks,
         )
-        reflect_runs = int(reflect_operation_report.get("submitted") or 0)
+        post_store_task_runs = sum(int(report.get("submitted") or 0) for report in post_store_reports)
+        post_store_total_elapsed_ms = sum(
+            float(report.get("total_elapsed_ms") or 0.0) for report in post_store_reports
+        )
         effective_question_dt = effective_question_datetime(question_dt, sessions)
         effective_question_date_text = format_memory_time(effective_question_dt)
         counts = db_counts(db)
-        recall_report = runtime.trigger_memory_recall(
+        recall_report = pwm.trigger_memory_recall(
             question,
             time_end=effective_question_date_text,
         )
@@ -1227,7 +1201,7 @@ def build_instance_memory_context(
             "turn_pairs_with_stored_facts": replay_stats.stored_pairs,
             "skipped_assistant_only_turns": replay_stats.skipped_assistant_only,
             "orphan_user_chunks": replay_stats.orphan_user_chunks,
-            "reflect_runs": reflect_runs,
+            "post_store_task_runs": post_store_task_runs,
             "db_path": str(db_path),
             "db_counts": counts,
             "recall_context_chars": len(memory_context or ""),
@@ -1236,19 +1210,19 @@ def build_instance_memory_context(
             "actual_recall_mode": recall_report.get("actual_recall_mode", "unknown"),
             "recall_status": recall_report.get("status", "empty"),
             "store_total_elapsed_ms": float(store_operation_report.get("total_elapsed_ms") or 0.0),
-            "reflect_total_elapsed_ms": float(reflect_operation_report.get("total_elapsed_ms") or 0.0),
+            "post_store_total_elapsed_ms": post_store_total_elapsed_ms,
             "recall_total_elapsed_ms": float(recall_operation_report.get("total_elapsed_ms") or 0.0),
             "memory_total_elapsed_ms": round(
                 float(store_operation_report.get("total_elapsed_ms") or 0.0)
-                + float(reflect_operation_report.get("total_elapsed_ms") or 0.0)
+                + post_store_total_elapsed_ms
                 + float(recall_operation_report.get("total_elapsed_ms") or 0.0),
                 2,
             ),
             "memory_operation_report": memory_operation_report,
         }
     finally:
-        if runtime is not None:
-            runtime.close()
+        if pwm is not None:
+            pwm.close()
 
 
 def answer_instance_from_memory_context(
@@ -1275,6 +1249,8 @@ def run_instance(
     memory_manager_config: Dict[str, Any],
     llm_config: Dict[str, Any],
     embedding_config: Dict[str, Any],
+    task_scheduling_config: Dict[str, Any],
+    user_state_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     memory_result = build_instance_memory_context(
         args=args,
@@ -1283,6 +1259,8 @@ def run_instance(
         memory_manager_config=memory_manager_config,
         llm_config=llm_config,
         embedding_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
+        user_state_config=user_state_config,
     )
     return answer_instance_from_memory_context(args=args, result=memory_result)
 
@@ -1293,6 +1271,8 @@ def run_instance_memory_context_worker(
         int,
         Dict[str, Any],
         argparse.Namespace,
+        Dict[str, Any],
+        Dict[str, Any],
         Dict[str, Any],
         Dict[str, Any],
         Dict[str, Any],
@@ -1308,6 +1288,8 @@ def run_instance_memory_context_worker(
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
+        user_state_config,
     ) = payload
     question_id = str(item.get("question_id") or f"item_{index}")
     question_state_dir = args.state_dir / question_id
@@ -1332,14 +1314,16 @@ def run_instance_memory_context_worker(
         memory_manager_config=memory_manager_config,
         llm_config=llm_config,
         embedding_config=embedding_config,
+        task_scheduling_config=task_scheduling_config,
+        user_state_config=user_state_config,
     )
     logging.info(
-        "[%s/%s] Finished %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s recall_chars=%s",
+        "[%s/%s] Finished %s: sessions=%s user_activities=%s facts=%s states=%s actionable_items=%s recall_chars=%s",
         index,
         total,
         question_id,
         result["history_session_count"],
-        result["db_counts"]["episodes"],
+        result["db_counts"]["user_activities"],
         result["db_counts"]["facts"],
         result["db_counts"]["states"],
         result["db_counts"]["actionable_items"],
@@ -1463,7 +1447,6 @@ def main() -> int:
             "instances_failed": 0,
             "resume": bool(args.resume),
             "memory_prompt_language": args.memory_prompt_language,
-            "memory_output_language": args.memory_output_language,
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
@@ -1473,6 +1456,8 @@ def main() -> int:
         memory_manager_config,
         llm_config,
         embedding_config,
+        task_scheduling_config,
+        user_state_config,
     ) = prepare_runtime_configs(args)
     success_count = 0
     failure_count = 0
@@ -1496,6 +1481,8 @@ def main() -> int:
                 memory_manager_config,
                 llm_config,
                 embedding_config,
+                task_scheduling_config,
+                user_state_config,
             )
             for index, item in enumerate(selected, 1)
         ]
@@ -1548,15 +1535,17 @@ def main() -> int:
                     memory_manager_config=memory_manager_config,
                     llm_config=llm_config,
                     embedding_config=embedding_config,
+                    task_scheduling_config=task_scheduling_config,
+                    user_state_config=user_state_config,
                 )
                 result = memory_results_by_index[index]
                 logging.info(
-                    "[%s/%s] Memory context ready for %s: sessions=%s episodes=%s facts=%s states=%s actionable_items=%s recall_chars=%s",
+                    "[%s/%s] Memory context ready for %s: sessions=%s user_activities=%s facts=%s states=%s actionable_items=%s recall_chars=%s",
                     index,
                     len(selected),
                     question_id,
                     result["history_session_count"],
-                    result["db_counts"]["episodes"],
+                    result["db_counts"]["user_activities"],
                     result["db_counts"]["facts"],
                     result["db_counts"]["states"],
                     result["db_counts"]["actionable_items"],
@@ -1646,12 +1635,10 @@ def main() -> int:
         "llm_thinking": args.llm_thinking,
         "llm_json_mode": args.llm_json_mode,
         "memory_prompt_language": args.memory_prompt_language,
-        "memory_output_language": args.memory_output_language,
         "workers": workers,
         "recall_top_k": args.recall_top_k,
         "recall_budget": args.recall_budget,
         "feedback_analysis_enabled": args.enable_feedback_analysis,
-        "reflect_every_sessions": args.reflect_every_sessions,
         "sessions_after_answer": args.sessions_after_answer,
         "fact_extraction_interval": args.fact_extraction_interval,
     }

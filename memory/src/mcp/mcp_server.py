@@ -19,7 +19,7 @@ SRC_ROOT = REPO_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from memory.memory_runtime import MemoryRuntime
+from pwm_manager import PersonWorldModel
 from voice.voice_runtime import VoiceRuntime
 
 
@@ -90,7 +90,7 @@ class MemoryMCPService:
 
     def __init__(
         self,
-        memory_runtime: MemoryRuntime,
+        person_world_model: PersonWorldModel,
         voice_runtime: Optional["VoiceRuntime"] = None,
         *,
         voice_runtime_factory: Optional[Callable[[], "VoiceRuntime"]] = None,
@@ -98,7 +98,7 @@ class MemoryMCPService:
         asr_result_dir: Optional[Path | str] = None,
         logger: Optional[logging.Logger] = None,
     ) -> None:
-        self.memory_runtime = memory_runtime
+        self.person_world_model = person_world_model
         self.voice_runtime = voice_runtime
         self._voice_runtime_factory = voice_runtime_factory
         self._voice_runtime_lock = threading.Lock()
@@ -153,20 +153,22 @@ class MemoryMCPService:
         store_reports: List[Dict[str, Any]] = []
         if segments:
             store_reports.append(
-                self.memory_runtime.accept_memory_input(
+                self.person_world_model.accept_memory_input(
                     transcript_segments=segments,
                     tags=tags,
                     ambient_recording_enabled=(source == "allday_recording"),
                 )
             )
 
-        queue_flushed = self.memory_runtime.flush_pending_memory_inputs(
-            timeout=self.queue_timeout,
+        flush_report = self.person_world_model.finalize_memory_session(
+            reason=f"mcp_audio_file_complete:{source}",
+            tags=tags,
         )
+        queue_flushed = bool(flush_report.get("accepted"))
 
         queued_count = sum(bool(report.get("queued")) for report in store_reports)
         report = {
-            "status": "ok" if queue_flushed else "queue_flush_timeout",
+            "status": "ok" if queue_flushed else "queue_flush_rejected",
             "source_type": source,
             "session_start": resolved_session_start,
             "audio": {
@@ -180,6 +182,7 @@ class MemoryMCPService:
             "store_queue_event_count": queued_count,
             "store_reports": store_reports,
             "store_queue_flushed": queue_flushed,
+            "input_flush_report": flush_report,
         }
         return _json_compatible(report)
 
@@ -270,7 +273,7 @@ class MemoryMCPService:
         """Process multiple files sequentially using the single-file workflow.
 
         Each file independently runs ``process_audio_file``. This preserves the
-        existing per-file MemoryRuntime flush and reflect behavior while keeping
+        existing per-file PersonWorldModel finalization behavior while keeping
         the voice models resident for the duration of the batch.
         """
         files = self._normalize_audio_file_specs(files)
@@ -511,7 +514,7 @@ class MemoryMCPService:
         """Run immediate recall and return memory context plus metadata."""
         if not str(query or "").strip():
             raise ValueError("query must be non-empty")
-        report = self.memory_runtime.trigger_memory_recall(
+        report = self.person_world_model.trigger_memory_recall(
             str(query),
             tags=tags,
             time_end=time_end,
@@ -528,7 +531,7 @@ class MemoryMCPService:
         if worker is not None and worker.is_alive():
             worker.join()
         try:
-            self.memory_runtime.close(timeout=self.queue_timeout)
+            self.person_world_model.close(timeout=self.queue_timeout)
         finally:
             close_voice = getattr(self.voice_runtime, "close", None)
             if callable(close_voice):
