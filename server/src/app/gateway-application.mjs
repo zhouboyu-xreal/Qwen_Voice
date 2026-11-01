@@ -1,3 +1,4 @@
+import { registerMemoryInspectionRoutes } from '../conversation/memory/inspection-api.mjs'
 import express from 'express'
 import { PERMISSION_DECISIONS } from '../core/work-authorization.mjs'
 import { createServer } from 'http'
@@ -787,6 +788,8 @@ app.get('/api/health', (req, res) => {
 // Provider-neutral memory control plane for replaceable Conversation Clients.
 // It exposes the same bounded documents used by Realtime without leaking the
 // Markdown default or any injected provider's persistence details.
+registerMemoryInspectionRoutes(app, { memory: frontendMemoryRuntime })
+
 app.get('/api/memory', (req, res, next) => {
   if (!frontendMemoryRuntime) {
     return res.status(404).json({ error: 'frontend memory is not configured' })

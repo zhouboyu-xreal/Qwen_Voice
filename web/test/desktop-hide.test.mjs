@@ -3,7 +3,6 @@ import test from 'node:test'
 import {
   applyDesktopClientState,
   desktopAutoHideSeconds,
-  desktopCanFinishWaking,
   desktopCanHide,
   DESKTOP_WAKE_GRACE_MS,
   desktopHideDeadline,
@@ -48,7 +47,7 @@ test('distinguishes active tasks from tasks waiting for authorization', () => {
 })
 
 test('ignores stale sleeping broadcasts right after an explicit wake', async () => {
-  const bridge = { enterHide: async () => ({ state: 'hidden' }) }
+  const bridge = { enterHide: async () => ({ state: 'sleeping' }) }
   const event = { type: 'client.state', state: 'sleeping' }
   const wakeAt = 1_000_000
 
@@ -76,19 +75,19 @@ test('maps a supported sleeping client state to the desktop bridge', async () =>
     state: 'sleeping',
   }, {
     desktop: true,
-    bridge: { enterHide: async () => ({ state: 'hidden' }) },
+    bridge: { enterHide: async () => ({ state: 'sleeping' }) },
     onLifecycle: state => lifecycle.push(state),
   })
 
   assert.equal(hidden, true)
-  assert.deepEqual(lifecycle, ['hidden'])
+  assert.deepEqual(lifecycle, ['sleeping'])
   assert.equal(await applyDesktopClientState({
     type: 'client.state',
     state: 'sleeping',
   }), false)
 })
 
-test('reports Client Action completion only after the desktop is hidden', async () => {
+test('reports Client Action completion after the desktop enters visible sleep', async () => {
   const lifecycle = []
   const hideRequests = []
   const result = await performDesktopClientAction({
@@ -98,7 +97,7 @@ test('reports Client Action completion only after the desktop is hidden', async 
     desktop: true,
     bridge: { enterHide: async options => {
       hideRequests.push(options)
-      return { state: 'hidden' }
+      return { state: 'sleeping' }
     } },
     onLifecycle: state => lifecycle.push(state),
     // Explicit user/model sleep must still work immediately after wake.
@@ -106,9 +105,9 @@ test('reports Client Action completion only after the desktop is hidden', async 
   })
   assert.deepEqual(result, {
     status: 'completed',
-    output: { state: 'hidden' },
+    output: { state: 'sleeping' },
   })
-  assert.deepEqual(lifecycle, ['hidden'])
+  assert.deepEqual(lifecycle, ['sleeping'])
   assert.deepEqual(hideRequests, [{ explicit: true }])
 
   const unsupported = await performDesktopClientAction({
@@ -156,13 +155,6 @@ test('only hides a healthy active desktop', () => {
   }), false)
 })
 
-test('finishes waking from the Gateway connection without waiting for microphone capture', () => {
-  assert.equal(desktopCanFinishWaking('connected'), true)
-  assert.equal(desktopCanFinishWaking('unavailable'), true)
-  assert.equal(desktopCanFinishWaking('connecting'), false)
-  assert.equal(desktopCanFinishWaking('hidden'), false)
-})
-
 test('starts the timeout after both interaction and work have ended', () => {
   assert.equal(desktopHideDeadline({
     lastInteractionAt: 1_000,
@@ -171,8 +163,8 @@ test('starts the timeout after both interaction and work have ended', () => {
   }), 130_000)
 })
 
-test('reads the wake word enabled flag from the URL', () => {
-  assert.equal(desktopWakeWordEnabled(''), false)
+test('requires keyword wake even for old desktop URLs', () => {
+  assert.equal(desktopWakeWordEnabled(''), true)
   assert.equal(desktopWakeWordEnabled('?wakeWordEnabled=true'), true)
-  assert.equal(desktopWakeWordEnabled('?wakeWordEnabled=false'), false)
+  assert.equal(desktopWakeWordEnabled('?wakeWordEnabled=false'), true)
 })

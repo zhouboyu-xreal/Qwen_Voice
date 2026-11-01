@@ -32,8 +32,9 @@ export function desktopAutoHideSeconds(search = '') {
     : 60
 }
 
-export function desktopWakeWordEnabled(search = '') {
-  return new URLSearchParams(search).get('wakeWordEnabled') === 'true'
+export function desktopWakeWordEnabled() {
+  // Keep keyword gating enabled for old desktop URLs and saved settings.
+  return true
 }
 
 export function desktopTasksActive(tasks = []) {
@@ -76,10 +77,6 @@ export function desktopCanHide({
   )
 }
 
-export function desktopCanFinishWaking(connectionState) {
-  return connectionState === 'connected' || connectionState === 'unavailable'
-}
-
 export function desktopHideDeadline({
   lastInteractionAt,
   workSettledAt,
@@ -90,9 +87,9 @@ export function desktopHideDeadline({
 }
 
 // Client state is a provider- and Gateway-level capability. This adapter owns
-// only its desktop presentation: the generic "sleeping" state hides the orb.
+// only its desktop presentation: the generic "sleeping" state keeps the orb visible and gates voice input.
 // 刚被用户显式唤醒的宽限期内忽略 sleeping 广播：Gateway 的休眠计时器
-// 可能恰好在唤醒瞬间到期，迟到的过期指令不应把悬浮球藏回去
+// 可能恰好在唤醒瞬间到期，迟到的过期指令不应撤销本次激活
 // （随后的 voice.wake 会重新唤醒 Gateway）。
 export const DESKTOP_WAKE_GRACE_MS = 5000
 
@@ -120,21 +117,21 @@ export async function performDesktopClientAction(event, {
     // blocked by the grace period used only for stale automatic sleep events.
     const lifecycle = await bridge.enterHide({ explicit: true })
     if (lifecycle?.state) onLifecycle(lifecycle.state)
-    if (lifecycle?.state !== 'hidden') {
+    if (lifecycle?.state !== 'sleeping') {
       return {
         status: 'failed',
         error: {
-          code: 'desktop_hide_incomplete',
-          message: 'Desktop did not enter the hidden state',
+          code: 'desktop_sleep_incomplete',
+          message: 'Desktop did not enter the sleeping state',
         },
       }
     }
-    return { status: 'completed', output: { state: 'hidden' } }
+    return { status: 'completed', output: { state: 'sleeping' } }
   } catch (error) {
     return {
       status: 'failed',
       error: {
-        code: 'desktop_hide_failed',
+        code: 'desktop_sleep_failed',
         message: String(error?.message || error).slice(0, 500),
       },
     }
@@ -158,5 +155,5 @@ export async function applyDesktopClientState(event, {
 
   const lifecycle = await bridge.enterHide()
   if (lifecycle?.state) onLifecycle(lifecycle.state)
-  return lifecycle?.state === 'hidden'
+  return lifecycle?.state === 'sleeping'
 }

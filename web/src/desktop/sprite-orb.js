@@ -61,7 +61,7 @@ export const PET_STATE_ANIMATION_POLICY = Object.freeze({
   idle: { name: 'idle', mode: 'loop' },
   connecting: { name: 'idle', mode: 'loop' },
   occupied: { name: 'idle', mode: 'loop' },
-  hidden: { name: 'idle', mode: 'loop' },
+  sleeping: { name: 'idle', mode: 'loop' },
   listening: { name: 'waiting', mode: 'loop', blocksCues: true },
   speaking: { name: 'waving', mode: 'loop', blocksCues: true },
   starting: { name: 'running', mode: 'loop', blocksCues: true },

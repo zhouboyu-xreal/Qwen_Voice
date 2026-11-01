@@ -175,7 +175,7 @@ export function bindOrbShell({
   })
 
   on(ORB_CHANNELS.wake, event => {
-    if (fromOrbWindow(event)) presence.wake('orb')
+    if (fromOrbWindow(event)) presence.show('orb')
   })
 
   on(ORB_CHANNELS.lifecycleReady, event => {

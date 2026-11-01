@@ -11,7 +11,7 @@ import {
 
 const REALTIME_DEFAULTS = {
   wakeShortcut: 'CommandOrControl+Shift+Space',
-  wakeWordEnabled: false,
+  wakeWordEnabled: true,
   realtimeProvider: 'dashscope',
   realtimeBaseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime',
   realtimeModel: 'qwen-audio-3.0-realtime-plus',
@@ -648,4 +648,11 @@ test('a cleared setting releases its environment slot', () => {
   const env = { QWEN_AUDIO_AGENT_BACKEND_MODEL: 'pinned-model' }
   applySettingsEnvironment({ backendModel: '' }, env)
   assert.equal('QWEN_AUDIO_AGENT_BACKEND_MODEL' in env, false)
+})
+
+
+test('requires desktop keyword wake when loading and saving legacy preferences', () => {
+  assert.equal(parseSettings('QWEN_AUDIO_WAKE_WORD_ENABLED=false').wakeWordEnabled, true)
+  assert.equal(parseSettings('', { QWEN_AUDIO_WAKE_WORD_ENABLED: 'false' }).wakeWordEnabled, true)
+  assert.equal(normalizeSettings({ wakeWordEnabled: false }).wakeWordEnabled, true)
 })

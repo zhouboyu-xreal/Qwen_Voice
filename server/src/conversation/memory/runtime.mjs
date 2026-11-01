@@ -111,6 +111,15 @@ export class FrontendMemoryRuntime {
     )
   }
 
+  async inspect(ownerId, options = {}) {
+    if (!this.capabilities().structuredInspection) return { supported: false }
+    const result = await this.provider.inspect(ownerId, options)
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      throw new TypeError('MemoryProvider inspect() must return an object')
+    }
+    return result
+  }
+
   async observe(ownerId, exchange = {}, context = {}) {
     if (!this.ownsSessionObservation()) return { observed: false }
     const result = await this.provider.observe(ownerId, exchange, context)

@@ -25,9 +25,7 @@ export function applyDesktopClientSettings(current, update = {}) {
     autoHideSeconds: Number.isFinite(update.autoHideSeconds)
       ? update.autoHideSeconds
       : current.autoHideSeconds,
-    wakeWordEnabled: typeof update.wakeWordEnabled === 'boolean'
-      ? update.wakeWordEnabled
-      : current.wakeWordEnabled,
+    wakeWordEnabled: true,
     language: update.language || current.language,
   }
 }

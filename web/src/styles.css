@@ -895,6 +895,15 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
 .desktop-orb-stage.error .fluid-orb::before {
   animation: desktop-orb-error 2.2s ease-in-out infinite;
 }
+.desktop-orb-stage.sleeping .fluid-orb {
+  --orb-halo: #87919620;
+  --orb-ring: #a8b0b440;
+}
+.desktop-orb-stage.sleeping .fluid,
+.desktop-orb-stage.sleeping .goo {
+  filter: saturate(.55) brightness(.9);
+  animation-duration: 12s;
+}
 .desktop-orb-stage.waking .fluid-orb {
   --orb-halo: #7f9be04d;
   --orb-ring: #a7bdf071;
@@ -968,8 +977,9 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
 .desktop-orb-controls {
   position: absolute;
   left: 50%;
-  top: 132px;
-  display: flex;
+  top: 120px;
+  display: grid;
+  grid-template-columns: repeat(4, 23px);
   gap: 2px;
   padding: 3px;
   border: 1px solid #ffffff12;
@@ -1620,3 +1630,6 @@ article.user .message-body .inline-code { background: #5e44c9; color: #f0eaff; }
     transition: none;
   }
 }
+
+.desktop-conversation-panel header .desktop-memory-button { display: grid; place-items: center; width: 30px; min-width: 30px; padding: 5px; }
+.desktop-memory-button svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }

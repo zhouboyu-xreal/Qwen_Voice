@@ -38,6 +38,8 @@ export function describeMemoryProvider(provider) {
         && description.capabilities?.sessionObservation === true,
       audioStreamObservation: protocolVersion >= 2
         && description.capabilities?.audioStreamObservation === true,
+      ...(protocolVersion >= 2 && description.capabilities?.structuredInspection === true
+        ? { structuredInspection: true } : {}),
     },
   }
 }
@@ -59,6 +61,7 @@ export function describeMemoryProvider(provider) {
  *   observe(ownerId, exchange, context) -> void
  *   flush(ownerId, context) -> void
  *   observeAudio(ownerId, event, context) -> void
+ *   inspect(ownerId, options) -> Promise<structured view> (structuredInspection)
  *
  * Providers advertise semanticQuery/sessionObservation/audioStreamObservation
  * from describe(). observeAudio() runs on the accepted PCM16 input hot path
@@ -102,6 +105,9 @@ export function assertMemoryProvider(value, { name = 'MemoryProvider' } = {}) {
     throw new TypeError(
       `${name} advertises audioStreamObservation but has no observeAudio method`,
     )
+  }
+  if (description.capabilities.structuredInspection && typeof value.inspect !== 'function') {
+    throw new TypeError(`${name} advertises structuredInspection but has no inspect method`)
   }
   if (value.flush != null && typeof value.flush !== 'function') {
     throw new TypeError(`${name} flush must be a function when provided`)

@@ -1193,6 +1193,8 @@ test('wires rolling summary and preference learning when enabled', async () => {
       memoryAutoEnabled: true,
       memoryApiKey: 'test-key',
       preferenceLearningEnabled: true,
+      // This test exercises Markdown learning regardless of local provider config.
+      memoryProvider: 'markdown',
       preferenceCandidatePath: join(directory, 'candidates.json'),
       userModelPath: join(directory, 'USER.md'),
       frontendMemoryPath: join(directory, 'MEMORY.md'),
@@ -1241,4 +1243,31 @@ test('wires rolling summary and preference learning when enabled', async () => {
   } finally {
     await app.close()
   }
+})
+
+
+test('serves read-only PWM inspection through the authenticated control plane', async () => {
+  const calls = []
+  const application = createTestGatewayApplication({
+    config: { ...config, port: 0, memoryAutoEnabled: false, webSearchProvider: 'none', webSearchMcpUrl: '' },
+    parentPort: null, autoStart: false, frontendMcp: null, frontendOpenApi: null,
+    frontendMemory: {
+      inspect: async (ownerId, options) => {
+        calls.push({ ownerId, options })
+        return { supported: true, available: true, items: [], total: 0 }
+      },
+      health: () => ({ ok: true }), close: async () => {},
+    },
+  })
+  application.start()
+  if (!application.server.listening) await once(application.server, 'listening')
+  try {
+    const response = await fetch(`http://127.0.0.1:${application.server.address().port}/api/pwm/states?ownerId=forged`)
+    assert.equal(response.status, 200)
+    assert.equal(calls.length, 1)
+    assert.ok(calls[0].ownerId)
+    assert.notEqual(calls[0].ownerId, 'forged')
+    assert.equal(calls[0].options.ownerId, undefined)
+    assert.equal(response.headers.get('cache-control'), 'no-store')
+  } finally { await application.close() }
 })

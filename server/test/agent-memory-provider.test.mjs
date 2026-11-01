@@ -108,3 +108,21 @@ test('does not persist or expose a local document snapshot', () => {
     /不支持本地 memory 文档编辑/,
   )
 })
+
+
+test('structured inspection uses the same owner partition as memory writes', async () => {
+  const calls = []
+  const provider = new AgentMemoryProvider({
+    stateDirectory: mkdtempSync(join(tmpdir(), 'qwaudio-memory-inspection-')),
+    sidecar: {
+      lastError: null, close() {},
+      request: async (method, params) => { calls.push({ method, params }); return { supported: true } },
+    },
+  })
+  await provider.inspect('owner-a', { section: 'states', ownerId: 'forged' })
+  await provider.query('owner-a', 'test')
+  assert.equal(calls[0].method, 'inspect')
+  assert.notEqual(calls[0].params.ownerId, 'forged')
+  assert.equal(calls[0].params.ownerId, calls[1].params.ownerId)
+  await provider.close()
+})

@@ -132,3 +132,15 @@ test('routes synchronous audio stream observations without awaiting the provider
     /must be synchronous/,
   )
 })
+
+
+test('inspection is optional and never falls back to Realtime documents', async () => {
+  const legacy = new FrontendMemoryRuntime({ provider: provider() })
+  assert.deepEqual(await legacy.inspect('owner'), { supported: false })
+  const runtime = new FrontendMemoryRuntime({ provider: provider({
+    describe: () => ({ protocolVersion: 2, key: 'inspection', label: 'Inspection', capabilities: { structuredInspection: true } }),
+    list: () => { throw new Error('must not read prompt documents') },
+    inspect: async (ownerId, options) => ({ supported: true, ownerId, ...options }),
+  }) })
+  assert.deepEqual(await runtime.inspect('owner', { section: 'states' }), { supported: true, ownerId: 'owner', section: 'states' })
+})

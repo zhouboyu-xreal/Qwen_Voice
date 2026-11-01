@@ -34,7 +34,7 @@ test('keeps the waking lifecycle distinct from an error', () => {
 test('arbitrates visual states by layered priority', () => {
   // 满载输入：每一层压过下一层。
   const everything = {
-    lifecycle: 'hidden',
+    lifecycle: 'sleeping',
     runtimeState: 'starting',
     connectionError: true,
     connecting: true,
@@ -42,7 +42,7 @@ test('arbitrates visual states by layered priority', () => {
     voiceState: 'listening',
     tasksWorking: true,
   }
-  assert.equal(resolveOrbVisualState(everything), 'hidden')
+  assert.equal(resolveOrbVisualState(everything), 'sleeping')
   assert.equal(
     resolveOrbVisualState({ ...everything, lifecycle: 'waking' }),
     'waking',

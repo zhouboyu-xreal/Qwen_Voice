@@ -48,12 +48,11 @@ function fakePresence() {
     calls: [],
     hide(reason) {
       this.calls.push(['hide', reason])
-      this.state = 'hidden'
+      this.state = 'sleeping'
       return this.state
     },
-    wake(reason) {
-      this.calls.push(['wake', reason])
-      this.state = 'waking'
+    show(reason) {
+      this.calls.push(['show', reason])
     },
     ready() {
       this.calls.push(['ready'])
@@ -126,10 +125,13 @@ test('a foreign sender can neither drag nor read lifecycle state', async () => {
 test('lifecycle channels drive the presence state machine', () => {
   const { ipc, presence, event } = shellHarness()
   assert.deepEqual(ipc.invoke(ORB_CHANNELS.enterHide, event), {
-    state: 'hidden',
+    state: 'sleeping',
   })
   ipc.emit(ORB_CHANNELS.wake, event)
-  assert.equal(presence.state, 'waking')
+  assert.equal(presence.state, 'sleeping')
+  assert.deepEqual(presence.calls.at(-1), ['show', 'orb'])
+  // Only the main-process keyword detector may initiate this transition.
+  presence.state = 'waking'
   ipc.emit(ORB_CHANNELS.lifecycleReady, event)
   assert.equal(presence.state, 'active')
   // ready is only meaningful while waking.
@@ -183,10 +185,10 @@ test('visible conversation panel refuses an inactivity hide request', () => {
   assert.deepEqual(ipc.invoke(ORB_CHANNELS.enterHide, event), {
     state: presence.state,
   })
-  assert.notEqual(presence.state, 'hidden')
+  assert.notEqual(presence.state, 'sleeping')
 })
 
-test('explicit sleep closes a visible conversation panel and hides the desktop', () => {
+test('explicit sleep collapses the conversation panel to the resident orb', () => {
   const { ipc, event, presence, calls } = shellHarness({
     onLoadSurface: () => 'panel',
   })
@@ -195,8 +197,8 @@ test('explicit sleep closes a visible conversation panel and hides the desktop',
     ORB_CHANNELS.enterHide,
     event,
     { explicit: true },
-  ), { state: 'hidden' })
-  assert.equal(presence.state, 'hidden')
+  ), { state: 'sleeping' })
+  assert.equal(presence.state, 'sleeping')
   assert.deepEqual(calls, ['surface:orb'])
 })
 

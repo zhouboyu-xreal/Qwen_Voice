@@ -92,6 +92,7 @@ import {
 } from './updater.mjs'
 import { createGracefulShutdown } from './graceful-shutdown.mjs'
 import { DesktopPresence } from './desktop-presence.mjs'
+import { createMemoryWindowController } from './memory-window.mjs'
 import { createElectronGatewayCredentialStore } from './gateway-credential-store.mjs'
 import {
   PreWakeContextRuntime,
@@ -218,6 +219,19 @@ let pendingGatewayPairingCode = null
 let desktopPreWakeContextRuntime = null
 let desktopPendingPreWakeContext = ''
 let desktopPreWakeContextCapturing = false
+let desktopWakeWordPending = false
+const memoryWindow = createMemoryWindowController({
+  BrowserWindow,
+  getUrl: () => {
+    const url = new URL(rendererServer.baseUrl)
+    url.searchParams.set('view', 'memory')
+    url.searchParams.set('lang', effectiveDesktopLanguage(desktopLanguage, app.getLocale()))
+    return url.href
+  },
+  getTitle: () => desktopText('我的记忆'),
+  getWorkArea: () => screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea,
+  onError: error => logger.warn('desktop.memory_window.failed', { error }),
+})
 let desktopAmbientRecordingRuntime = null
 let desktopAmbientRecordingId = ''
 let desktopAmbientRecordingStopping = false
@@ -230,6 +244,12 @@ const desktopPresence = new DesktopPresence({
   getWindow: () => mainWindow,
   globalShortcut,
   logger,
+  onSleep: () => {
+    desktopWakeWord.reset()
+    desktopPendingPreWakeContext = ''
+    desktopPreWakeContextRuntime?.clear()
+    desktopPreWakeContextCapturing = false
+  },
 })
 
 const desktopWakeWord = new DesktopWakeWordRuntime({
@@ -288,6 +308,16 @@ async function ensureDesktopPreWakeContextRuntime() {
 }
 
 async function wakeDesktopFromWakeWord() {
+  if (!desktopWakeWordEnabled || desktopPresence.state !== 'sleeping' || desktopWakeWordPending) return
+  desktopWakeWordPending = true
+  try {
+    await activateDesktopFromWakeWord()
+  } finally {
+    desktopWakeWordPending = false
+  }
+}
+
+async function activateDesktopFromWakeWord() {
   let snapshot = null
   try {
     snapshot = await desktopPreWakeContextRuntime?.consumeForWake()
@@ -295,6 +325,7 @@ async function wakeDesktopFromWakeWord() {
     desktopPreWakeContextRuntime?.clear()
     logger.warn('desktop.pre_wake_context.snapshot_failed', { error })
   }
+  if (desktopPresence.state !== 'sleeping') return
   desktopPendingPreWakeContext = String(snapshot?.text || '')
   desktopPreWakeContextCapturing = false
   logger.info('desktop.pre_wake_context.wake_snapshot', {
@@ -306,7 +337,8 @@ async function wakeDesktopFromWakeWord() {
 ipcMain.on('qwen-audio-agent:wake-word-audio', (event, payload) => {
   if (
     !desktopWakeWordEnabled
-    || desktopPresence.state !== 'hidden'
+    || desktopPresence.state !== 'sleeping'
+    || desktopWakeWordPending
     || !mainWindow
     || mainWindow.isDestroyed()
     || event.sender !== mainWindow.webContents
@@ -832,7 +864,6 @@ async function startLocalGateway(origin, accessToken = gatewayAccessToken) {
           if (
             mainWindow
             && !mainWindow.isDestroyed()
-            && desktopPresence.state !== 'hidden'
           ) {
             void loadQwenAudioAgent(mainWindow)
           }
@@ -889,7 +920,7 @@ async function startConfiguredRuntime(settings = configuredOrigin().settings) {
   appOrigin = isLoopbackUrl(configuredGatewayOrigin)
     ? await startLocalGateway(configuredGatewayOrigin)
     : configuredGatewayOrigin
-  // PCM is owned by the Desktop client while it is hidden, so pre-wake ASR
+  // PCM is owned by the Desktop client while it is sleeping, so pre-wake ASR
   // remains local. It shares the same adapter and sidecar as TUI.
   void ensureDesktopPreWakeContextRuntime()
   process.env.QWEN_AUDIO_AGENT_URL = appOrigin
@@ -936,13 +967,14 @@ function isDesktopRendererUrl(value) {
 function configurePermissions(window) {
   const electronSession = window.webContents.session
   electronSession.setPermissionCheckHandler((
-    _webContents,
+    webContents,
     permission,
     requestingOrigin,
     details,
   ) => {
     const origin = details?.securityOrigin || requestingOrigin
-    return permission === 'media' && isDesktopRendererUrl(origin)
+    return webContents === mainWindow?.webContents
+      && permission === 'media' && isDesktopRendererUrl(origin)
   })
   electronSession.setPermissionRequestHandler((
     webContents,
@@ -957,7 +989,8 @@ function configurePermissions(window) {
     const audioOnly = !mediaTypes.length
       || mediaTypes.every(type => type === 'audio')
     callback(
-      permission === 'media'
+      webContents === mainWindow?.webContents
+      && permission === 'media'
       && audioOnly
       && isDesktopRendererUrl(source),
     )
@@ -1012,17 +1045,30 @@ function showDesktop(reason = 'tray') {
     return
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    desktopPresence.wake(reason)
+    desktopPresence.show(reason)
     return
   }
   startConfiguredRuntime().then(() => {
-    desktopPresence.wake(reason)
+    desktopPresence.show(reason)
   }).catch(error => {
     lastRuntimeError = error?.message || String(error)
     logger.error('runtime.show_failed', { error })
     showSettings()
   })
 }
+
+async function showMemoryWindow() {
+  if (setupRequired) {
+    showSettings()
+    return
+  }
+  await ensureDesktopUi()
+  await memoryWindow.open()
+}
+
+ipcMain.on('qwen-audio-agent:open-memory', event => {
+  if (mainWindow && event.sender === mainWindow.webContents) void showMemoryWindow()
+})
 
 function createTray() {
   if (!tray) {
@@ -1044,6 +1090,10 @@ function createTray() {
     {
       label: desktopText('显示悬浮球'),
       click: () => showDesktop('tray'),
+    },
+    {
+      label: desktopText('我的记忆'),
+      click: () => { void showMemoryWindow() },
     },
     {
       label: desktopText('设置…'),
@@ -1124,6 +1174,7 @@ function createWindow() {
     }
   })
 
+  window.webContents.on('did-start-loading', () => desktopPresence.sleep('renderer-load'))
   loadQwenAudioAgent(window)
   return window
 }
@@ -1199,7 +1250,7 @@ const orbShell = bindOrbShell({
   onLoadSurface: () => desktopSurfaceMode,
   onSetSurface: mode => {
     const selected = setDesktopSurfaceMode(mode)
-    if (selected === 'panel') desktopPresence.wake('panel')
+    if (selected === 'panel') desktopPresence.show('panel')
     return selected
   },
   onSetConversationSession: sessionId => {
@@ -1682,11 +1733,9 @@ async function applyDesktopSettings(settings) {
     && !mainWindow.isDestroyed()
   )
   if (desktopRendererChanged) {
-    // Applying runtime settings is an explicit desktop interaction. A
-    // previously auto-hidden orb must rejoin the new Gateway as an active
-    // client instead of carrying its wake-word-only sleep state across the
-    // restart.
-    desktopPresence.wake('settings')
+    // A replacement Gateway starts in local wake-word listening, even if the
+    // previous connection was active. Applying settings is not a voice wake.
+    desktopPresence.sleep('settings')
     void loadQwenAudioAgent(mainWindow)
   } else if (mainWindow && !mainWindow.isDestroyed()) {
     // Client-owned presentation and presence preferences are hot-applied in
@@ -1695,6 +1744,8 @@ async function applyDesktopSettings(settings) {
     // language or idle policy.
     sendDesktopClientSettings(mainWindow, normalized)
   }
+  // Refresh the read-only view after switching Gateway identity or language.
+  if (gatewayChanged || credentialChanged || languageChanged) await memoryWindow.reload()
   const runtime = await runtimeStatus(appOrigin)
   return {
     settings: normalized,
@@ -1796,7 +1847,7 @@ if (!app.requestSingleInstanceLock()) {
       showSettings()
       return
     }
-    desktopPresence.wake('second-instance')
+    desktopPresence.show('second-instance')
   })
 
   app.whenReady().then(async () => {
@@ -1853,10 +1904,10 @@ if (!app.requestSingleInstanceLock()) {
         return
       }
       if (!BrowserWindow.getAllWindows().length) {
-        void ensureDesktopUi().then(() => desktopPresence.wake('activate'))
+        void ensureDesktopUi().then(() => desktopPresence.show('activate'))
         return
       }
-      desktopPresence.wake('activate')
+      desktopPresence.show('activate')
     })
   }).catch(error => {
     const message = error?.stack || error?.message || String(error)
@@ -1873,6 +1924,7 @@ if (!app.requestSingleInstanceLock()) {
     app,
     cleanup: async () => {
       logger.info('desktop.stopping')
+      memoryWindow.close()
       desktopPresence.destroy()
       desktopWakeWord.stop()
       stopAmbientRecordingDrainTimer()

@@ -1,5 +1,6 @@
 const ENGLISH = {
   '设置': 'Settings',
+  '我的记忆': 'My memory',
   '管理语音、后台 Agent 与桌面应用': 'Manage voice, backend agents, and the desktop app',
   '检查更新': 'Check for updates',
   '运行状态': 'Runtime status',
@@ -55,7 +56,7 @@ const ENGLISH = {
   '5 分钟': '5 minutes',
   '10 分钟': '10 minutes',
   '语音唤醒': 'Voice wake',
-  '休眠后说出"你好千问"即可唤醒': 'Say “你好千问” to wake after sleeping',
+  '悬浮球始终显示，说“你好，千问”开始对话': 'The orb stays visible. Say “你好，千问” to start a conversation',
   '显示快捷键': 'Show shortcut',
   '点击后按下新的快捷键': 'Click, then press a new shortcut',
   '恢复默认快捷键': 'Restore default shortcut',

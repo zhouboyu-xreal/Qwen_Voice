@@ -10,11 +10,14 @@ import {
   GatewayClientProtocolEvent,
 } from '../../shared/protocol/gateway-client-protocol.mjs'
 
-test('an enter_sleep tool call hides the desktop orb end to end', async () => {
+test('an enter_sleep tool call keeps the orb visible and requires another keyword wake', async () => {
   const window = {
     hidden: false,
     isDestroyed: () => false,
     hide() { this.hidden = true },
+    show() {},
+    focus() {},
+    isMinimized: () => false,
     webContents: { send() {} },
   }
   const presence = new DesktopPresence({
@@ -25,6 +28,8 @@ test('an enter_sleep tool call hides the desktop orb end to end', async () => {
       unregisterAll() {},
     },
   })
+  presence.wake('wake-word')
+  presence.ready()
   const outputs = []
   let sleeping = false
   let clientActions
@@ -72,8 +77,12 @@ test('an enter_sleep tool call hides the desktop orb end to end', async () => {
   })
   await new Promise(resolve => setTimeout(resolve, 0))
 
-  assert.equal(window.hidden, true)
-  assert.equal(presence.state, 'hidden')
+  assert.equal(window.hidden, false)
+  assert.equal(presence.state, 'sleeping')
+  presence.wake('shortcut')
+  assert.equal(presence.state, 'sleeping')
+  presence.wake('wake-word')
+  assert.equal(presence.state, 'waking')
   assert.equal(sleeping, true)
   assert.equal(outputs.length, 1)
   assert.equal(outputs[0][1].status, 'sleeping')

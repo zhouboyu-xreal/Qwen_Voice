@@ -549,6 +549,8 @@ class MemoryRuntime:
             str((task_report or {}).get("reason") or "") in rejected_reasons
             for task_report in submission_reports
         )
+        if accepted:
+            self._memory_context_manager.record_preceding_context_units([])
         return {
             "accepted": accepted,
             "queued": (
@@ -700,8 +702,9 @@ class MemoryRuntime:
     ) -> Dict[str, Any]:
         """Submit buffered tail input and its final follow-up tasks.
 
-        This establishes an input boundary but does not wait for queued tasks
-        to finish. Call :meth:`wait_for_memory_tasks` when completion is needed.
+        A successful flush clears preceding context after submitting the tail,
+        establishing an input boundary without waiting for queued tasks to
+        finish. Call :meth:`wait_for_memory_tasks` when completion is needed.
         """
         input_flush_report = self._flush_pending_memory_input_units(
             reason=reason,

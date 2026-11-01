@@ -48,7 +48,6 @@ import { requestedSessionId } from './session.js'
 import { initialVoiceEnabled } from './voice-defaults.js'
 import {
   applyDesktopClientState,
-  desktopCanFinishWaking,
   desktopCanHide,
   desktopHideDeadline,
   desktopTasksActive,
@@ -131,8 +130,8 @@ function labelFor(state) {
     starting: t('正在启动'),
     connecting: t('正在连接语音前台'),
     occupied: t('其他入口正在使用'),
-    hidden: t('已隐藏'),
-    waking: t('正在显示'),
+    sleeping: t('待唤醒，说“你好，千问”开始对话'),
+    waking: t('正在唤醒'),
   }[state] || state
 }
 
@@ -151,6 +150,11 @@ function OrbControlIcon({ type, muted = false, collapsed = false }) {
       <rect x="9" y="3.5" width="6" height="11" rx="3" />
       <path d="M6.5 11.5a5.5 5.5 0 0 0 11 0M12 17v3m-3 0h6" />
       {muted && <path d="M4 4 20 20" />}
+    </svg>
+  }
+  if (type === 'memory') {
+    return <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 5h7a3 3 0 0 1 3 3v12a4 4 0 0 0-3-2H4zm16 0h-3a3 3 0 0 0-3 3v12a4 4 0 0 1 3-2h3z" />
     </svg>
   }
   if (type === 'settings') {
@@ -237,7 +241,8 @@ export default function App() {
   const [orbDragDirection, setOrbDragDirection] = useState('')
   const [spriteAnimationCues, setSpriteAnimationCues] = useState([])
   const [spriteOrbFailed, setSpriteOrbFailed] = useState(false)
-  const [desktopLifecycle, setDesktopLifecycle] = useState('active')
+  const [desktopLifecycle, setDesktopLifecycle] = useState(desktopOrbMode ? 'sleeping' : 'active')
+  const [gatewaySleeping, setGatewaySleeping] = useState(false)
   const [desktopSurfaceMode, setDesktopSurfaceMode] = useState(
     initialDesktopSurfaceMode,
   )
@@ -258,7 +263,7 @@ export default function App() {
   const autoHideRequestedDeadlineRef = useRef(0)
   const ambientRecordingToggleInFlightRef = useRef(false)
   const lastWakeAtRef = useRef(0)
-  const previousDesktopLifecycle = useRef('active')
+  const previousDesktopLifecycle = useRef(desktopOrbMode ? 'sleeping' : 'active')
   const desktopWakeReasonRef = useRef('')
   const gatewayCommandsRef = useRef(null)
   const sessionIdRef = useRef(sessionId)
@@ -511,6 +516,18 @@ export default function App() {
           ? { ...task, phase: 'disconnected' }
           : task
       )))
+    }
+    if (desktopOrbMode && event.type === 'voice.sleep') {
+      if (event.state === 'sleeping') setGatewaySleeping(true)
+      if (event.state === 'awake') {
+        setGatewaySleeping(false)
+        window.qwenAudioAgentDesktop?.lifecycleReady()
+      }
+    }
+    if (desktopOrbMode && event.type === 'gateway.disconnected') {
+      setGatewaySleeping(false)
+      setDesktopLifecycle('sleeping')
+      void window.qwenAudioAgentDesktop?.enterHide({ explicit: true })
     }
     void applyDesktopClientState(event, {
       desktop: desktopOrbMode,
@@ -811,19 +828,17 @@ export default function App() {
     triggerSpriteAnimation,
   ])
 
-  // Keep the microphone alive while the desktop orb is hidden and the wake
-  // word is enabled, even if the user has muted the realtime conversation.
-  // Microphone mute leaves output playback active; wake-word detection still
-  // needs a live input stream to resume on "你好千问" while hidden.
+  // Sleeping keeps the orb visible and routes capture only to local keyword
+  // detection. Microphone readiness does not imply an active conversation.
   const voiceEnabledForWakeWord = (
     desktopOrbMode
-    && desktopLifecycle === 'hidden'
+    && desktopLifecycle !== 'active'
     && wakeWordEnabled
   )
   const voice = useRealtimeVoice({
     sessionId,
     enabled: voiceEnabled || voiceEnabledForWakeWord,
-    suspended: desktopOrbMode && desktopLifecycle === 'hidden' && !wakeWordEnabled,
+    suspended: desktopOrbMode && desktopLifecycle === 'sleeping' && !wakeWordEnabled,
     outputMuted: false,
     // WebUI and desktop share one control contract: the toggle only changes
     // microphone capture and never closes or interrupts the output stream.
@@ -1014,19 +1029,23 @@ export default function App() {
       ) {
         triggerSpriteAnimation('wake', { priority: true })
         desktopWakeReasonRef.current = lifecycle.reason || ''
+        setVoiceEnabled(true)
+        setWaitingForVoice(false)
       }
+      const enteredSleep = lifecycle.state === 'sleeping'
+        && previousDesktopLifecycle.current !== 'sleeping'
       previousDesktopLifecycle.current = lifecycle.state
       setDesktopLifecycle(lifecycle.state)
       if (lifecycle.state === 'waking') lastWakeAtRef.current = Date.now()
       if (lifecycle.reason === 'activity') noteInteraction()
-      if (lifecycle.state === 'hidden') {
+      if (lifecycle.state === 'sleeping') {
         // Main has already collapsed a visible conversation panel before an
         // explicit sleep. Mirror that authoritative surface transition so a
         // later wake cannot render the panel inside the compact orb window.
-        setDesktopSurfaceMode('orb')
-        setActivity(t('已隐藏'))
+        if (enteredSleep) setDesktopSurfaceMode('orb')
+        setActivity(t('待唤醒，说“你好，千问”开始对话'))
       }
-      if (lifecycle.state === 'waking') setActivity(t('正在显示悬浮球'))
+      if (lifecycle.state === 'waking') setActivity(t('正在唤醒'))
       if (lifecycle.state === 'active' && lifecycle.reason === 'ready') {
         setActivity(t('待命'))
         noteInteraction()
@@ -1044,49 +1063,39 @@ export default function App() {
     }
   }, [noteInteraction, triggerSpriteAnimation])
 
-  useEffect(() => {
-    if (!desktopOrbMode || desktopLifecycle !== 'waking') return
-    // Presence readiness describes whether the desktop surface can finish
-    // waking, not whether microphone capture has initialized. Keeping those
-    // lifecycles separate prevents a slow/denied microphone from leaving the
-    // orb permanently in `waking`, which would also disable inactivity sleep.
-    if (desktopCanFinishWaking(voice.connectionState)) {
-      window.qwenAudioAgentDesktop?.lifecycleReady()
-    }
-  }, [
-    desktopLifecycle,
-    voice.connectionState,
-  ])
-
-  // 快捷键/托盘唤起恢复 Gateway presence；Realtime 连接在休眠期间保持。
+  // Only the local wake-word detector can begin a voice activation.
   const wakeGateway = voice.wake
   const publishClientEvent = voice.publishClientEvent
   useEffect(() => {
-    if (!desktopOrbMode || desktopLifecycle !== 'waking') return
-    const consumePreWakeContext = (
-      window.qwenAudioAgentDesktop?.consumePreWakeContext
-    )
+    if (!desktopOrbMode || desktopLifecycle !== 'waking' || !gatewaySleeping) return
+    const bridge = window.qwenAudioAgentDesktop
+    const requestWake = snapshot => {
+      if (!wakeGateway({
+        preWakeContext: snapshot?.text || '',
+        wakeReason: desktopWakeReasonRef.current,
+      })) {
+        void bridge?.enterHide({ explicit: true })
+      }
+    }
+    const consumePreWakeContext = bridge?.consumePreWakeContext
     if (typeof consumePreWakeContext !== 'function') {
-      wakeGateway({ wakeReason: desktopWakeReasonRef.current })
+      requestWake()
       return undefined
     }
     let disposed = false
     void consumePreWakeContext()
       .then(snapshot => {
         if (!disposed) {
-          wakeGateway({
-            preWakeContext: snapshot?.text || '',
-            wakeReason: desktopWakeReasonRef.current,
-          })
+          requestWake(snapshot)
         }
       })
       .catch(() => {
         if (!disposed) {
-          wakeGateway({ wakeReason: desktopWakeReasonRef.current })
+          requestWake()
         }
       })
     return () => { disposed = true }
-  }, [desktopLifecycle, wakeGateway])
+  }, [desktopLifecycle, gatewaySleeping, wakeGateway])
 
   autoHideStateRef.current = {
     desktopLifecycle,
@@ -1167,6 +1176,10 @@ export default function App() {
   }
 
   const enableVoice = () => {
+    if (desktopOrbMode && desktopLifecycle !== 'active') {
+      setActivity(t('待唤醒，说“你好，千问”开始对话'))
+      return
+    }
     if (!voice.activateAudio()) return
     if (voice.ownership.state === 'busy') {
       setWaitingForVoice(true)
@@ -1225,6 +1238,10 @@ export default function App() {
   }
 
   const sendComposerInput = parts => {
+    if (desktopOrbMode && desktopLifecycle !== 'active') {
+      setActivity(t('待唤醒，说“你好，千问”开始对话'))
+      return false
+    }
     // Sending is a browser user gesture, so it is also the earliest reliable
     // point to unlock audio playback while the microphone remains muted.
     voice.activateAudio()
@@ -1294,7 +1311,7 @@ export default function App() {
         aria-label={`qwen-audio · ${voice.visualError || voiceConnectionError ? t('连接异常') : labelFor(orbVisualState)}`}
         title={
           desktopLifecycle === 'waking'
-            ? t('正在显示悬浮球')
+            ? t('正在唤醒')
             : voice.error
           || (orbVisualState === 'idle' && authorizationTask
             ? taskDetail(authorizationTask)
@@ -1332,6 +1349,7 @@ export default function App() {
         >
           <button
             className={!voiceEnabled ? 'active' : ''}
+            disabled={desktopLifecycle !== 'active'}
             onClick={event => {
               event.stopPropagation()
               if (voiceEnabled || waitingForVoice) {
@@ -1341,17 +1359,21 @@ export default function App() {
               enableVoice()
             }}
             aria-label={
-              voiceEnabled
+              desktopLifecycle !== 'active'
+                ? t('待唤醒，说“你好，千问”开始对话')
+                : voiceEnabled
                 ? t('麦克风静音')
                 : waitingForVoice ? t('取消等待语音') : t('开启麦克风')
             }
             title={
-              voiceEnabled
+              desktopLifecycle !== 'active'
+                ? t('待唤醒，说“你好，千问”开始对话')
+                : voiceEnabled
                 ? t('麦克风静音')
                 : waitingForVoice ? t('取消等待语音') : t('开启麦克风')
             }
           >
-            <OrbControlIcon type="microphone" muted={!voiceEnabled} />
+            <OrbControlIcon type="microphone" muted={!voiceEnabled || desktopLifecycle !== 'active'} />
           </button>
           <button
             className={['starting', 'recording'].includes(ambientRecordingState)
@@ -1392,6 +1414,16 @@ export default function App() {
             title={t('打开对话')}
           >
             <OrbControlIcon type="conversation" />
+          </button>
+          <button
+            onClick={event => {
+              event.stopPropagation()
+              window.qwenAudioAgentDesktop?.openMemory()
+            }}
+            aria-label={t('我的记忆')}
+            title={t('我的记忆')}
+          >
+            <OrbControlIcon type="memory" />
           </button>
           <button
             onClick={event => {
@@ -1542,6 +1574,12 @@ export default function App() {
       <div className="status">
         <i className={orbVisualState} /><span>{labelFor(orbVisualState)}</span>
       </div>
+      {desktopOrbMode && <button
+        className="ghost desktop-memory-button"
+        onClick={() => window.qwenAudioAgentDesktop?.openMemory()}
+        title={t('我的记忆')}
+        aria-label={t('我的记忆')}
+      ><OrbControlIcon type="memory" /></button>}
       {/* 资料库入口只在 web 模式给：桌面悬浮球的 header 已经紧到把「新会话」
           压成一个「＋」，再塞一个文字按钮会挤掉语音按钮 */}
       {!desktopOrbMode && (
@@ -1582,7 +1620,7 @@ export default function App() {
         }}
       >
         {compactVoiceControl
-          ? <OrbControlIcon type="microphone" muted={!voiceEnabled} />
+          ? <OrbControlIcon type="microphone" muted={!voiceEnabled || desktopLifecycle !== 'active'} />
           : voiceEnabled
             ? t('麦克风静音')
             : waitingForVoice ? t('取消等待') : t('开启麦克风')}

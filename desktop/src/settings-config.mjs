@@ -24,7 +24,7 @@ const DEFAULTS = {
   orbSkin: 'fluid',
   autoHideSeconds: 60,
   wakeShortcut: 'CommandOrControl+Shift+Space',
-  wakeWordEnabled: false,
+  wakeWordEnabled: true,
   dashscopeApiKey: '',
   realtimeBaseUrl: DEFAULT_DASHSCOPE_REALTIME_URL,
   realtimeProvider: DEFAULT_REALTIME_PROVIDER,
@@ -319,13 +319,8 @@ export function parseSettings(content = '', fallback = {}) {
       'QWEN_AUDIO_DESKTOP_WAKE_SHORTCUT',
       fallback.QWEN_AUDIO_DESKTOP_WAKE_SHORTCUT ?? DEFAULTS.wakeShortcut,
     )),
-    wakeWordEnabled: String(
-      configured(
-        values,
-        'QWEN_AUDIO_WAKE_WORD_ENABLED',
-        fallback.QWEN_AUDIO_WAKE_WORD_ENABLED || '',
-      ),
-    ).toLowerCase() === 'true',
+    // Desktop always requires its local wake phrase, including legacy configs.
+    wakeWordEnabled: DEFAULTS.wakeWordEnabled,
     dashscopeApiKey: String(configuredApiKey || '').trim(),
     realtimeBaseUrl: String(configuredRealtimeBaseUrl || '').trim()
       || DEFAULTS.realtimeBaseUrl,
@@ -424,7 +419,7 @@ export function normalizeSettings(settings = {}) {
     wakeShortcut: cleanWakeShortcut(
       settings.wakeShortcut ?? DEFAULTS.wakeShortcut,
     ),
-    wakeWordEnabled: Boolean(settings.wakeWordEnabled),
+    wakeWordEnabled: DEFAULTS.wakeWordEnabled,
     dashscopeApiKey: String(
       settings.dashscopeApiKey ?? DEFAULTS.dashscopeApiKey,
     ).trim(),

@@ -37,16 +37,31 @@ See [backend settings](../configuration/backend.md).
 
 ## Orb and Auto Sleep
 
-After the configured idle period, the orb can hide automatically. You can also ask it to step down.
-Sleep **hides the UI and stops microphone input to the voice frontend while retaining the Realtime
-connection and conversation context**. The app stays in the menu bar; backend work is not cancelled,
-and pending announcements continue after waking.
+The orb stays visible from startup and initially waits for “你好，千问”. Say the phrase to begin a
+voice conversation; you can continue speaking within that activation. Idle timeout or an explicit
+sleep request returns it to keyword listening while keeping the orb visible. Sleeping stops microphone
+input to the voice frontend; backend tasks continue running.
 
-Wake it from the menu bar or show shortcut. The macOS default is `⇧⌘ Space`; view or change the
-actual binding in Settings. If wake-word detection is enabled, the microphone is used only for local
-keyword detection during sleep. Say “你好千问” to wake it. The first enable downloads and verifies
-an approximately 33 MB [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) model, then reuses its cache.
+The menu bar, show shortcut, and conversation panel only control presentation. Starting the app,
+reloading its UI, or losing the Gateway connection requires another keyword wake. The macOS show
+shortcut defaults to `⇧⌘ Space` and can be changed in Settings. During sleep, microphone input is
+routed to local keyword detection; separately enabled ambient recording follows its own settings.
+The first launch downloads and verifies an approximately 33 MB
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) model, then reuses its cache.
 Detection runs in an isolated Desktop worker; wake-word audio is not uploaded.
+
+
+## My memory
+
+Open My memory from the orb or menu bar to browse the current Gateway user's intentions
+(goals, plans, to-dos) and states (situational, recurring, enduring). The independent read-only
+window supports type, domain, status and history filters, pagination, evidence, source excerpts,
+and change history.
+
+Viewing memory does not activate voice or acquire a microphone. Only committed extraction
+results are shown. Refresh manually or let the visible window refresh every 8 seconds.
+Missing databases, empty filters, unsupported providers and read failures have separate messages.
+Past validity dates are displayed without modifying the stored state.
 
 ## Appearance
 

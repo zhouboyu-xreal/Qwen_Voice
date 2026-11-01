@@ -21,7 +21,7 @@ test('desktop client settings hot-apply without replacing unrelated state', () =
   const current = {
     orbSkinId: 'fluid',
     autoHideSeconds: 60,
-    wakeWordEnabled: false,
+    wakeWordEnabled: true,
     language: 'zh-CN',
   }
 
@@ -32,7 +32,15 @@ test('desktop client settings hot-apply without replacing unrelated state', () =
   }), {
     orbSkinId: 'firefly',
     autoHideSeconds: 120,
-    wakeWordEnabled: false,
+    wakeWordEnabled: true,
     language: 'en',
   })
+})
+
+
+test('legacy settings cannot turn off keyword gating', () => {
+  assert.equal(initialDesktopClientSettings('?wakeWordEnabled=false').wakeWordEnabled, true)
+  assert.equal(applyDesktopClientSettings(initialDesktopClientSettings(), {
+    wakeWordEnabled: false,
+  }).wakeWordEnabled, true)
 })

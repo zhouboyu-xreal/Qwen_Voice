@@ -25,7 +25,7 @@ class FakeWorker extends EventEmitter {
   }
 }
 
-test('desktop owns wake-word detection and forwards only hidden audio to its worker', () => {
+test('desktop owns wake-word detection and forwards local wake-listening audio to its worker', () => {
   let detections = 0
   const runtime = new DesktopWakeWordRuntime({
     modelRoot: '/tmp/wake-word',

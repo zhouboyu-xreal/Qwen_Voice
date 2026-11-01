@@ -190,6 +190,7 @@ export class AgentMemoryProvider {
         semanticQuery: true,
         sessionObservation: true,
         audioStreamObservation: false,
+        structuredInspection: true,
       },
     }
   }
@@ -202,6 +203,13 @@ export class AgentMemoryProvider {
     throw new Error(
       'Agent Memory 不支持本地 memory 文档编辑；请使用 Python sidecar 的记忆流程。',
     )
+  }
+
+  async inspect(ownerId, options = {}) {
+    return this.sidecar.request('inspect', {
+      ...options,
+      ownerId: ownerKey(ownerId),
+    }, { timeoutMs: 5_000 })
   }
 
   async query(ownerId, query, { limit = 5 } = {}, context = {}) {

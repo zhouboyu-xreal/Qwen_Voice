@@ -33,6 +33,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from config import split_memory_config
+from memory.memory_inspector import MemoryInspector
 from pwm_manager import PersonWorldModel
 
 
@@ -150,6 +151,17 @@ class AgentMemoryRuntime:
 
     def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Serialize stdio and local-IPC mutations through the memory service."""
+        # Reads use independent committed snapshots and never initialize an owner
+        # runtime or wait for its worker's long-running model calls.
+        if method == "inspect":
+            owner = _clean(params.get("ownerId"), 240)
+            if not owner:
+                raise ValueError("ownerId must be non-empty")
+            owner_dir = self._owner_dir / _owner_key(owner)
+            return MemoryInspector(
+                owner_dir / "memory.db", owner_dir / "user_model.db",
+                owner_name=str(self._manager_config.get("world_owner_entity_name") or "用户本人"),
+            ).inspect(params)
         handlers = {
             "observe": self.observe,
             "set_ambient_recording_state": self.set_ambient_recording_state,
