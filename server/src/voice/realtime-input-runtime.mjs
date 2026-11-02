@@ -47,6 +47,7 @@ export class RealtimeInputRuntime {
     reportFrontendError,
     onSpeechStarted = () => {},
     onSpeechStopped = () => {},
+    onInputDiagnostic = () => {},
     createInputTurnId = () => `text_${randomUUID().replaceAll('-', '')}`,
   }) {
     this.ownerId = ownerId
@@ -67,6 +68,7 @@ export class RealtimeInputRuntime {
     this.reportFrontendError = reportFrontendError
     this.onSpeechStarted = onSpeechStarted
     this.onSpeechStopped = onSpeechStopped
+    this.onInputDiagnostic = onInputDiagnostic
     this.createInputTurnId = createInputTurnId
   }
 
@@ -84,7 +86,7 @@ export class RealtimeInputRuntime {
     } else if (event.type === 'input_audio_buffer.committed') {
       this.#commitAudio(event)
     } else if (event.type === 'conversation.item.ambient_audio_transcription.completed') {
-      this.turns.completeInput(event.item_id)
+      this.#finishInput(event)
     } else if (
       event.type === 'conversation.item.input_audio_transcription.delta'
       || event.type === 'conversation.item.input_audio_transcription.text'
@@ -93,12 +95,12 @@ export class RealtimeInputRuntime {
     } else if (event.type === 'conversation.item.input_audio_transcription.completed') {
       this.#completeTranscript(event)
     } else if (event.type === 'conversation.item.input_audio_transcription.failed') {
-      const failedInput = this.turns.completeInput(event.item_id)
-      if (failedInput.duplicate) return true
+      const context = this.#finishInput(event)
+      if (!context) return true
       this.send({
         type: GatewayServerEvent.TRANSCRIPT_DISCARD,
         role: 'user',
-        turnId: failedInput.context?.turnId,
+        turnId: context.turnId,
       })
     }
     return true
@@ -106,6 +108,10 @@ export class RealtimeInputRuntime {
 
   #startSpeech(event) {
     const started = this.turns.beginVoice(event.item_id)
+    this.#diagnose(
+      event, started.context,
+      started.accepted ? 'speech_started' : 'manual_input_active', !started.accepted,
+    )
     if (!started.accepted) return
     this.clearResponseCandidate()
     this.onSpeechStarted({
@@ -136,13 +142,8 @@ export class RealtimeInputRuntime {
 
   #stopSpeech(event) {
     const stoppedTurn = this.turns.resolveInput(event.item_id)
-    if (
-      this.turns.isInputInvalid(event.item_id)
-      || this.turns.isStale(stoppedTurn)
-    ) {
-      this.turns.invalidateInput(event.item_id)
-      return
-    }
+    if (this.#rejectInput(event, stoppedTurn)) return
+    this.#diagnose(event, stoppedTurn, 'speech_stopped')
     this.onSpeechStopped({
       turnId: stoppedTurn.turnId,
       source: 'realtime_provider',
@@ -178,13 +179,8 @@ export class RealtimeInputRuntime {
 
   #commitAudio(event) {
     const committedInputTurn = this.turns.resolveInput(event.item_id)
-    if (
-      this.turns.isInputInvalid(event.item_id)
-      || this.turns.isStale(committedInputTurn)
-    ) {
-      this.turns.invalidateInput(event.item_id)
-      return
-    }
+    if (this.#rejectInput(event, committedInputTurn)) return
+    this.#diagnose(event, committedInputTurn, 'audio_committed')
     this.turns.endSpeech()
     this.announcementWindow.endSpeech()
     this.send({
@@ -196,9 +192,8 @@ export class RealtimeInputRuntime {
   }
 
   #streamTranscript(event) {
-    if (this.turns.isInputInvalid(event.item_id)) return
     const transcriptTurn = this.turns.resolveInput(event.item_id)
-    if (this.turns.isStale(transcriptTurn)) return
+    if (this.#rejectInput(event, transcriptTurn)) return
     const transcript = streamingInputTranscript(event)
     if (!transcriptTurn?.turnId || !transcript) return
     this.send({
@@ -211,13 +206,8 @@ export class RealtimeInputRuntime {
   }
 
   #completeTranscript(event) {
-    const completedInput = this.turns.completeInput(event.item_id)
-    const transcriptTurn = completedInput.context
-    if (
-      completedInput.invalid
-      || completedInput.duplicate
-      || this.turns.isStale(transcriptTurn)
-    ) return
+    const transcriptTurn = this.#finishInput(event)
+    if (!transcriptTurn) return
     const transcript = String(event.transcript || '').trim()
     if (!transcript) {
       this.send({
@@ -250,6 +240,40 @@ export class RealtimeInputRuntime {
       content: transcript,
       turnId: transcriptTurn.turnId,
     })
+  }
+
+  #diagnose(event, context, reason, ignored = false) {
+    this.onInputDiagnostic({
+      providerEventType: event.type,
+      providerEventId: String(event.event_id || ''),
+      itemId: String(event.item_id || ''),
+      turnId: context?.turnId || '',
+      turnGeneration: context?.turnGeneration ?? null,
+      currentTurnId: this.turns.current().turnId,
+      disposition: ignored ? 'ignored' : 'accepted',
+      reason,
+      transcriptChars: String(event.transcript || event.text || event.delta || '').length,
+    })
+  }
+
+  #rejectInput(event, context) {
+    const reason = !context?.turnId ? 'unmatched_input'
+      : this.turns.isInputInvalid(event.item_id) ? 'invalid_input'
+      : this.turns.isStale(context) ? 'stale_turn'
+      : this.turns.isInputComplete(context) ? 'input_already_complete' : ''
+    if (!reason) return false
+    this.#diagnose(event, context, reason, true)
+    return true
+  }
+
+  #finishInput(event) {
+    const completed = this.turns.completeInput(event.item_id)
+    const context = completed.context
+    const reason = completed.invalid ? (completed.reason || 'invalid_input')
+      : completed.duplicate ? 'input_already_complete'
+      : this.turns.isStale(context) ? 'stale_turn' : ''
+    this.#diagnose(event, context, reason || 'input_completed', Boolean(reason))
+    return reason ? null : context
   }
 
   submit(event) {

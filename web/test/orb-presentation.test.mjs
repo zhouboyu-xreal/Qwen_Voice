@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   desktopOrbClassName,
+  resolveOrbActivity,
   resolveOrbVisualState,
 } from '../src/desktop/orb-presentation.js'
 
@@ -9,7 +10,7 @@ test('keeps speaking animation active while microphone input is muted', () => {
   assert.equal(desktopOrbClassName({
     state: 'speaking',
     enabled: false,
-  }), 'desktop-orb-stage speaking input-muted')
+  }), 'desktop-orb-stage speaking input-muted orb-moving orb-lit')
 })
 
 test('exposes semantic listening, error, and dragging states to the desktop orb', () => {
@@ -18,7 +19,7 @@ test('exposes semantic listening, error, and dragging states to the desktop orb'
     enabled: true,
     error: true,
     dragging: true,
-  }), 'desktop-orb-stage listening enabled error dragging')
+  }), 'desktop-orb-stage listening enabled error dragging orb-moving orb-lit')
 })
 
 test('keeps the waking lifecycle distinct from an error', () => {
@@ -98,4 +99,34 @@ test('arbitrates visual states by layered priority', () => {
   // 无入参时待机；未知 Provider 状态不能泄漏给皮肤。
   assert.equal(resolveOrbVisualState(), 'idle')
   assert.equal(resolveOrbVisualState({ voiceState: 'custom' }), 'idle')
+})
+
+test('waits still and dim until recording starts or the wake word activates the orb', () => {
+  assert.deepEqual(resolveOrbActivity(), { moving: false, illuminated: false })
+  assert.deepEqual(resolveOrbActivity({ lifecycle: 'sleeping', ambientRecording: true }), {
+    moving: true, illuminated: false,
+  })
+  for (const lifecycle of ['waking', 'active']) {
+    for (const ambientRecording of [false, true]) {
+      assert.deepEqual(resolveOrbActivity({ lifecycle, ambientRecording }), {
+        moving: true, illuminated: true,
+      })
+    }
+  }
+})
+
+test('recording animates a sleeping orb independently of microphone input mute', () => {
+  for (const enabled of [true, false]) {
+    const className = desktopOrbClassName({ state: 'sleeping', lifecycle: 'sleeping', enabled, ambientRecording: true })
+    assert.match(className, /\borb-moving\b/)
+    assert.match(className, /\borb-dim\b/)
+    assert.doesNotMatch(className, /\borb-lit\b/)
+  }
+})
+
+test('returning to sleep keeps moving only while ambient recording is active', () => {
+  const sleeping = { state: 'sleeping', lifecycle: 'sleeping', enabled: true }
+  assert.match(desktopOrbClassName(sleeping), /\borb-still\b/)
+  assert.match(desktopOrbClassName({ ...sleeping, ambientRecording: true }), /\borb-moving\b/)
+  assert.match(desktopOrbClassName({ state: 'idle', lifecycle: 'active', enabled: false }), /\borb-moving orb-lit\b/)
 })

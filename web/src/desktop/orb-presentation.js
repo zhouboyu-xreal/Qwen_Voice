@@ -28,13 +28,20 @@ export function resolveOrbVisualState({
   return 'idle'
 }
 
+export function resolveOrbActivity({ lifecycle = 'sleeping', ambientRecording = false } = {}) {
+  const illuminated = lifecycle === 'waking' || lifecycle === 'active'
+  return { moving: illuminated || ambientRecording, illuminated }
+}
+
 export function desktopOrbClassName({
   state,
   enabled,
   error = false,
   dragging = false,
   lifecycle = 'active',
+  ambientRecording = false,
 }) {
+  const activity = resolveOrbActivity({ lifecycle, ambientRecording })
   return [
     'desktop-orb-stage',
     state,
@@ -42,5 +49,7 @@ export function desktopOrbClassName({
     error ? 'error' : '',
     dragging ? 'dragging' : '',
     lifecycle !== 'active' ? lifecycle : '',
+    activity.moving ? 'orb-moving' : 'orb-still',
+    activity.illuminated ? 'orb-lit' : 'orb-dim',
   ].filter(Boolean).join(' ')
 }

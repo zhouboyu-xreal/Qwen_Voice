@@ -26,6 +26,8 @@ export class RealtimeTurnState {
     this.committedTurnGeneration = 0
     this.userSpeaking = false
     this.voiceStartItemId = ''
+    this.pendingVoiceInput = null
+    this.completedInputGenerations = new Set()
     this.manualInputGeneration = null
   }
 
@@ -50,9 +52,10 @@ export class RealtimeTurnState {
     }
 
     this.userSpeaking = true
-    const known = itemId && !this.correlation.isComplete(itemId)
+    const candidate = itemId && !this.correlation.isComplete(itemId)
       ? this.correlation.resolve(itemId, null)
       : null
+    const known = candidate && !this.isInputComplete(candidate) ? candidate : null
     if (known) {
       this.turnId = known.turnId
       this.turnGeneration = known.turnGeneration
@@ -62,6 +65,7 @@ export class RealtimeTurnState {
       this.correlation.remember(itemId, this.current(), { replace: true })
     }
     this.voiceStartItemId = itemId || ''
+    this.pendingVoiceInput = this.current()
     return { accepted: true, context: this.current() }
   }
 
@@ -73,6 +77,7 @@ export class RealtimeTurnState {
     const supersededVoiceTurn = this.userSpeaking ? this.current() : null
     this.userSpeaking = false
     this.voiceStartItemId = ''
+    this.pendingVoiceInput = null
     this.turnGeneration = ++this.turnSequence
     this.turnId = turnId
     this.manualInputGeneration = this.turnGeneration
@@ -83,11 +88,37 @@ export class RealtimeTurnState {
   }
 
   resolveInput(itemId) {
-    return this.correlation.resolve(itemId, this.current())
+    const known = this.correlation.resolve(itemId, null)
+    if (known) return known
+    // Some providers use a different id for VAD and transcription. Bind that
+    // alias only while a voice input is awaiting completion; a late unknown
+    // item must never fall back to an already completed or manual turn.
+    const pending = this.pendingVoiceInput
+    if (!pending || this.isStale(pending) || this.isInputComplete(pending)) return null
+    return this.correlation.remember(itemId, pending)
+  }
+
+  isInputComplete(context) {
+    return this.completedInputGenerations.has(context?.turnGeneration)
   }
 
   completeInput(itemId) {
-    const completed = this.correlation.complete(itemId, this.current())
+    const context = this.resolveInput(itemId)
+    if (!context?.turnId) {
+      return { context: null, invalid: true, reason: 'unmatched_input' }
+    }
+    const completed = this.correlation.complete(itemId, context)
+    // Id-based deduplication alone misses alternate/missing provider ids.
+    // Seal the whole voice-input generation after its first terminal event.
+    if (this.isInputComplete(context)) return { ...completed, duplicate: true }
+    if (completed.invalid || this.isStale(context)) return completed
+    this.completedInputGenerations.add(context.turnGeneration)
+    while (this.completedInputGenerations.size > this.correlation.maxItems) {
+      this.completedInputGenerations.delete(this.completedInputGenerations.values().next().value)
+    }
+    if (this.pendingVoiceInput?.turnGeneration === context.turnGeneration) {
+      this.pendingVoiceInput = null
+    }
     if (
       this.voiceStartItemId
       && this.voiceStartItemId !== itemId
@@ -143,6 +174,7 @@ export class RealtimeTurnState {
   }
 
   advanceBoundary() {
+    this.pendingVoiceInput = null
     this.turnGeneration = ++this.turnSequence
     this.committedTurnGeneration = this.turnGeneration
     return this.current()
@@ -152,5 +184,6 @@ export class RealtimeTurnState {
     this.advanceBoundary()
     this.voiceStartItemId = ''
     this.correlation.clear()
+    this.completedInputGenerations.clear()
   }
 }

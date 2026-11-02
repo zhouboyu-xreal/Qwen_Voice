@@ -909,7 +909,7 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   --orb-ring: #a7bdf071;
 }
 .desktop-orb-stage.waking .fluid {
-  filter: grayscale(.55) saturate(.48) brightness(.84);
+  filter: saturate(1.25) brightness(1.08);
   animation-duration: 3s;
 }
 .goo {
@@ -930,10 +930,6 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   background: radial-gradient(ellipse 60% 50% at 32% 26%, #ffffff4d 0%, transparent 55%);
   box-shadow: inset -8px -10px 26px #ffffff40, inset 8px 10px 22px #5a4fd026;
 }
-.desktop-orb-stage.input-muted:not(.speaking) .goo,
-.desktop-orb-stage.input-muted:not(.speaking) .goo .fill {
-  animation-play-state: paused;
-}
 .desktop-orb-stage.connecting .goo,
 .desktop-orb-stage.starting .goo {
   box-shadow: 0 12px 30px #6f7b8038, 0 0 22px #7f898e3d;
@@ -944,12 +940,8 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
   box-shadow: 0 10px 26px #5f696e38, 0 0 18px #737e8335;
   filter: blur(1.2px) grayscale(.95) saturate(.12) brightness(.68);
 }
-.desktop-orb-stage.error .goo,
-.desktop-orb-stage.error .goo .fill {
-  animation-play-state: paused;
-}
 .desktop-orb-stage.waking .goo {
-  filter: blur(1.2px) grayscale(.58) saturate(.45) brightness(.82);
+  filter: blur(1.2px) brightness(1.16) saturate(1.2);
   animation-duration: 4s;
 }
 .desktop-orb-stage.working .goo {
@@ -958,6 +950,26 @@ header .ghost.active { color: white; border-color: #785cf480; background: #785cf
 }
 .desktop-orb-stage.working .goo .fill {
   animation-duration: 8s;
+}
+/* Motion follows recording/wake lifecycle, independently of microphone mute.
+   Include descendants and pseudo-elements so the inner liquid, breathing,
+   and outer rings all freeze together while awaiting the wake word. */
+.desktop-orb-stage .stage,
+.desktop-orb-stage .stage::before,
+.desktop-orb-stage .stage::after,
+.desktop-orb-stage .stage * {
+  animation-play-state: var(--orb-animation-state, paused);
+}
+.desktop-orb-stage.orb-still { --orb-animation-state: paused; }
+.desktop-orb-stage.orb-moving { --orb-animation-state: running; }
+.desktop-orb-stage .stage {
+  transition: filter .25s ease;
+}
+.desktop-orb-stage.orb-dim .stage {
+  filter: saturate(.55) brightness(.78);
+}
+.desktop-orb-stage.orb-lit .stage {
+  filter: saturate(1.15) brightness(1.08) drop-shadow(0 0 8px #8ca5ff66);
 }
 .desktop-orb-stage {
   position: relative;

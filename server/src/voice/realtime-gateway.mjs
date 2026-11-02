@@ -1021,6 +1021,9 @@ export function attachRealtimeGateway(server, {
       shouldEnsurePermissionResponse: context => responseTurnCandidate === context,
       ensurePermissionResponseFor,
       reportFrontendError,
+      onInputDiagnostic: fields => {
+        connectionLogger.info('realtime.input.event', fields)
+      },
       onSpeechStarted: fields => {
         // The keyword phrase itself is captured while the client is sleeping
         // and never reaches this callback. The active local ASR context is

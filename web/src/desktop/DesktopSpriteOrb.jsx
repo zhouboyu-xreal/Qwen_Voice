@@ -13,6 +13,7 @@ import {
 export default function DesktopSpriteOrb({
   skin,
   state,
+  motionEnabled = true,
   baseWorking = false,
   dragDirection = '',
   cue = null,
@@ -125,13 +126,14 @@ export default function DesktopSpriteOrb({
         canvas.width,
         canvas.height,
       )
-      timer = setTimeout(draw, Math.max(16, frame.remainingMs))
+      if (motionEnabled) timer = setTimeout(draw, Math.max(16, frame.remainingMs))
     }
     draw()
     return () => clearTimeout(timer)
   }, [
     assets,
     playback.key,
+    motionEnabled,
   ])
 
   if (!assets) return <div className="stage sprite-orb" />

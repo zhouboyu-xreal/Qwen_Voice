@@ -43,4 +43,5 @@ test('desktop renders a visible sleeping orb with microphone activation disabled
   assert.match(html, /你好，千问/)
   assert.match(html, /<button[^>]*disabled=""[^>]*aria-label="[^"]*你好，千问/)
   assert.doesNotMatch(html, /desktop-orb-stage hidden/)
+  assert.match(html, /class="desktop-orb-stage [^"]*\borb-still orb-dim\b/)
 })

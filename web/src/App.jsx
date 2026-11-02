@@ -17,11 +17,13 @@ import MessageContent from './MessageContent.jsx'
 import MultimodalComposer from './composer/MultimodalComposer.jsx'
 import TaskArtifacts from './TaskArtifacts.jsx'
 import PermissionActions from './PermissionActions.jsx'
+import AmbientRecordingButton from './desktop/AmbientRecordingButton.jsx'
 import DesktopFluidOrb from './desktop/DesktopFluidOrb.jsx'
 import DesktopSpriteOrb from './desktop/DesktopSpriteOrb.jsx'
 import KnowledgeLibraryPanel from './KnowledgeLibraryPanel.jsx'
 import {
   desktopOrbClassName,
+  resolveOrbActivity,
   resolveOrbVisualState,
 } from './desktop/orb-presentation.js'
 import {
@@ -930,6 +932,10 @@ export default function App() {
     backend: desktopBackendRuntime(backend),
   })
   const desktopHasWorkingTasks = desktopOrbMode && desktopTasksWorking(agentTasks)
+  const orbActivity = resolveOrbActivity({
+    lifecycle: desktopLifecycle,
+    ambientRecording: ambientRecordingState === 'recording',
+  })
   // 统一视觉状态仲裁：生命周期 → 异常 → 对话态 → 后台态。
   // 后台工作态仅在桌面悬浮球展示；等待授权由播报和任务卡片承载，
   // 不占用 Agent 动画状态。WebUI 也由任务卡片承载同类信息。
@@ -1307,6 +1313,7 @@ export default function App() {
           error: voice.visualError || voiceConnectionError,
           dragging: orbDragging,
           lifecycle: desktopLifecycle,
+          ambientRecording: ambientRecordingState === 'recording',
         })}
         aria-label={`qwen-audio · ${voice.visualError || voiceConnectionError ? t('连接异常') : labelFor(orbVisualState)}`}
         title={
@@ -1335,6 +1342,7 @@ export default function App() {
               <DesktopSpriteOrb
                 skin={orbSkinId}
                 state={orbVisualState}
+                motionEnabled={orbActivity.moving}
                 baseWorking={desktopHasWorkingTasks}
                 dragDirection={orbDragDirection}
                 cue={spriteAnimationCue}
@@ -1375,36 +1383,12 @@ export default function App() {
           >
             <OrbControlIcon type="microphone" muted={!voiceEnabled || desktopLifecycle !== 'active'} />
           </button>
-          <button
-            className={['starting', 'recording'].includes(ambientRecordingState)
-              ? 'active recording' : ''}
-            onPointerDown={event => {
-              // The orb itself is draggable. Start at pointer-down so a
-              // platform that suppresses the synthetic click during a drag
-              // gesture cannot turn this dedicated control into a no-op.
-              event.stopPropagation()
-              requestAmbientRecordingToggle()
-            }}
-            onClick={event => {
-              event.stopPropagation()
-              requestAmbientRecordingToggle()
-            }}
-            aria-label={ambientRecordingState === 'recording'
-              ? t('停止环境录音')
-              : ambientRecordingState === 'starting'
-                ? t('正在启动环境录音')
-              : ambientRecordingState === 'finalizing'
-                ? t('正在处理环境录音') : t('开始环境录音')}
-            title={ambientRecordingState === 'recording'
-              ? t('停止环境录音')
-              : ambientRecordingState === 'starting'
-                ? t('正在启动环境录音')
-              : ambientRecordingState === 'finalizing'
-                ? t('正在处理环境录音') : t('开始环境录音')}
-            disabled={ambientRecordingState === 'starting' || ambientRecordingState === 'finalizing'}
+          <AmbientRecordingButton
+            state={ambientRecordingState}
+            onToggle={requestAmbientRecordingToggle}
           >
             <OrbControlIcon type="recording" />
-          </button>
+          </AmbientRecordingButton>
           <button
             onClick={event => {
               event.stopPropagation()

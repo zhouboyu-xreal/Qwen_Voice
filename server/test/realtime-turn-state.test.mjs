@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { RealtimeTurnState } from '../src/voice/realtime-turn-state.mjs'
+import { TurnCorrelation } from '../src/voice/turn-correlation.mjs'
 
 function state() {
   return new RealtimeTurnState({
@@ -109,4 +110,46 @@ test('interrupt and close advance the stale-event boundary', () => {
   turns.close()
   assert.equal(turns.isInputInvalid('item-1'), false)
   assert.equal(turns.committedTurnGeneration, 3)
+})
+
+test('seals every provider alias in a completed voice generation', () => {
+  const turns = state()
+  const first = turns.beginVoice('speech').context
+  assert.deepEqual(turns.resolveInput('alias'), first)
+  assert.equal(turns.completeInput('speech').duplicate, undefined)
+  assert.equal(turns.completeInput('alias').duplicate, true)
+  assert.equal(turns.resolveInput('unmatched'), null)
+  assert.equal(turns.completeInput(undefined).invalid, true)
+  assert.notEqual(turns.beginVoice('alias').context.turnGeneration, first.turnGeneration)
+})
+
+test('retains alias correlation across later speech starts', () => {
+  const turns = state()
+  const first = turns.beginVoice('speech-1').context
+  assert.deepEqual(turns.resolveInput('alias-1'), first)
+  turns.beginVoice('speech-2')
+  assert.deepEqual(turns.resolveInput('alias-1'), first)
+})
+
+test('manual input and interruption close the pending voice fallback', () => {
+  const turns = state()
+  assert.equal(turns.resolveInput('orphan'), null)
+  turns.beginVoice('speech')
+  turns.beginManual('text')
+  turns.finishManualResponse(turns.current())
+  assert.equal(turns.resolveInput('orphan'), null)
+  turns.beginVoice('speech-2')
+  turns.advanceBoundary()
+  assert.equal(turns.resolveInput(undefined), null)
+})
+
+test('completed voice generations have bounded retention and are cleared on close', () => {
+  const turns = new RealtimeTurnState({ correlation: new TurnCorrelation({ maxItems: 2 }) })
+  for (let i = 0; i < 5; i += 1) {
+    turns.beginVoice(`speech-${i}`)
+    turns.completeInput(`speech-${i}`)
+  }
+  assert.equal(turns.completedInputGenerations.size, 2)
+  turns.close()
+  assert.equal(turns.completedInputGenerations.size, 0)
 })
