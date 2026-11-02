@@ -152,7 +152,12 @@ class SpeakerReferenceDetector:
                 "Install dependencies with: pip install -r requirements.txt"
             ) from exc
 
-        kwargs = {"model": self.model_id}
+        from .modelscope_model import resolve_modelscope_model_path
+
+        kwargs = {
+            "model": resolve_modelscope_model_path(self.model_id, logger=self.logger),
+            "disable_update": True,
+        }
         if device and device != "cpu":
             kwargs["device"] = device
         self.model = AutoModel(**kwargs)

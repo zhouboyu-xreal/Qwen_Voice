@@ -718,7 +718,7 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
 逐条审查输入的 `user_claim_signal` 及其对应 fact，判断该 fact 是否直接支持关于用户本人的显式主张；成立时生成 `user_claim`，不成立时返回空 `claims`。本模块不归纳观察到的行为规律，不生成未来目标或待办，也不判断新旧 claim 的关系。
 
 二、user_claim 的含义
-`user_claim` 是用户本人明确陈述或明确确认的、语义完整且可追溯到 fact 的主张，用于表达用户的身份、所属关系、人与事物的关系、偏好、约束或本人自述的持续行为。它不是 fact 的同义复述：fact 保存原始事件和对话情境，claim 抽取其中可复用、可与以后证据比较的用户主张。一条 claim 只表达一个核心判断，须写清主体、属性或关系、具体内容及必要的对象、时间和条件；“可复用”不等于永远有效，不能把有条件或阶段性的说法泛化成永久属性。
+`user_claim` 是用户本人明确陈述或明确确认的、语义完整且可追溯到 fact 的主张，用于表达用户的身份、所属关系、人与事物的关系、偏好、约束或本人自述的持续行为。fact 保存原始事件和对话情境，claim 从中选择可与以后证据比较的用户主张，不负责复述整段事件；两者的区别在于表达对象和职责，而不是 claim 必须更短或更抽象。可以沿用 fact 中准确的表达，不必为了避免同义复述而删除必要背景。一条 claim 只表达一个核心判断，须写清主体、属性或关系、具体内容及必要的对象、时间和条件；“可复用”不等于永远有效，不能把有条件或阶段性的说法泛化成永久属性。
 允许的 `claim_type` 为：
 - `identity_profile`：用户明确说明的身份、背景或角色，包括某个具体项目中的角色；
 - `affiliation`：用户与组织、团队、项目或地点的所属关系；
@@ -731,9 +731,17 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
 个人主张与适用范围审查：
 - 不要求 claim 跨项目、长期或普遍成立。只要 fact 确实表达用户本人的偏好、角色、职责边界或个人条件，就可保留只在特定项目、版本、阶段或情境下成立的 claim；不能因范围有限而一概丢弃，也不能为方便复用而删除范围。
 - 区分“用户对项目作出判断”与“关于用户本人的主张”。主持会议、讲解方案、确认团队决定或功能范围，本身不证明个人偏好、个人时间不足或本人承担全部执行。项目期限紧、资源不足等条件不能直接转移为用户个人约束；但明确的项目内个人选择倾向或职责关系可以提炼。
+- “用户认为”不自动构成 preference。技术可行性、性能影响或产品使用频次的判断，本身不表示本人的喜欢、厌恶或优先选择；只有 fact 另有明确个人立场时才提炼对应偏好。不能因 claim_type_hint=preference，就把“单手对体验影响较大”改成“用户重视单手体验”，或把“双手情况不太容易长时间出现”改成用户偏好单手或本人的行为惯例；只有这些项目判断而无合格个人主张时返回空 claims。明确的项目内偏好、个人感受和有条件的选择仍可保留，不因上述限制一概丢弃。
 - claim 的断言不得超出 fact 支持的范围：保留具体对象、项目、阶段、时间、前提、否定和主观程度，不自行加入“一贯、通常、长期、跨项目”等概括。原文确实是一般性本人自述时，也不反向缩窄成当前项目的选择。
 - 正例：“在本次 CES Demo 中，用户更倾向于保证交互稳定性，而不是增加手势种类”可形成保留“本次 CES Demo”限定的 preference；“在 CES Demo 项目中，用户负责交互方案设计，不负责算法实现”可形成项目限定的角色或职责关系，不能扩大为用户所有项目的职责。
 - 反例：“用户确认本次 CES Demo 先做功能、有余力再优化”仅说明项目取舍，若未明确表达个人偏好，不生成“用户在开发工作中偏好功能优先”；“本次 Demo 因时间紧缩减范围”不能生成“用户本人时间不足”。只有这些信息时返回空 claims。明确的“我一向先保证功能再优化”仍可形成一般性偏好，“本周晚上不接额外工作”仍可形成阶段性个人约束。
+
+claim_text 的最小必要上下文：
+- 压缩对话过程，不压缩决定主张含义的上下文。正文应让读者脱离原始会议后，仍能判断用户对什么持什么立场、在何种范围和条件下成立，并可与以后主张比较；不是给每条 claim 机械增加项目名前缀，也不是复制完整 fact。
+- 具体对象：保留所指功能、方案或关系对象的必要描述。遇到“方案一／方案二”“这个功能”“双手情况”等临时指代，只能用同一 fact summary 已提供的定义解析；标签可附带保留，但不能代替具体含义。若 summary 没有定义，signal、相邻条目、关键词或实体列表不能补造定义；缺少对象会使核心主张无法独立理解时返回空 claims，不用“当前项目中”等泛称掩盖缺失。
+- 适用范围与成立条件：保留影响含义的项目、功能、阶段、时间、场景和前提，例如出差、旁边有他人或某项功耗约束。无需每条都凑齐这些要素，不猜测项目名称；不能把局部选择改成全局偏好，也不能把场景例子擅自改为“仅在该场景”。
+- 比较与判断强度：偏好有明确替代方案、取舍依据或原因，且省略后会改变含义时，应一并保留；保持“希望、更倾向、不愿、可能、担心”等原有强度，不把影响判断改成明确选择。会议时间不自动等于主张有效期，不把阶段性“当前”改成永远成立；也不为补齐背景加入无关进展、参数或他人任务。
+- 组织示例（仅当对应内容在本条 fact 中明确给出，不把示例写入结果）：关于当前眼镜手势方案，若 fact 写“用户在出差或旁边有人时不愿使用比耶、call等手势，觉得尴尬难记，倾向grab、point”，claim 应保留这些情境、对象与倾向，不能只剩“用户不喜欢特殊手势”。若 fact 已说明方案一是直接用大幅openhand/grab做快捷播控、方案二是反手pinch打开OSD菜单再选功能，并说明用户偏好前者及原因，claim 应明确比较这两种交互方式，不能只写“用户偏好方案一”；若本条 fact 只有方案编号而无定义，不能借用本批其他 fact 的定义生成 claim。
 
 三、输入 user_claim_signal 的含义
 每个输入条目有独立的 `signal_id`、一条 `user_claim_signal` 及其所属 fact。同一个 fact 可能因多个 signal 重复出现，但它仍是同一份事实证据。signal 是 fact 提炼阶段给出的候选线索，不是最终 claim，也不是 fact 之外的新证据：`claim_type_hint` 提示可能的类别，`claim_anchor` 标出待核验的主题，`evidence_basis` 帮助定位证据，signal 的 `confidence` 只表示前一阶段的估计。必须以当前条目的 fact `summary` 核验该 signal，不得照搬 signal 的判断、借用其他条目的事实，或把重复出现的 fact 当作多次独立证据。hint 为 preference 或 constraint 不证明一定存在个人偏好或个人约束；高 confidence 也不能弥补缺失的个人主张或范围依据，降低 confidence 不能使过度泛化的 claim 合格。
@@ -743,9 +751,11 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
 2. 显式主张须来自用户本人直接陈述，或用户对他人具体说法的明确确认、否认、纠正；回应型 fact 必须同时保留对方说法和用户最终立场。仅有第三方报告、模糊应声、单次行为或助手推测时，不能生成 claim。
 3. 每条 claim 的 `subject_entity` 必须等于当前 fact 中非空的 `world_owner_entity`（用户本人），不得以其他人、产品用户或环境 speaker 为主体。`object_entity` 若非空，必须来自同一 fact 的 `entities`；没有明确用户主体时返回空 `claims`。
 4. 每条 claim 必须由当前 fact 的 `summary` 直接支持，`evidence_fact_ids` 必须恰好为当前条目 fact 的 `[fact_id]`。不得引用其他 fact，即使它们内容相似。
-5. `claim_text` 必须是自包含的完整陈述，写明会影响语义的对象、范围、时间及条件；必要限定必须写在正文中，不能仅依靠 object_entity、primary_domain 或有效期恢复含义。没有具体项目名称时保留 fact 中可确认的范围，不猜测名称，也不删除限定；不要拼接无关主张。`predicate` 使用简短稳定的小写英文键，如 `has_role`、`member_of`、`prefers`、`dislikes`、`requires`、`cannot`、`has_routine`。否定语义同时体现在 predicate 和 claim_text 中，不输出独立正负字段。
+5. `claim_text` 必须是自包含的完整陈述，按上述最小必要上下文保留会影响语义的对象、范围、时间及条件；必要限定必须写在正文中，不能仅依靠 object_entity、primary_domain 或有效期恢复含义。没有具体项目名称时保留 fact 中可确认的范围，不猜测名称，也不删除限定；不要拼接无关主张。`predicate` 使用简短稳定的小写英文键，如 `has_role`、`member_of`、`prefers`、`dislikes`、`requires`、`cannot`、`has_routine`，须与实际主张一致，不能一律使用 prefers。否定语义同时体现在 predicate 和 claim_text 中，不输出独立正负字段。
 6. `primary_domain` 只能是 `general|health|work|life|information|finance|family|learning|social|interest|travel`，优先选最具体领域。仅当 fact 明确给出有效时间时填写 `valid_from`/`valid_to`，不得猜测；有效期为空不代表永久成立，相对时间和情境限定仍保留在 claim_text 中。claim 的 `confidence` 应根据当前 fact 对最终主张的支持程度独立判断，不照搬 signal 的 confidence。
 7. 同一 fact 在多个条目中出现时仍逐条审查；相同主张可以由不同 signal 输出，系统后续去重。只返回 JSON，不要 markdown。
+
+输出前逐条复核：它是否确实是关于本人的主张，而不只是产品判断？对象离开原会话后能否识别？是否删掉了会改变含义的情境、比较对象或条件？是否强化了原立场？能从本条 summary 补回的必要内容应补回；证据不足时返回该 signal 的空 claims，不靠较低 confidence 使其合格。
 
 输出：
 {
@@ -759,7 +769,7 @@ EXPLICIT_USER_CLAIM_EXTRACTION_PROMPT_ZH = """你是个人世界模型的显式 
           "primary_domain": "general|health|work|life|information|finance|family|learning|social|interest|travel",
           "predicate": "",
           "object_entity": "",
-          "claim_text": "包含主体和完整语义的陈述",
+          "claim_text": "自包含的用户主张，保留具体对象及影响含义的适用范围、情境、条件和比较，不复制整段事件或补造背景",
           "valid_from": "",
           "valid_to": "",
           "evidence_fact_ids": [1],
@@ -991,6 +1001,7 @@ user_claim 是关于用户本人的可追溯主张，保存明确自述或有依
 - recurring_state：用户在什么条件下反复做什么，需要 claim 明确陈述频率、周期或条件—行为规律；本模块不从单次行为、喜好或同一次讨论中的反复提及归纳行为规律。“我每周三早上去健身房”可支持明确自述的规律，不要求再次重复自述。
 - situational_state：参考时点仍成立、尚在持续的个人处境，包括工作重心、注意力投入、约束、可用性、精力、压力、社交投入或个人准备条件。它不是不满足 enduring_state 的内容的兜底类型。项目进度、功能清单、技术指标、具体待办或用户提出某方案，本身不等于个人处境；不能加上“当前关注”就把它们转为 current_focus。个人情况明确时也不要求额外说明行为后果，“我最近很累”本身可以支持精力状态；“本周主要精力放在交付准备，其他需求暂不接”可以支持阶段性重心和可用性。
 合格 claim 也可以不产生 state。角色或职责关系本身不证明忙碌、压力或可用性；项目期限紧不证明个人时间不足。项目限定的偏好仍可保留在 claim 中，不应仅为消费输入而创建 state。
+上述个人状态筛选同样约束 create、reinforce 和 revise，不只是新建门槛。新 claim 与旧 state 属于同一项目或话题，不等于支持该个人状态；旧 state 已写“正在推进某项目”，也不能把该项目后续的功能要求和参数都追加进去。本轮只有技术目标、方案意见或项目资料，没有新增支持、改变或挑战具体个人状态的依据时，返回 operations=[]，不为消费这些 claim 而 reinforce。
 
 二、按以下步骤作增量判断
 1. 阅读每条新 claim 的完整主张、对象/项目/场景、时间/阶段、前提、否定和判断强度；结合有效期、来源和 reference_time 判断它是否支持上述个人状态，还是仅为事项意见。逐条评估不等于逐条输出操作。
@@ -1001,11 +1012,13 @@ user_claim 是关于用户本人的可追溯主张，保存明确自述或有依
 
 三、输出范围、身份与证据
 - state_text 必须自包含；结论的适用范围不能超过支撑它的 claim。不能只在 conditions 或 state_topic 中写项目名，正文却变成全局判断；同时保留“可能、倾向、只在”等判断强度。
-- conditions 是正文适用条件的结构化补充，不是新证据；无条件时允许 {}。更新旧 state 时输出本次判断后的完整条件，不能因为新 claim 没提到就删除仍有效的限定，不能无依据用 {} 清空旧范围。
+- 正文只表达用户本人的稳定倾向、重复行为或当前处境，不罗列用来理解证据的完整技术方案、性能目标、功能清单和具体待办。不是禁止技术词或数字：工具故障若直接阻碍本人负责的验证，可保留该依赖；“本周每天只能投入两小时”也应保留。只保留决定个人状态含义的必要条件，不展开接口、帧率、UI规则等实现细节，也不为了简短删除主体、项目、阶段或判断强度。
+- conditions 是正文适用条件的结构化补充，不是新证据；无条件时允许 {}。它只保存个人状态适用的项目、阶段、场景、前提、依赖或结束条件，不是存放技术参数、功能列表、候选方案和全部下一步任务的容器。更新旧 state 时输出本次判断后的完整条件，不能因为新 claim 没提到就删除仍有效的限定，不能无依据用 {} 清空旧范围；但旧 conditions 中与个人状态无关的技术资料不需要继续保留，不能把正文删掉的细节搬到 conditions。
+- 每次有依据的更新都输出重新审视后的完整状态，而非旧正文加新增细节。若旧 state 混有技术清单，在个人状态仍有证据支持的前提下保留其核心判断及有效限定，清理无关内容；核心判断不变且新证据确实支持时可 reinforce，个人处境或条件有变化时才 revise。reason 区分表达清理与真实状态变化，不能编造阶段变化；不为清理技术细节而 weaken/expire 仍成立的个人状态，更不因此把源 claim 判为无效。本轮没有合格个人证据时，不为清理旧正文而强行关联技术 claim。
 - state_kind 是类别，不是唯一身份。创建时用简短、稳定的中文 state_topic 区分具体状态；外文专名可保留，不使用英文蛇形标识或拼音。不同项目确需独立维护时可用 CES Demo 工作重点、项目 B 工作重点 区分；同一事项仅日期推进或表述变化时复用原主题，不为每条 claim 各建一条 state。同一状态跨来源只保留一个身份。更新须保持原 state_domain、state_type、state_kind、state_topic。
 - state_kind 对应选项：enduring_state 为 communication_style|decision_style|value_priority|risk_preference|privacy_preference|time_preference|work_style|lifestyle_preference|long_term_constraint；recurring_state 为 daily_routine|weekly_routine|work_routine|health_routine|social_routine|conditional_behavior；situational_state 为 current_focus|current_constraint|current_availability|current_energy|current_stress|current_social_engagement|current_preparation。不能为了套入某个类别，把技术可靠性要求改成人的风险偏好。
 - operations 仅允许 create|reinforce|revise|weaken|expire；create 的 target_state_id 为 0，其他操作引用 state_contexts 中的 ID，不跨本轮 state_domain。同一旧 state 本轮最多一个操作。
-- evidence 只引用输入 user_claim，至少一条 new_claim_cases.new_claim 作为触发；只列实际使用的 claim，未列出的旧证据由系统保留。反例使用 counterexample，不能当作 support。reason 说明个人状态的成立依据、适用范围、持续性及本轮为何需要操作，不能仅写“多条观点一致”。confidence 不替代证据。
+- evidence 只引用输入 user_claim，至少一条 new_claim_cases.new_claim 作为触发；只列实际支持、改变或挑战该个人判断的 claim，不能把同一项目的全部 claims 都列为 support。仅辅助理解的技术资料不能充当 support 或 change_trigger，可不引用或仅作 context；未列出的旧证据由系统保留。反例使用 counterexample，不能当作 support。reason 说明个人状态的成立依据、适用范围、持续性及本轮为何需要操作，不能仅写“多条观点一致”或复述技术方案。confidence 不替代证据。
 
 边界示例：
 - “用户更偏好稳定交互而非增加手势，限本次 Demo”：可以保留为局部 claim，不自动形成长期价值取向或当前注意力分配。
@@ -1013,6 +1026,9 @@ user_claim 是关于用户本人的可追溯主张，保存明确自述或有依
 - “用户希望光标延迟低于60ms”“文字提示只放教程”：分别是性能目标、设计意见，不直接生成 current_focus。
 - “用户长期偏好安静的住宿环境”：可以形成住宿场景下的稳定偏好，无需拔高为“追求内心平静”。
 - “用户本周晚上要陪家人，不接额外工作”：可以形成本周晚间的 situational_state，不否定长期工作偏好。
+- 已有“用户当前准备手势方案评审并推进POC验证”，新 claim 仅为“延迟目标低于60ms、光标作为OST子开关”：返回 operations=[]，不能把参数和开关规则补进正文、conditions 或 support evidence。
+- 新 claim 明确“本周本人主要负责POC验证，其他功能设计暂交给同事”：可以评估职责投入与阶段性重心变化，只保留本人投入及分工边界，不展开POC指标；没有明确说明时不补成忙碌、压力大或拒绝其他工作。
+- 旧 state 为“用户正组织手势方案评审；延迟60ms、图标加文字、光标默认关闭”，新证据明确本人仍在组织评审：可保留该个人准备状态，清理正文和 conditions 中的技术清单，仅关联支持本人准备状态的证据；这是表达修正，不表示技术要求、源 claim 或项目事实已经失效。示例不是当前证据，不直接写入结果。
 
 只返回 JSON：
 {
@@ -1023,7 +1039,7 @@ user_claim 是关于用户本人的可追溯主张，保存明确自述或有依
       "state_type": "enduring_state|recurring_state|situational_state",
       "state_kind": "受控选项",
       "state_topic": "具体状态的稳定主题标识",
-      "state_text": "完整的聚合状态陈述",
+      "state_text": "自包含的个人状态判断，保留必要范围和条件，不汇总技术方案、项目参数或待办清单",
       "conditions": {},
       "valid_from": "", "valid_to": "", "confidence": 0.8,
       "evidence": [{"evidence_type": "user_claim", "evidence_id": 1, "role": "change_trigger|support|counterexample|context", "weight": 1.0}],
@@ -1055,6 +1071,7 @@ runtime_context 仅使用实际提供的内容；为空不补造地点、行为�
 2. 可以从证据综合判断用户正在持续投入什么，不要求用户逐字说“这是我的当前重心”。例如本人持续组织评审、协调材料并推进尚未结束的发布准备，可支持该阶段的发布准备重心；仅参加一次发布方案讨论、被提到属于某项目或看到 thread 新建，不足以推出持续个人重心。不得进一步补成“全部精力投入”或“不接其他工作”，除非另有依据。
 3. 个人状态明确时无需额外行为后果：“用户最近一直很累”可以支持当前精力状态；本人负责下一步且正等待外部确认，可支持该事项中的个人依赖约束。但项目多、期限近、团队资源不足或事项受阻，不自动证明本人压力大、个人时间不足、不可打扰或情绪低落。长期倾向和重复规律不在本路径输出范围。
 4. state 维护当前有效判断，不追求比证据更抽象；允许与明确个人陈述采用相近表述。不要为制造用户画像而把项目意见变成价值观，或只把 thread 摘要缩写一遍。
+以上筛选同样适用于 create、reinforce 和 revise。先判断本轮事项变化是否实际支持、改变或挑战本人的投入、阶段、角色、依赖或其他个人条件，再决定操作；同项目相关性不等于个人状态的支持。旧 state 已写“正在推进某项目”，也不能持续向其中追加该项目的功能要求和技术指标；只有事项方案变化而没有个人状态依据时返回 operations=[]。
 
 二、判断当前有效性和已有状态
 1. 结合实际时间、阶段、用户参与关系和当前证据判断处境是否在 reference_time 仍成立。历史活动、过去阶段和未来安排不自动成为当前状态；有证据表明已经在为未来事项持续准备时，只保留当前的准备处境。
@@ -1063,9 +1080,15 @@ runtime_context 仅使用实际提供的内容；为空不补造地点、行为�
 4. 确需结束旧状态且有不同身份的新个人处境时，可同时 expire 和 create；同一身份延续优先 revise。同一旧 state 本轮最多一个操作。状态结束不表示历史 claim 错误。
 
 三、输出和证据约束
-- state_text 必须自包含地表达用户的当前个人处境，保留项目、阶段、时间、前提、主体和判断强度，不能扩大到未被支持的范围。conditions 是结构化补充，不弥补泛化正文；输出完整且有依据的当前条件，保留未被新证据修改或解除的旧限定，不因为本轮没提到就清空。
+- state_text 必须自包含地表达用户的当前个人处境，保留项目、阶段、时间、前提、主体和判断强度，不能扩大到未被支持的范围。只保留本人的投入、准备、约束或其他状态含义，不展开完整技术方案、性能目标、功能清单和待办。不是禁止技术词或数字：某工具故障若直接阻碍本人负责的验证，可保留该依赖，但不展开故障的完整实现方案；不能用“当前关注／准备”包装项目细节。
+- conditions 是结构化的个人状态适用范围、阶段、场景、前提、依赖或结束条件，不弥补泛化正文，也不是技术参数、功能列表、候选方案或任务清单。输出完整且有依据的当前条件，保留未被新证据修改或解除的旧限定，不因为本轮没提到就清空；旧 conditions 中与个人状态无关的技术资料可以清理，不把正文删除的技术细节搬入 conditions。
+- 每次有依据的更新都输出重新审视后的完整个人状态，不是旧正文加事项增量。旧 state 若混有技术清单，应保留有证据支持的个人核心判断和仍有效的限定，清理无关资料；新证据只支持原判断时可 reinforce，个人处境或条件确有变化时才 revise。reason 说明表达清理与实际变化的区别，不编造新阶段，不为清理细节而 weaken/expire 仍成立的状态；清理不表示源 facts、claims 或 thread 无效。只有技术变化、没有合格个人状态证据时，不为清理旧正文而强行提交操作。
 - valid_from/valid_to 仅依据证据，不把获知时间当成实际起点，不用项目 deadline 自动代替个人状态结束时间；期限未知可保留有依据的阶段或结束条件，不编造日期。只有证据足以支持的候选才操作，不要求每个 thread 都被覆盖。
-- 每项操作必须引用至少一个本轮 user_thread，以及与该 thread 对应的至少一条 user_thread_event、user_activity 或 fact 非 context 证据。fact 必须来自所引用 thread 的 activity_cases.linked_facts，事件来自其 change_events；不能借用其他 case 或未提供的历史 ID。thread 关联用于跟踪，事件或原始证据说明本轮判断。反例不可作 support，同源重复表达不能提高独立支持数量。
+- 每项操作的 evidence 列表必须同时包含两类引用，适用于 create、reinforce、revise、weaken、expire，不能省略其中任何一类：
+  1. 至少一条 evidence_type="user_thread"，evidence_id 使用本轮 thread_cases 中对应 thread 的真实 ID。该引用用于事项关联与追踪，可使用 role="context"，并不意味着整个 thread 都是个人状态的直接支持。
+  2. 至少一条属于该 thread 的 user_thread_event、user_activity 或 fact，role 必须为 change_trigger、support 或 counterexample，不能全部为 context。该证据必须实际支持、改变或挑战具体个人判断。
+- 只引用 user_thread_event 或 fact，即使它们能关联到 thread，也不能代替显式的 user_thread 引用；只引用 user_thread 也不满足直接证据要求。fact 必须来自所引用 thread 的 activity_cases.linked_facts，事件来自其 change_events，activity 使用对应 activity_cases 中的真实 ID；不能借用其他 case 或未提供的历史 ID。跨 thread 综合判断时，所有直接证据所属的 thread 都必须在 evidence 中显式引用。
+- 不能把全部事项事件和技术 facts 都列为 support。仅辅助理解的项目资料可不引用或仅作 context，不能充当 support 或 change_trigger；用于追踪的 user_thread 引用仍然必须保留。反例不可作 support，同源重复表达不能提高独立支持数量。
 - reason 说明本轮证据为何支持用户当前个人处境、范围和时效，以及为何需要该操作；不能仅复述项目进展。confidence 不代替缺失的个人证据。
 - state_domain 只能为 general、health、work、life、information、finance、family、learning、social、interest、travel；state_type 必须为 situational_state；state_kind 只能为 current_focus、current_constraint、current_availability、current_energy、current_stress、current_social_engagement、current_preparation。
 - 创建时用简短稳定的中文 state_topic 区分个人处境，外文专名可保留，不使用英文蛇形标识或拼音；不同项目确需独立维护时保留区分信息，同一状态不随日期改名。更新保持原 state_domain、state_type、state_kind、state_topic。
@@ -1076,6 +1099,9 @@ runtime_context 仅使用实际提供的内容；为空不补造地点、行为�
 - “本人下一步工作需等客户确认，当前无法继续推进”：可支持客户确认依赖下的 current_constraint；不能扩为用户所有工作都受阻。
 - “用户参加了一场会议”：保留为活动证据即可，不强制产生 state。
 - 明确“最近一直很累”时可更新相应精力状态，不要求同时说明影响了哪些工作。
+- 已有“用户正准备手势方案评审”，本轮仅调整导航键为两套实现或延迟目标为60ms：返回 operations=[]，不把方案变化追加到正文、conditions 或 support evidence。
+- 本轮证据明确本人正组织验证、但下一步需等待客户确认：只表达“用户当前组织方案验证，自己负责的下一步依赖客户确认”，必要时保留项目和阶段；不展开验证接口和指标，不推断个人压力或全部工作受阻。
+- 旧 state 含“用户正组织评审；延迟60ms、UI提示规则”等清单，本轮证据确认本人仍在组织评审：保留有依据的评审准备状态和适用限定，清理正文与 conditions 的技术资料，不否定源证据，也不编造个人阶段已变化。示例不是当前证据，不直接写入结果。
 
 只返回 JSON：
 {
@@ -1087,16 +1113,22 @@ runtime_context 仅使用实际提供的内容；为空不补造地点、行为�
       "state_type": "situational_state",
       "state_kind": "current_constraint",
       "state_topic": "客户方案确认依赖",
-      "state_text": "完整、有依据的用户当前个人状态",
+      "state_text": "有依据且自包含的用户当前投入、准备或其他个人处境，不复述项目技术方案或任务清单",
       "conditions": {},
       "valid_from": "",
       "valid_to": "",
       "confidence": 0.8,
       "evidence": [
         {
-          "evidence_type": "user_thread|user_thread_event|user_activity|fact",
+          "evidence_type": "user_thread",
           "evidence_id": 1,
-          "role": "change_trigger|support|counterexample|context",
+          "role": "context",
+          "weight": 1.0
+        },
+        {
+          "evidence_type": "user_thread_event",
+          "evidence_id": 2,
+          "role": "change_trigger",
           "weight": 1.0
         }
       ],
@@ -1105,6 +1137,7 @@ runtime_context 仅使用实际提供的内容；为空不补造地点、行为�
   ]
 }
 create 的 target_state_id 为 0，其他操作必须引用输入的现有 situational_state ID。
+evidence 示例中的 1、2 仅展示“thread 关联 + 直接证据”的组合，必须替换为输入中真实且归属一致的 ID；第二条可按实际依据替换为 user_activity 或 fact，并选择恰当的非 context 角色。没有足够依据同时提供这两类引用时，不输出该操作。
 
 reference_time：
 {reference_time}
