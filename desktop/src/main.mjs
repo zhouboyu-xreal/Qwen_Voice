@@ -1,4 +1,11 @@
 import {
+  loadPwmYamlSettings,
+  testPwmModel,
+  pwmSettingsChanged,
+  retainPwmSecrets,
+} from './pwm-model-service.mjs'
+import { publicPwmSettings } from '../../shared/pwm-model-settings.mjs'
+import {
   app,
   BrowserWindow,
   dialog,
@@ -149,6 +156,10 @@ const skinsRoot = clientPaths.skinsDirectory
 const desktopSettingsStore = createSettingsStore({
   configDir: runtimeEnvironment.configDirectory,
   clientDir: clientPaths.directory,
+  pwmDefaults: env => {
+    try { return loadPwmYamlSettings({ env, sourceRoot }) }
+    catch { return {} } // The sidecar reports malformed YAML; desktop settings must still open.
+  },
 })
 const desktopGatewayCredentials = createElectronGatewayCredentialStore({
   filePath: clientPaths.credentialsPath,
@@ -1413,7 +1424,7 @@ ipcMain.handle('qwen-audio-agent:settings-load', async event => {
   }
   const settings = desktopSettingsStore.load()
   return {
-    settings,
+    settings: publicPwmSettings(settings),
     skins: [...BUILTIN_ORB_SKINS, ...listSkins(skinsRoot)],
     runtime: setupRequired
       ? {
@@ -1564,6 +1575,22 @@ ipcMain.handle('qwen-audio-agent:updater-install', event => {
   }
 })
 
+const pwmProbeSenders = new Set()
+ipcMain.handle('qwen-audio-agent:pwm-test-model', async (event, { kind, settings } = {}) => {
+  if (!settingsWindow || event.sender !== settingsWindow.webContents) throw new Error('无权测试 PWM 连接')
+  if (!isLoopbackUrl(settings?.gatewayUrl || desktopSettingsStore.load().gatewayUrl)) {
+    throw new Error('PWM 由远端 Gateway 配置')
+  }
+  if (pwmProbeSenders.has(event.sender.id)) throw new Error('PWM 连接测试正在进行')
+  const senderId = event.sender.id
+  pwmProbeSenders.add(senderId)
+  try {
+    return await testPwmModel(kind, settings, desktopSettingsStore.load())
+  } finally {
+    pwmProbeSenders.delete(senderId)
+  }
+})
+
 ipcMain.handle('qwen-audio-agent:settings-save', async (event, settings) => {
   if (!settingsWindow || event.sender !== settingsWindow.webContents) {
     throw new Error('无权保存设置')
@@ -1577,6 +1604,7 @@ async function applyDesktopSettings(settings) {
   // Remote configuration belongs to its Gateway host. Only client preferences
   // are applied here; stale local model/backend fields must not block pairing.
   settings = { ...(remote ? clientSettingsPatch(settings) : settings), gatewayUrl: nextOrigin }
+  settings = retainPwmSecrets(settings)
   const current = readFileSync(runtimeEnvironment.configPath, 'utf8')
   const previous = desktopSettingsStore.load()
   const content = updateSettingsContent(current, settings, { scope: 'gateway' })
@@ -1628,8 +1656,10 @@ async function applyDesktopSettings(settings) {
     previous.wakeWordEnabled !== normalized.wakeWordEnabled
   )
   const languageChanged = previous.language !== normalized.language
+  const pwmChanged = pwmSettingsChanged(previous, normalized)
   const gatewayRuntimeChanged = (
-    gatewayChanged
+    pwmChanged
+    || gatewayChanged
     || apiKeyChanged
     || realtimeBaseUrlChanged
     || realtimeProviderChanged
@@ -1643,6 +1673,7 @@ async function applyDesktopSettings(settings) {
   if (!remote && nextOrigin === borrowedGatewayOrigin && gatewayRuntimeChanged) {
     const borrowedHealth = await readDesktopGatewayHealth(borrowedGatewayOrigin)
     if (borrowedHealth) {
+      if (pwmChanged) throw new Error('当前 Gateway 由其他进程管理，请先停止它再应用 PWM 设置')
       const nextEnvironment = desktopGatewayEnvironment({
         env: process.env,
         configured: parseEnv(content),
@@ -1688,6 +1719,7 @@ async function applyDesktopSettings(settings) {
     backend: normalized.agentProtocol,
     remoteGateway: remote,
     changes: {
+      pwm: pwmChanged,
       gateway: gatewayChanged,
       apiKey: apiKeyChanged,
       realtimeProvider: realtimeProviderChanged,
@@ -1752,7 +1784,7 @@ async function applyDesktopSettings(settings) {
   if (gatewayChanged || credentialChanged || languageChanged) await memoryWindow.reload()
   const runtime = await runtimeStatus(appOrigin)
   return {
-    settings: normalized,
+    settings: publicPwmSettings(normalized),
     restarted,
     restartRequired: false,
     runtime,

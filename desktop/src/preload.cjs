@@ -129,6 +129,7 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
       listener,
     )
   },
+  testPwmModel: (kind, settings) => ipcRenderer.invoke('qwen-audio-agent:pwm-test-model', { kind, settings }),
   loadSettings: () => ipcRenderer.invoke('qwen-audio-agent:settings-load'),
   loadRuntimeStatus: () => ipcRenderer.invoke(
     'qwen-audio-agent:settings-runtime-status',

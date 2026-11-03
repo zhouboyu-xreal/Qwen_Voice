@@ -110,6 +110,7 @@ class PersonWorldModel:
                 world_owner_entity_name=self._memory_runtime.manager.world_owner_entity_name,
                 logger=self._logger.getChild("user_proactive_service"),
             )
+            self._memory_runtime.manager.initialize_embedding_cache()
             self._task_scheduler.start()
         except Exception:
             if hasattr(self, "_task_scheduler"):

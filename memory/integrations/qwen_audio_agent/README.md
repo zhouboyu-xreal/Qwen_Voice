@@ -79,3 +79,28 @@ PWM 启动、worker 空闲和普通任务完成都不会自动触发周期检查
 活动表示采集当时观察到的行为、交谈或环境情境。观察时间来自整个来源窗口，
 不表示精确活动时长；来源窗口也可能包含其他话题。活动列表不套用意图和状态的
 领域、状态或当前/历史筛选。
+
+### 桌面 PWM 模型设置
+
+设置页按“语音前台 → PWM → 后台 Agent → 应用程序”排列。PWM（PersonalWorldModel）
+分别配置语言模型 `llm_client` 和向量模型 `embedding_client`，高级参数默认折叠。
+服务预设仅填充地址与模型名；Embedding 使用 OpenAI 兼容协议。
+
+本地设置保存在 Gateway 的 `config.env` 中，优先于 `config.yaml` 的
+`personal_world_model.llm_model` / `embedding_model`。没有桌面覆盖项时继续沿用 YAML，
+包括其中引用的环境变量密钥。对应覆盖项如下：
+
+| 客户端 | 环境变量（前缀均为 `QWEN_AUDIO_PWM_`） |
+| --- | --- |
+| 语言模型 | `LLM_BASE_URL`、`LLM_MODEL`、`LLM_API_KEY`、`LLM_TIMEOUT`、`LLM_MAX_TOKENS`、`LLM_THINKING`、`LLM_JSON_MODE` |
+| Embedding | `EMBEDDING_BASE_URL`、`EMBEDDING_MODEL`、`EMBEDDING_API_KEY`、`EMBEDDING_TIMEOUT`、`EMBEDDING_DIMENSIONS`、`EMBEDDING_BATCH_SIZE`、`EMBEDDING_NORMALIZE` |
+
+密钥分别保存，页面只接收“已配置”状态，留空保留原密钥。连接测试由桌面主进程发送固定测试文本，
+不会发送记忆内容、保存草稿或重启运行时。远端 Gateway 模式下，PWM 设置由远端主机管理。
+点击“应用”后，本地托管的 Gateway / PWM Sidecar 自动重新加载；其他进程管理的本地 Gateway
+需要先停止，再应用 PWM 设置。
+
+Embedding 的模型、请求地址、维度或归一化策略改变后，仅失效可再生成的向量缓存，保留事实、
+活动、意图、状态及原文。旧版本没有模型标记的向量也会在升级后重建一次。召回文档向量在共享
+工作队列中后台补齐，行动信号向量在后续模式更新时按需补齐；服务暂不可用的缓存会在下次启动时
+继续尝试。向量维度必须与服务真实输出一致，不会再补零或截断；重建期间仍可使用词法召回。

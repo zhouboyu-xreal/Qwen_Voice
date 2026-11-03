@@ -177,6 +177,46 @@ class UserMemoryDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
 
+    def ensure_embedding_profile(self, signature: str) -> bool:
+        """Invalidate only derived vectors when the configured space changes.
+
+        Legacy vectors without a recorded profile are rebuilt once as their
+        generating model cannot be established safely.
+        """
+        with self.transaction():
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS memory_embedding_profile "
+                "(id INTEGER PRIMARY KEY CHECK(id=1), signature TEXT NOT NULL)"
+            )
+            row = self._conn.execute(
+                "SELECT signature FROM memory_embedding_profile WHERE id=1"
+            ).fetchone()
+            if row is not None and row["signature"] == signature:
+                return False
+            self._conn.execute("UPDATE memory_recall_documents SET identity_text_embedding=NULL")
+            self._conn.execute("UPDATE memory_fact_user_action_signals SET action_text_embedding=NULL")
+            self._conn.execute(
+                "INSERT INTO memory_embedding_profile(id, signature) VALUES(1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET signature=excluded.signature", (signature,),
+            )
+        return True
+
+    def recall_documents_needing_embeddings(self, *, after_id: int = 0, limit: int = 32):
+        return [dict(row) for row in self._conn.execute(
+            "SELECT id, identity_text FROM memory_recall_documents "
+            "WHERE id>? AND identity_text_embedding IS NULL AND trim(identity_text)!='' "
+            "ORDER BY id LIMIT ?", (after_id, limit),
+        ).fetchall()]
+
+    def set_recall_document_embeddings(self, embeddings) -> None:
+        with self.transaction():
+            for document_id, embedding in embeddings:
+                self._conn.execute(
+                    "UPDATE memory_recall_documents SET identity_text_embedding=? "
+                    "WHERE id=? AND identity_text_embedding IS NULL",
+                    (_embedding_to_blob(embedding), int(document_id)),
+                )
+
     def close(self) -> None:
         self._conn.close()
 

@@ -19,7 +19,7 @@
           </span>
           <div>
             <h1>设置</h1>
-            <p>管理语音、后台 Agent 与桌面应用</p>
+            <p>管理语音、PWM、后台 Agent 与桌面应用</p>
           </div>
         </div>
         <div class="app-meta">
@@ -57,6 +57,8 @@
             aria-controls="voice-settings"
             data-settings-tab="voice"
           >语音前台</button>
+          <button id="pwm-tab" class="settings-tab" type="button" role="tab"
+            aria-selected="false" aria-controls="pwm-settings" data-settings-tab="pwm">PWM</button>
           <button
             id="backend-tab"
             class="settings-tab"
@@ -276,6 +278,125 @@
             </div>
           </section>
 
+          <section id="pwm-settings" class="settings-group" role="tabpanel" aria-labelledby="pwm-tab" data-settings-panel="pwm" hidden>
+            <p class="setting-hint pwm-note" data-remote-gateway-note hidden>PWM 由远端 Gateway 配置。</p>
+            <div data-local-gateway-settings>
+              <div class="pwm-section-heading">
+                <h2>个人世界模型</h2>
+                <span>PersonalWorldModel</span>
+              </div>
+              <p class="pwm-description">为记忆提炼、用户状态更新与语义检索配置模型。</p>
+              <article class="settings-card pwm-model-card">
+                <div class="pwm-card-heading">
+                  <div>
+                    <h3>语言模型</h3>
+                    <span>llm_client</span>
+                  </div>
+                  <button class="pwm-test-button" type="button" data-pwm-test="llm">测试连接</button>
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-llm-preset">服务预设</label>
+                  <select id="pwm-llm-preset" data-pwm-preset="llm">
+                    <option value="default">DeepSeek</option>
+                    <option value="custom">自定义 · OpenAI 兼容</option>
+                  </select>
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-llm-baseurl">服务地址</label>
+                  <input id="pwm-llm-baseurl" data-pwm-field="pwmLlmBaseUrl" type="url" spellcheck="false" />
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-llm-model">模型名称</label>
+                  <input id="pwm-llm-model" data-pwm-field="pwmLlmModel" type="text" spellcheck="false" />
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-llm-key">API Key</label>
+                  <div class="field-with-action">
+                    <input id="pwm-llm-key" data-pwm-field="pwmLlmApiKey" type="password" autocomplete="new-password" spellcheck="false" />
+                    <button class="link-button" type="button" data-pwm-reveal="llm" aria-label="显示新输入的密钥" aria-pressed="false">显示</button>
+                  </div>
+                </div>
+                <details class="pwm-advanced">
+                  <summary>高级参数</summary>
+                  <div class="setting-row">
+                    <label for="pwm-llm-timeout">超时（秒）</label>
+                    <input id="pwm-llm-timeout" data-pwm-field="pwmLlmTimeout" type="number" min="1" max="600" step="1" />
+                  </div>
+                  <div class="setting-row">
+                    <label for="pwm-llm-maxtokens">最大 Tokens</label>
+                    <input id="pwm-llm-maxtokens" data-pwm-field="pwmLlmMaxTokens" type="number" min="1" max="262144" step="1" />
+                  </div>
+                  <div class="setting-row">
+                    <label for="pwm-thinking">Thinking</label>
+                    <select id="pwm-thinking" data-pwm-field="pwmLlmThinking">
+                      <option value="disabled">关闭</option>
+                      <option value="enabled">开启</option>
+                    </select>
+                  </div>
+                  <div class="setting-row">
+                    <label for="pwm-json">JSON 模式</label>
+                    <input id="pwm-json" data-pwm-field="pwmLlmJsonMode" type="checkbox" />
+                  </div>
+                </details>
+                <p class="pwm-test-status" data-pwm-status="llm" role="status" aria-live="polite">
+                </p>
+              </article>
+              <article class="settings-card pwm-model-card">
+                <div class="pwm-card-heading">
+                  <div>
+                    <h3>Embedding 模型</h3>
+                    <span>embedding_client</span>
+                  </div>
+                  <button class="pwm-test-button" type="button" data-pwm-test="embedding">测试连接</button>
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-embedding-preset">服务预设</label>
+                  <select id="pwm-embedding-preset" data-pwm-preset="embedding">
+                    <option value="default">智谱 · OpenAI 兼容</option>
+                    <option value="custom">自定义 · OpenAI 兼容</option>
+                  </select>
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-embedding-baseurl">服务地址</label>
+                  <input id="pwm-embedding-baseurl" data-pwm-field="pwmEmbeddingBaseUrl" type="url" spellcheck="false" />
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-embedding-model">模型名称</label>
+                  <input id="pwm-embedding-model" data-pwm-field="pwmEmbeddingModel" type="text" spellcheck="false" />
+                </div>
+                <div class="setting-row">
+                  <label for="pwm-embedding-key">API Key</label>
+                  <div class="field-with-action">
+                    <input id="pwm-embedding-key" data-pwm-field="pwmEmbeddingApiKey" type="password" autocomplete="new-password" spellcheck="false" />
+                    <button class="link-button" type="button" data-pwm-reveal="embedding" aria-label="显示新输入的密钥" aria-pressed="false">显示</button>
+                  </div>
+                </div>
+                <details class="pwm-advanced">
+                  <summary>高级参数</summary>
+                  <div class="setting-row">
+                    <label for="pwm-embedding-dimensions">向量维度</label>
+                    <input id="pwm-embedding-dimensions" data-pwm-field="pwmEmbeddingDimensions" type="number" min="8" max="65536" step="1" />
+                    <p class="setting-hint">向量维度须与服务实际输出一致。</p>
+                  </div>
+                  <div class="setting-row">
+                    <label for="pwm-embedding-batchsize">批量大小</label>
+                    <input id="pwm-embedding-batchsize" data-pwm-field="pwmEmbeddingBatchSize" type="number" min="1" max="1024" step="1" />
+                  </div>
+                  <div class="setting-row">
+                    <label for="pwm-embedding-timeout">超时（秒）</label>
+                    <input id="pwm-embedding-timeout" data-pwm-field="pwmEmbeddingTimeout" type="number" min="1" max="600" step="1" />
+                  </div>
+                  <div class="setting-row">
+                    <label for="pwm-normalize">向量归一化</label>
+                    <input id="pwm-normalize" data-pwm-field="pwmEmbeddingNormalize" type="checkbox" />
+                  </div>
+                </details>
+                <p class="pwm-test-status" data-pwm-status="embedding" role="status" aria-live="polite">
+                </p>
+              </article>
+              <p class="pwm-description">应用后重新加载本地 PWM。更换 Embedding 模型、地址或维度后，后台重建向量缓存，保留原始记忆。</p>
+            </div>
+          </section>
           <section
             id="backend-settings"
             class="settings-group"

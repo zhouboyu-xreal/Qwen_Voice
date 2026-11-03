@@ -8,6 +8,8 @@ semantic matching instead of treating a synthetic vector as real evidence.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import re
@@ -85,6 +87,13 @@ class EmbeddingClient:
         self._normalize = bool(merged.get("normalize", True))
         self._timeout = int(merged.get("timeout") or 30)
         self._batch_size = max(1, int(merged.get("batch_size") or 32))
+
+    @property
+    def model_signature(self) -> str:
+        """Identity of the vector space; credentials never participate."""
+        value = [self._provider, self._model, _build_openai_embedding_url(self._base_url),
+                 self._dim, self._normalize]
+        return hashlib.sha256(json.dumps(value).encode("utf-8")).hexdigest()
 
     @property
     def dimension(self) -> int:
@@ -193,10 +202,11 @@ class EmbeddingClient:
     def _as_vector(self, raw: Any) -> np.ndarray:
         vector = np.asarray(raw, dtype=np.float32).reshape(-1)
         if vector.size != self._dim:
-            resized = np.zeros((self._dim,), dtype=np.float32)
-            keep = min(self._dim, vector.size)
-            resized[:keep] = vector[:keep]
-            vector = resized
+            raise ValueError(
+                f"Embedding dimension mismatch: expected {self._dim}, got {vector.size}"
+            )
+        if not np.all(np.isfinite(vector)):
+            raise ValueError("Embedding contains non-finite values")
         if self._normalize:
             norm = float(np.linalg.norm(vector))
             if norm > 0:

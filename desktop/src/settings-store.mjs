@@ -93,6 +93,7 @@ export function createSettingsStore({
   configDir,
   clientDir,
   env = process.env,
+  pwmDefaults = () => ({}),
 } = {}) {
   const directory = requiredConfigDirectory(configDir)
   if (!String(clientDir || '').trim()) {
@@ -110,7 +111,8 @@ export function createSettingsStore({
     updateSettingsContent(readTextFile(settingsPath), {}, { scope: 'gateway' })
     + updateSettingsContent(readTextFile(clientSettingsPath), {}, { scope: 'client' })
   )
-  const load = () => parseSettings(readContent(), env)
+  const parse = content => parseSettings(content, env, pwmDefaults({ ...env, ...parseEnv(content) }))
+  const load = () => parse(readContent())
 
   // The same readiness the startup gate reads: stored values first, then the
   // live environment for slots the file leaves unset — mirroring how the
@@ -150,7 +152,7 @@ export function createSettingsStore({
     clientSettingsPath,
     uiStatePath,
     load,
-    preview: settings => parseSettings(updateSettingsContent(readContent(), settings), env),
+    preview: settings => parse(updateSettingsContent(readContent(), settings)),
 
     save(settings) {
       // Validate the complete form before writing either owner's file.

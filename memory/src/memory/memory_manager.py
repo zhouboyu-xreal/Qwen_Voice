@@ -250,6 +250,9 @@ class MemoryNodeManager:
             event_context_limit=self._memory_cfg.get("user_thread_event_context_limit", 16),
         )
         self._task_scheduler.register_handler(
+            "memory_embedding_cache_refresh", self._rebuild_embedding_cache,
+        )
+        self._task_scheduler.register_handler(
             "memory_fact_extraction", self._process_memory_fact_extraction_task,
         )
         self._task_scheduler.register_handler(
@@ -571,6 +574,40 @@ class MemoryNodeManager:
     def set_embedding_client(self, embedding_client: Optional[EmbeddingClient]) -> None:
         """Share a pre-initialized embedding client with memory runtime callers."""
         self._embedding_client = embedding_client
+
+    def initialize_embedding_cache(self) -> None:
+        """Invalidate incompatible caches before readers and workers start."""
+        self._ensure_embedding_client()
+        client = self._embedding_client
+        if not isinstance(client, EmbeddingClient) or not isinstance(self._db, UserMemoryDB):
+            return
+        changed = self._db.ensure_embedding_profile(client.model_signature)
+        self._logger.info("PWM embedding cache profile_changed=%s", changed)
+        if self._db.recall_documents_needing_embeddings(limit=1):
+            self._task_scheduler.submit("memory_embedding_cache_refresh", {})
+
+    def _rebuild_embedding_cache(self) -> Dict[str, Any]:
+        """Rebuild derived caches on the writer worker; recall remains read-only."""
+        client = self._embedding_client
+        after_id = 0
+        rebuilt = 0
+        while True:
+            rows = self._db.recall_documents_needing_embeddings(
+                after_id=after_id, limit=client.batch_size,
+            )
+            if not rows:
+                break
+            vectors = client.embed_batch(row["identity_text"] for row in rows)
+            updates = [(row["id"], vector) for row, vector in zip(rows, vectors)
+                       if vector is not None]
+            if updates:
+                self._db.set_recall_document_embeddings(updates)
+                rebuilt += len(updates)
+            after_id = rows[-1]["id"]
+            if not updates:
+                break  # Retry unfilled caches on the next runtime start.
+        self._logger.info("PWM embedding cache rebuilt=%s", rebuilt)
+        return {"status": "ok", "rebuilt": rebuilt}
 
     def _process_memory_user_thread_update_task(
         self, *, activity_ids: List[int], reference_timestamp: Any = None,

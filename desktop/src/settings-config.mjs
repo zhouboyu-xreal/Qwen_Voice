@@ -1,3 +1,9 @@
+import {
+  PWM_SETTING_KEYS,
+  parsePwmSettings,
+  normalizePwmSettings,
+  pwmSettingsPatch,
+} from '../../shared/pwm-model-settings.mjs'
 import { parseEnv } from 'node:util'
 import {
   backendDefinition,
@@ -63,6 +69,7 @@ export function clientSettingsPatch(settings) {
 
 const SETTING_KEYS = {
   ...CLIENT_SETTING_KEYS,
+  ...PWM_SETTING_KEYS,
   dashscopeApiKey: 'DASHSCOPE_API_KEY',
   realtimeBaseUrl: 'QWEN_AUDIO_REALTIME_BASE_URL',
   realtimeProvider: 'QWEN_AUDIO_REALTIME_PROVIDER',
@@ -170,7 +177,7 @@ function encoded(value) {
   return `"${text.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`
 }
 
-export function parseSettings(content = '', fallback = {}) {
+export function parseSettings(content = '', fallback = {}, pwmDefaults = {}) {
   const values = parseEnv(content)
   const agentProtocol = cleanAgentProtocol(configured(
     values,
@@ -290,6 +297,7 @@ export function parseSettings(content = '', fallback = {}) {
     fallback.QWEN_OMNI_REALTIME_VOICE || DEFAULTS.omniRealtimeVoice,
   ) || '').trim()
   return {
+    ...parsePwmSettings({ ...fallback, ...values }, pwmDefaults),
     gatewayUrl: configured(
       values,
       'QWEN_AUDIO_AGENT_URL',
@@ -402,6 +410,7 @@ export function normalizeSettings(settings = {}) {
     throw new Error('请填写外部后台服务地址')
   }
   return {
+    ...normalizePwmSettings(settings),
     gatewayUrl: cleanUrl(
       settings.gatewayUrl,
       DEFAULTS.gatewayUrl,
@@ -500,6 +509,7 @@ export function realtimeSettingsConfigured(settings = {}) {
 // into environment slots that are still unset, so a freshly saved API Key
 // would look ignored until the app itself restarts.
 export function applySettingsEnvironment(settings = {}, env = process.env) {
+  settings = pwmSettingsPatch(settings)
   const normalized = normalizeSettings(settings)
   const backend = backendDefinition(normalized.agentProtocol)
   const entries = Object.entries(SETTING_KEYS)
@@ -526,6 +536,7 @@ export function applySettingsEnvironment(settings = {}, env = process.env) {
 // preferences use separate files without duplicating validation or schemas.
 export function updateSettingsContent(content = '', settings = {}, { scope = 'all' } = {}) {
   if (!['all', 'gateway', 'client'].includes(scope)) throw new TypeError('invalid settings scope')
+  settings = pwmSettingsPatch(settings)
   const accepts = key => scope === 'all'
     || (scope === 'client') === CLIENT_ENVIRONMENT_KEYS.has(key)
   const normalized = normalizeSettings(settings)

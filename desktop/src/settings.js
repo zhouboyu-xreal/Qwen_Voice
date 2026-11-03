@@ -1,3 +1,5 @@
+import { createPwmSettingsForm } from './pwm-settings-form.mjs'
+import { PWM_FIELDS } from '../../shared/pwm-model-settings.mjs'
 import {
   backendOptionStates,
   backendSelectionAvailable,
@@ -84,6 +86,15 @@ const openLogs = document.querySelector('#open-logs')
 const submit = form.querySelector('button[type="submit"]')
 const settingsTabs = [...document.querySelectorAll('[data-settings-tab]')]
 const settingsPanels = [...document.querySelectorAll('[data-settings-panel]')]
+const pwmForm = createPwmSettingsForm({
+  document,
+  desktop: window.qwenAudioAgentDesktop,
+  translate: (text, params) => t(text, params),
+  onChange: () => {
+    showMessage('')
+    updateApplyState()
+  },
+})
 const voiceReferenceRecordingStatus = document.querySelector(
   '#voice-reference-recording-status',
 )
@@ -870,6 +881,7 @@ const BAILIAN_API_KEY_URL = 'https://bailian.console.aliyun.com/?tab=model#/api-
 
 function formSettings() {
   return {
+    ...pwmForm.values(),
     gatewayUrl: gatewayUrl.value,
     orbSkin: orbSkinSelect.value,
     autoHideSeconds: Number(autoHideSeconds.value),
@@ -896,6 +908,7 @@ function formSettings() {
 
 function fingerprint(value) {
   return JSON.stringify({
+    ...Object.fromEntries(Object.keys(PWM_FIELDS).map(field => [field, value[field]])),
     gatewayUrl: value.gatewayUrl,
     orbSkin: value.orbSkin,
     autoHideSeconds: value.autoHideSeconds,
@@ -938,6 +951,7 @@ function updateApplyState() {
     backendReport,
     selectedBackend(),
   )
+  pwmForm.setUnavailable(remote || applying)
   submit.disabled = (
     applying
     || recordingWakeShortcut
@@ -1145,6 +1159,7 @@ function renderSkinOptions(selected) {
 }
 
 function render() {
+  pwmForm.render(settings)
   gatewayUrl.value = settings.gatewayUrl
   renderSkinOptions(settings.orbSkin)
   const hideValue = String(settings.autoHideSeconds ?? 120)

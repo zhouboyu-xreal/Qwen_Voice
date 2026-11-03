@@ -5,9 +5,10 @@ const { resolve } = require('node:path')
 // accessing user configuration, or connecting to any external service.
 module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
   const { parseSettings, clientSettingsPatch } = await import('../src/settings-config.mjs')
+  const { publicPwmSettings } = await import('../../shared/pwm-model-settings.mjs')
   const { parseDesktopGatewayInput } = await import('../src/gateway-connection.mjs')
   const { encodeGatewayPairingCode, encodeGatewayBrowserPairingCode } = await import('../../shared/gateway/remote-access.mjs')
-  let settings = { ...parseSettings('', {}), agentProtocol: 'qwen' }
+  let settings = { ...parseSettings('', {}), agentProtocol: 'qwen', language: 'zh-CN', pwmLlmApiKey: 'fixture-llm-key' }
   let saves = 0
   const runtime = () => ({
     gatewayConnected: true, gatewayUrl: settings.gatewayUrl,
@@ -15,7 +16,12 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
     backend: { protocol: 'qwen', label: 'Qwen Code', connected: true },
   })
   const handlers = {
-    'settings-load': () => ({ settings, runtime: runtime(), skins: [], wakeShortcutRegistered: true }),
+    'settings-load': () => ({ settings: publicPwmSettings(settings), runtime: runtime(), skins: [], wakeShortcutRegistered: true }),
+    'pwm-test-model': (_event, draft) => {
+      assert.equal(draft.kind, 'llm')
+      assert.equal(draft.settings.pwmLlmModel, 'fixture-chat')
+      return { ok: true }
+    },
     'settings-runtime-status': runtime,
     'settings-detect-backends': () => ({ backends: [{
       id: 'qwen', label: 'Qwen Code', ready: true, selected: true,
@@ -24,9 +30,10 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
     'updater-status': () => ({ phase: 'idle' }),
     'settings-save': (_event, draft) => {
       const target = parseDesktopGatewayInput(draft.gatewayUrl)
+      if (!draft.pwmLlmApiKey) delete draft.pwmLlmApiKey
       settings = { ...settings, ...(target.remote ? clientSettingsPatch(draft) : draft), gatewayUrl: target.origin }
       saves += 1
-      return { settings, runtime: runtime(), wakeShortcutRegistered: true }
+      return { settings: publicPwmSettings(settings), runtime: runtime(), wakeShortcutRegistered: true }
     },
   }
   for (const [name, handler] of Object.entries(handlers)) {
@@ -56,6 +63,41 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
       poll()
     })`)
     assert.equal(await evaluate(`document.querySelector('#gateway-pairing-code') === null`), true)
+    assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-settings-tab]'), tab => tab.dataset.settingsTab)`), ['voice', 'pwm', 'backend', 'app'])
+    assert.equal(await evaluate(`(() => {
+      document.querySelector('#pwm-tab').click()
+      const key = document.querySelector('#pwm-llm-key')
+      return document.querySelector('.pwm-section-heading > span').textContent === 'PersonalWorldModel'
+        && document.querySelector('.pwm-card-heading h3').textContent === '语言模型'
+        && key.value === '' && key.placeholder === '已配置；留空保留'
+    })()`), true)
+    await evaluate(`new Promise((resolve, reject) => {
+      const model = document.querySelector('[data-pwm-field="pwmLlmModel"]')
+      model.value = 'fixture-chat'
+      model.dispatchEvent(new Event('input', { bubbles: true }))
+      document.querySelector('[data-pwm-test="llm"]').click()
+      const deadline = Date.now() + 3000
+      const poll = () => {
+        if (document.querySelector('[data-pwm-status="llm"]').classList.contains('success')) return resolve()
+        if (Date.now() > deadline) return reject(new Error('PWM probe did not complete through preload'))
+        setTimeout(poll, 20)
+      }
+      poll()
+    })`)
+    assert.equal(await evaluate(`document.querySelector('#pwm-llm-preset').value`), 'custom')
+    await evaluate(`new Promise((resolve, reject) => {
+      document.querySelector('#settings-form').requestSubmit()
+      const deadline = Date.now() + 3000
+      const poll = () => {
+        if (document.querySelector('button[type=submit]').disabled) return resolve()
+        if (Date.now() > deadline) return reject(new Error('PWM settings were not applied'))
+        setTimeout(poll, 20)
+      }
+      poll()
+    })`)
+    assert.equal(settings.pwmLlmModel, 'fixture-chat')
+    assert.equal(settings.pwmLlmApiKey, 'fixture-llm-key')
+    assert.equal(await evaluate(`document.querySelector('#pwm-llm-key').value`), '')
     const legacyCode = { version: 1, gateway_url: 'https://gateway.example', pairing_code: 'test-code', expires_at: Date.now() + 60_000 }
     const links = [
       encodeGatewayPairingCode(legacyCode),
@@ -83,7 +125,7 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
         poll()
       })`)
     }
-    assert.equal(saves, links.length)
+    assert.equal(saves, links.length + 1)
     assert.equal(await evaluate(`document.querySelector('[data-local-gateway-settings]').hidden`), true)
     assert.equal(await evaluate(`document.querySelector('#current-backend').textContent.includes('待配置')`), false)
     assert.equal(await evaluate(`(() => {

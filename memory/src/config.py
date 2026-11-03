@@ -43,6 +43,47 @@ def _expand_env_refs(value: Any) -> Any:
     return value
 
 
+def _apply_pwm_environment(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Desktop config.env overrides; YAML remains the default for every sidecar."""
+    pwm = config.get("personal_world_model")
+    if not isinstance(pwm, dict):
+        return config
+    fields = {
+        "LLM_BASE_URL": ("llm_model", "llm_base_url", str),
+        "LLM_MODEL": ("llm_model", "llm_name", str),
+        "LLM_API_KEY": ("llm_model", "llm_api_key", str),
+        "LLM_TIMEOUT": ("llm_model", "llm_timeout", int),
+        "LLM_MAX_TOKENS": ("llm_model", "llm_max_tokens", int),
+        "LLM_THINKING": ("llm_model", "llm_thinking", str),
+        "LLM_JSON_MODE": ("llm_model", "llm_json_mode", bool),
+        "EMBEDDING_BASE_URL": ("embedding_model", "base_url", str),
+        "EMBEDDING_MODEL": ("embedding_model", "model", str),
+        "EMBEDDING_API_KEY": ("embedding_model", "api_key", str),
+        "EMBEDDING_TIMEOUT": ("embedding_model", "timeout", int),
+        "EMBEDDING_DIMENSIONS": ("embedding_model", "dimensions", int),
+        "EMBEDDING_BATCH_SIZE": ("embedding_model", "batch_size", int),
+        "EMBEDDING_NORMALIZE": ("embedding_model", "normalize", bool),
+    }
+    for suffix, (section, field, convert) in fields.items():
+        value = os.environ.get(f"QWEN_AUDIO_PWM_{suffix}")
+        if value is None or not value.strip():
+            continue
+        if not isinstance(pwm.get(section), dict):
+            continue  # split_memory_config owns missing-section validation.
+        if convert is bool:
+            text = value.strip().lower()
+            if text not in {"1", "0", "true", "false", "yes", "no", "on", "off"}:
+                raise ValueError(f"Invalid PWM boolean: {suffix}")
+            value = text in {"1", "true", "yes", "on"}
+        else:
+            value = convert(value.strip())
+        pwm[section][field] = value
+        if section == "embedding_model":
+            # 'openai' selects the API protocol, independently of the vendor.
+            pwm[section]["provider"] = "openai"
+    return config
+
+
 def load_project_config(source: Optional[Path | str | Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Load the project YAML (or normalize an already loaded YAML mapping)."""
     if isinstance(source, Mapping):
@@ -58,7 +99,8 @@ def load_project_config(source: Optional[Path | str | Mapping[str, Any]] = None)
         loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         if not isinstance(loaded, dict):
             raise ValueError(f"Config root must be a mapping: {path}")
-    return _expand_env_refs(loaded)
+    config = _expand_env_refs(loaded)
+    return _apply_pwm_environment(config)
 
 
 def split_memory_config(

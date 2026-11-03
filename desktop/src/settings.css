@@ -269,7 +269,7 @@ h2 {
 
 .settings-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   padding: 4px;
   margin: 0 0 16px;
@@ -980,4 +980,123 @@ footer {
   .runtime-status dt {
     margin-bottom: 0;
   }
+}
+
+.pwm-section-heading,
+.pwm-card-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.pwm-section-heading h2 {
+  margin: 0;
+}
+
+.pwm-section-heading > span,
+.pwm-card-heading span {
+  color: var(--text-auxiliary);
+  font-size: 11px;
+}
+
+.pwm-description {
+  margin: 10px 0 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.pwm-model-card {
+  margin-bottom: 16px;
+}
+
+.pwm-card-heading {
+  padding: 16px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.pwm-card-heading h3 {
+  margin: 0 0 2px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.pwm-test-button {
+  flex: none;
+  padding: 7px 12px;
+  border: 1px solid var(--divider);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.pwm-test-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.pwm-test-button:disabled {
+  opacity: .5;
+}
+
+.pwm-advanced {
+  border-top: 1px solid var(--divider);
+}
+
+.pwm-advanced summary {
+  padding: 14px 16px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pwm-advanced summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.pwm-model-card input[type="number"] {
+  width: 100%;
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  color: var(--text-primary);
+  background: var(--panel);
+  font: inherit;
+  font-size: 14px;
+}
+
+.pwm-model-card input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.pwm-test-status {
+  margin: 0;
+  padding: 0 16px 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.pwm-test-status:empty {
+  display: none;
+}
+
+.pwm-test-status.success {
+  color: var(--success);
+}
+
+.pwm-test-status.error {
+  color: var(--danger);
+}
+
+.pwm-note {
+  margin: 0;
 }

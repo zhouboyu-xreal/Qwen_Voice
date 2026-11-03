@@ -1,3 +1,4 @@
+import { PWM_DEFAULTS } from '../../shared/pwm-model-settings.mjs'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
@@ -10,6 +11,7 @@ import {
 } from '../src/settings-config.mjs'
 
 const REALTIME_DEFAULTS = {
+  ...PWM_DEFAULTS,
   wakeShortcut: 'CommandOrControl+Shift+Space',
   wakeWordEnabled: true,
   realtimeProvider: 'dashscope',
