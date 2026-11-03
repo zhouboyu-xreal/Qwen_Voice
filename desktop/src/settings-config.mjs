@@ -31,6 +31,7 @@ const DEFAULTS = {
   autoHideSeconds: 60,
   wakeShortcut: 'CommandOrControl+Shift+Space',
   wakeWordEnabled: true,
+  ambientRecordingSource: 'microphone-system',
   dashscopeApiKey: '',
   realtimeBaseUrl: DEFAULT_DASHSCOPE_REALTIME_URL,
   realtimeProvider: DEFAULT_REALTIME_PROVIDER,
@@ -57,6 +58,7 @@ const CLIENT_SETTING_KEYS = {
   autoHideSeconds: 'QWEN_AUDIO_DESKTOP_AUTO_HIDE_SECONDS',
   wakeShortcut: 'QWEN_AUDIO_DESKTOP_WAKE_SHORTCUT',
   wakeWordEnabled: 'QWEN_AUDIO_WAKE_WORD_ENABLED',
+  ambientRecordingSource: 'QWEN_AUDIO_AMBIENT_RECORDING_SOURCE',
   language: 'QWEN_AUDIO_DESKTOP_LANGUAGE',
 }
 
@@ -128,6 +130,13 @@ function cleanAgentProtocol(value) {
     throw new Error(`不支持的后台 Agent：${protocol}`)
   }
   return protocol
+}
+
+function cleanAmbientRecordingSource(value) {
+  if (!['microphone', 'microphone-system'].includes(value)) {
+    throw new Error('环境录音来源必须为 microphone 或 microphone-system')
+  }
+  return value
 }
 
 function cleanAutoHideSeconds(value) {
@@ -327,6 +336,10 @@ export function parseSettings(content = '', fallback = {}, pwmDefaults = {}) {
       'QWEN_AUDIO_DESKTOP_WAKE_SHORTCUT',
       fallback.QWEN_AUDIO_DESKTOP_WAKE_SHORTCUT ?? DEFAULTS.wakeShortcut,
     )),
+    ambientRecordingSource: cleanAmbientRecordingSource(configured(
+      values, 'QWEN_AUDIO_AMBIENT_RECORDING_SOURCE',
+      fallback.QWEN_AUDIO_AMBIENT_RECORDING_SOURCE ?? DEFAULTS.ambientRecordingSource,
+    )),
     // Desktop always requires its local wake phrase, including legacy configs.
     wakeWordEnabled: DEFAULTS.wakeWordEnabled,
     dashscopeApiKey: String(configuredApiKey || '').trim(),
@@ -429,6 +442,9 @@ export function normalizeSettings(settings = {}) {
       settings.wakeShortcut ?? DEFAULTS.wakeShortcut,
     ),
     wakeWordEnabled: DEFAULTS.wakeWordEnabled,
+    ambientRecordingSource: cleanAmbientRecordingSource(
+      settings.ambientRecordingSource ?? DEFAULTS.ambientRecordingSource,
+    ),
     dashscopeApiKey: String(
       settings.dashscopeApiKey ?? DEFAULTS.dashscopeApiKey,
     ).trim(),

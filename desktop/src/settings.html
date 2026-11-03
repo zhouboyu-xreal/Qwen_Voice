@@ -569,6 +569,18 @@
               </div>
 
               <div class="setting-row">
+                <label for="ambient-recording-source">环境录音来源</label>
+                <div>
+                  <select id="ambient-recording-source">
+                    <option value="microphone-system">麦克风 + 系统音频</option>
+                    <option value="microphone">仅麦克风</option>
+                  </select>
+                  <p class="field-hint">下次开始录音时生效。两路音频分别保存；系统音频仅用于环境录音，不参与唤醒和语音交互。</p>
+                  <p class="field-hint">系统音频需要系统授权；macOS 需 14.2 或更新版本，使用原生音频采集，无需共享屏幕。</p>
+                </div>
+              </div>
+
+              <div class="setting-row">
                 <label for="wake-shortcut">显示快捷键</label>
                 <div class="shortcut-field">
                   <input

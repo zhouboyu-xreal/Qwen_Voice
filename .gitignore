@@ -1,4 +1,5 @@
 node_modules/
+desktop/native/bin/
 web/dist/
 dist/
 .venv/
@@ -29,6 +30,7 @@ config/openclaw-workspace/*
 testws/
 config/opencode/opencode.jsonc
 config/opencode/node_modules/
+desktop/native/bin/
 config/opencode/bun.lock
 config/opencode/.gitignore
 config/opencode/package.json

@@ -14,6 +14,7 @@ const REALTIME_DEFAULTS = {
   ...PWM_DEFAULTS,
   wakeShortcut: 'CommandOrControl+Shift+Space',
   wakeWordEnabled: true,
+  ambientRecordingSource: 'microphone-system',
   realtimeProvider: 'dashscope',
   realtimeBaseUrl: 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime',
   realtimeModel: 'qwen-audio-3.0-realtime-plus',

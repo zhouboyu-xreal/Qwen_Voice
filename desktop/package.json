@@ -5,6 +5,7 @@
   "type": "module",
   "main": "src/main.mjs",
   "scripts": {
+    "prestart": "node native/build-system-audio.mjs",
     "start": "electron .",
     "test": "node --test"
   },

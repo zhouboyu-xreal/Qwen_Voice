@@ -76,6 +76,19 @@ class _AudioBatch:
     ended_at: datetime
     sample_count: int
     sample_rate: int
+    source: str
+
+
+@dataclass
+class _AudioTrack:
+    source: str
+    sample_rate: Optional[int] = None
+    chunk_samples: int = 0
+    batch_index: int = 0
+    batch_started_at: Optional[datetime] = None
+    batch_samples: int = 0
+    writer: Optional[wave.Wave_write] = None
+    partial_path: Optional[Path] = None
 
 
 class _AgentMemoryIpcClient:
@@ -121,7 +134,7 @@ class _AgentMemoryIpcClient:
 
 
 class AmbientAudioRecordingService:
-    """Maintain one lossless recording and a serial offline-ASR worker."""
+    """Keep independent source tracks and merge ASR in capture-time order."""
 
     def __init__(
         self,
@@ -148,8 +161,15 @@ class AmbientAudioRecordingService:
         )
         self._asr_sample_rate = max(1, int(sample_rate_value))
         self._chunk_duration_seconds = float(chunk_duration_seconds)
-        self._recording_sample_rate: Optional[int] = None
-        self._chunk_samples = 0
+        self._tracks: Dict[str, _AudioTrack] = {}
+        self._asr_progress: Dict[str, datetime] = {}
+        self._buffered_segments: List[Dict[str, Any]] = []
+        self._delivery_index = 0
+        self._delivery_future: Optional[Future[Dict[str, Any]]] = None
+        self._delivery_until: Optional[datetime] = None
+        self._delivery_payload: Optional[Dict[str, Any]] = None
+        self._pending_batches: Dict[Future[Dict[str, Any]], _AudioBatch] = {}
+        self._failed_until: Optional[datetime] = None
         self._recordings_dir = recordings_dir.expanduser().resolve()
         self._recordings_dir.mkdir(parents=True, exist_ok=True)
         self._agent_memory_ipc = agent_memory_ipc
@@ -162,11 +182,6 @@ class AmbientAudioRecordingService:
         self._recording_started_at: Optional[datetime] = None
         self._manifest_path: Optional[Path] = None
         self._audio_file_names: List[str] = []
-        self._batch_index = 0
-        self._batch_started_at: Optional[datetime] = None
-        self._batch_samples = 0
-        self._writer: Optional[wave.Wave_write] = None
-        self._partial_path: Optional[Path] = None
         self._pending: List[Future[Dict[str, Any]]] = []
         self._completed: List[Dict[str, Any]] = []
         self._failed_batches = 0
@@ -181,18 +196,23 @@ class AmbientAudioRecordingService:
             if self._recording_id == recording_id:
                 return self._result()
             raise RuntimeError("another ambient recording is already active")
-        self._recording_id = recording_id
+        sources = params.get("sources", ["microphone"])
+        if not isinstance(sources, list) or not sources or any(
+            source not in ("microphone", "system") for source in sources
+        ) or len(set(sources)) != len(sources):
+            raise ValueError("sources must be a non-empty unique list of microphone/system")
         self._recording_started_at = _parse_timestamp(params.get("startedAt"))
+        self._recording_id = recording_id
         recording_stamp = self._recording_started_at.strftime("%Y%m%d_%H%M%S")
         self._manifest_path = self._recordings_dir / (
             f"{recording_stamp}_{self._recording_short_id()}.json"
         )
         self._audio_file_names = []
-        self._batch_index = 0
-        self._batch_started_at = self._recording_started_at
-        self._batch_samples = 0
-        self._recording_sample_rate = None
-        self._chunk_samples = 0
+        self._tracks = {source: _AudioTrack(source) for source in sources}
+        self._asr_progress = {source: self._recording_started_at for source in sources}
+        self._buffered_segments = []
+        self._delivery_index = 0
+        self._published_until = self._recording_started_at
         self._stopping = False
         self._memory_finalized = False
         self._write_manifest()
@@ -215,58 +235,66 @@ class AmbientAudioRecordingService:
         self._require_active_recording(params)
         if self._stopping:
             raise RuntimeError("ambient recording is stopping")
+        source = str(params.get("source") or "microphone")
+        track = self._tracks.get(source)
+        if track is None:
+            raise ValueError("audio source is not enabled for this recording")
         sample_rate = int(params.get("sampleRate") or 0)
         if sample_rate < 8_000 or sample_rate > 192_000:
             raise ValueError("ambient audio sampleRate must be between 8000 and 192000")
-        if self._recording_sample_rate is None:
-            self._recording_sample_rate = sample_rate
-            self._chunk_samples = max(
-                sample_rate,
-                int(self._chunk_duration_seconds * sample_rate),
-            )
-            self._logger.info(
-                "ambient recording capture format recording_id=%s sample_rate=%s",
-                self._recording_id,
-                sample_rate,
-            )
-        elif sample_rate != self._recording_sample_rate:
-            raise ValueError(
-                "ambient audio sampleRate changed within one recording: "
-                f"got={sample_rate} expected={self._recording_sample_rate}"
-            )
         try:
             payload = base64.b64decode(str(params.get("audio") or ""), validate=True)
         except (binascii.Error, ValueError) as exc:
             raise ValueError("audio must be valid base64 PCM16") from exc
         if len(payload) % 2:
-            payload = payload[:-1]
+            raise ValueError("audio must contain complete PCM16 samples")
+        if not payload:
+            return self._result()
+        started_at = _parse_timestamp(params["startedAt"]) if params.get("startedAt") else None
+        if started_at and started_at < self._recording_started_at - timedelta(seconds=1):
+            raise ValueError("audio startedAt precedes the recording")
+        if track.sample_rate is not None and track.sample_rate != sample_rate:
+            # Device switches can change rates. Seal the old format instead of
+            # writing differently sampled PCM into the same WAV header.
+            self._seal_current_batch(track)
+            track.sample_rate = None
+        if track.sample_rate is None:
+            track.sample_rate = sample_rate
+            track.chunk_samples = max(sample_rate, int(self._chunk_duration_seconds * sample_rate))
+            track.batch_started_at = started_at or track.batch_started_at or self._recording_started_at
+            self._logger.info("ambient track capture format source=%s sample_rate=%s", source, sample_rate)
+        elif started_at is not None:
+            expected = track.batch_started_at + timedelta(seconds=track.batch_samples / sample_rate)
+            if abs((started_at - expected).total_seconds()) > 0.25:
+                self._seal_current_batch(track)
+                track.batch_started_at = started_at
+                self._logger.info("ambient track discontinuity source=%s started_at=%s", source, started_at)
         offset = 0
         while offset < len(payload):
-            self._ensure_writer()
-            available_samples = self._chunk_samples - self._batch_samples
+            self._ensure_writer(track)
+            available_samples = track.chunk_samples - track.batch_samples
             take_bytes = min(len(payload) - offset, available_samples * 2)
             if take_bytes <= 0:
-                self._seal_current_batch()
+                self._seal_current_batch(track)
                 continue
             chunk = payload[offset : offset + take_bytes]
-            assert self._writer is not None
-            # ``writeframes`` patches the WAV header after every append, making
-            # a partially written file recoverable after an unexpected exit.
-            self._writer.writeframes(chunk)
-            self._batch_samples += len(chunk) // 2
+            assert track.writer is not None
+            track.writer.writeframes(chunk)
+            track.batch_samples += len(chunk) // 2
             offset += len(chunk)
-            if self._batch_samples >= self._chunk_samples:
-                self._seal_current_batch()
+            if track.batch_samples >= track.chunk_samples:
+                self._seal_current_batch(track)
         self._harvest_completed()
         return self._result(include_completed=True)
 
     def stop(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._require_active_recording(params)
         self._stopping = True
-        if self._batch_samples > 0:
-            self._seal_current_batch()
-        else:
-            self._discard_empty_partial()
+        for track in self._tracks.values():
+            if track.batch_samples > 0:
+                self._seal_current_batch(track)
+            else:
+                self._discard_empty_partial(track)
         self._harvest_completed()
         self._write_manifest()
         self._logger.info(
@@ -280,7 +308,7 @@ class AmbientAudioRecordingService:
         self._require_active_recording(params)
         self._harvest_completed()
         result = self._result(include_completed=True)
-        if self._stopping and not self._pending and not self._writer:
+        if self._stopping and not self._pending and not self._buffered_segments and self._delivery_future is None:
             self._finalize_memory_recording()
         return result
 
@@ -291,9 +319,17 @@ class AmbientAudioRecordingService:
     def close(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         if self._recording_id and not self._stopping:
             self.stop({"recordingId": self._recording_id})
+        # Normal Desktop shutdown drains first. Never close a runtime while
+        # its worker is still transcribing a sealed source file.
+        while self._pending or self._delivery_payload is not None or self._buffered_segments:
+            self._harvest_completed()
+            if self._pending or self._delivery_future is not None:
+                time.sleep(0.01)
+        self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._recording_id and not self._memory_finalized:
+            self._finalize_memory_recording()
         if self._voice_runtime is not None:
             self._voice_runtime.close()
-        self._executor.shutdown(wait=False, cancel_futures=False)
         return {"closed": True}
 
     def _require_active_recording(self, params: Dict[str, Any]) -> None:
@@ -301,70 +337,73 @@ class AmbientAudioRecordingService:
         if not self._recording_id or recording_id != self._recording_id:
             raise ValueError("recordingId does not identify the active recording")
 
-    def _ensure_writer(self) -> None:
-        if self._writer is not None:
+    def _ensure_writer(self, track: _AudioTrack) -> None:
+        if track.writer is not None:
             return
         if (
-            self._batch_started_at is None
-            or self._recording_sample_rate is None
-            or self._chunk_samples <= 0
+            track.batch_started_at is None
+            or track.sample_rate is None
+            or track.chunk_samples <= 0
         ):
             raise RuntimeError("ambient recording has not started")
-        self._batch_index += 1
+        track.batch_index += 1
         stem = (
-            f"{self._batch_started_at.strftime('%Y%m%d_%H%M%S')}"
-            f"_{self._batch_index:06d}_{self._recording_short_id()}"
+            f"{track.batch_started_at.strftime('%Y%m%d_%H%M%S')}"
+            f"_{track.source}_{track.batch_index:06d}_{self._recording_short_id()}"
         )
-        self._partial_path = self._recordings_dir / f"{stem}.partial.wav"
-        writer = wave.open(str(self._partial_path), "wb")
+        track.partial_path = self._recordings_dir / f"{stem}.partial.wav"
+        writer = wave.open(str(track.partial_path), "wb")
         writer.setnchannels(1)
         writer.setsampwidth(2)
-        writer.setframerate(self._recording_sample_rate)
-        self._writer = writer
-        self._batch_samples = 0
+        writer.setframerate(track.sample_rate)
+        track.writer = writer
+        track.batch_samples = 0
 
-    def _seal_current_batch(self) -> None:
-        if self._writer is None or self._partial_path is None or self._batch_started_at is None:
+    def _seal_current_batch(self, track: _AudioTrack) -> None:
+        if track.writer is None or track.partial_path is None or track.batch_started_at is None:
             return
-        writer = self._writer
-        partial_path = self._partial_path
-        sample_count = self._batch_samples
-        started_at = self._batch_started_at
-        self._writer = None
-        self._partial_path = None
-        self._batch_samples = 0
+        writer = track.writer
+        partial_path = track.partial_path
+        sample_count = track.batch_samples
+        started_at = track.batch_started_at
+        track.writer = None
+        track.partial_path = None
+        track.batch_samples = 0
         writer.close()
         final_path = partial_path.with_name(partial_path.name.replace(".partial.wav", ".wav"))
         self._audio_file_names.append(final_path.name)
         partial_path.replace(final_path)
-        assert self._recording_sample_rate is not None
-        ended_at = started_at + timedelta(seconds=sample_count / self._recording_sample_rate)
+        assert track.sample_rate is not None
+        ended_at = started_at + timedelta(seconds=sample_count / track.sample_rate)
         batch = _AudioBatch(
-            index=self._batch_index,
+            index=track.batch_index,
             path=final_path,
             started_at=started_at,
             ended_at=ended_at,
             sample_count=sample_count,
-            sample_rate=self._recording_sample_rate,
+            sample_rate=track.sample_rate,
+            source=track.source,
         )
-        self._batch_started_at = ended_at
-        self._pending.append(self._executor.submit(self._transcribe_batch, batch))
+        track.batch_started_at = ended_at
+        future = self._executor.submit(self._transcribe_batch, batch)
+        self._pending.append(future)
+        self._pending_batches[future] = batch
         self._write_manifest()
         self._logger.info(
             "ambient audio batch sealed recording_id=%s batch=%s duration_s=%.3f path=%s",
             self._recording_id,
             batch.index,
-            sample_count / self._recording_sample_rate,
+            sample_count / track.sample_rate,
             final_path.name,
         )
 
-    def _discard_empty_partial(self) -> None:
-        if self._writer is not None:
-            self._writer.close()
-        if self._partial_path is not None:
-            self._partial_path.unlink(missing_ok=True)
-        self._writer = None
-        self._partial_path = None
+    def _discard_empty_partial(self, track: _AudioTrack) -> None:
+        if track.writer is not None:
+            track.writer.close()
+        if track.partial_path is not None:
+            track.partial_path.unlink(missing_ok=True)
+        track.writer = None
+        track.partial_path = None
 
     def _transcribe_batch(self, batch: _AudioBatch) -> Dict[str, Any]:
         voice_runtime = self._get_voice_runtime()
@@ -383,24 +422,16 @@ class AmbientAudioRecordingService:
             metadata = dict(item.get("metadata") or {})
             metadata.update({
                 "recording_id": self._recording_id,
+                "audio_source": batch.source,
+                "ambient_asr_watermark_managed": True,
                 "audio_file": relative_path,
                 "audio_batch_index": batch.index,
                 "audio_sha256": checksum,
             })
             item["metadata"] = metadata
             segments.append(item)
-        memory_result = self._agent_memory_ipc.request(
-            "observe_transcript_segments",
-            {
-                "ownerId": self._agent_memory_ipc.owner_id,
-                "recordingId": self._recording_id,
-                "batchId": f"{self._recording_id}:{batch.index}",
-                "segments": segments,
-                "tags": ["qwen-audio-agent", "ambient-recording", self._recording_id],
-            },
-        )
         return {
-            "batchId": f"{self._recording_id}:{batch.index}",
+            "batchId": f"{self._recording_id}:{batch.source}:{batch.index}",
             "recordingId": self._recording_id,
             "batchIndex": batch.index,
             "audioFile": relative_path,
@@ -411,7 +442,8 @@ class AmbientAudioRecordingService:
             "audioSampleRate": batch.sample_rate,
             "speechSegmentCount": report.get("speech_segment_count", 0),
             "transcriptSegmentCount": len(segments),
-            "memoryObserved": bool(memory_result.get("observed")),
+            "source": batch.source,
+            "segments": segments,
         }
 
     def _get_voice_runtime(self) -> VoiceRuntime:
@@ -432,6 +464,8 @@ class AmbientAudioRecordingService:
                 continue
             try:
                 completed = future.result()
+                self._asr_progress[completed["source"]] = _parse_timestamp(completed["endedAt"])
+                self._buffered_segments.extend(completed.pop("segments"))
                 self._completed.append(completed)
                 self._logger.info(
                     "ambient audio batch transcribed recording_id=%s batch=%s segments=%s",
@@ -440,13 +474,74 @@ class AmbientAudioRecordingService:
                     completed["transcriptSegmentCount"],
                 )
             except Exception:
+                failed_start = self._pending_batches[future].started_at
+                self._failed_until = min(self._failed_until, failed_start) if self._failed_until else failed_start
                 self._failed_batches += 1
                 self._logger.exception(
                     "ambient audio batch transcription failed recording_id=%s",
                     self._recording_id,
                 )
+            self._pending_batches.pop(future, None)
         self._pending = remaining
+        if self._delivery_future is not None and self._delivery_future.done():
+            # A failed/lost response leaves the exact payload intact for retry;
+            # new segments must never be attached to the same batch id.
+            try:
+                self._delivery_future.result()
+                self._delivery_index += 1
+                self._published_until = self._delivery_until
+                self._delivery_payload = None
+            finally:
+                self._delivery_future = None
+        self._publish_transcripts(final=self._stopping and not self._pending)
         self._write_manifest()
+
+    def _publish_transcripts(self, *, final: bool = False) -> None:
+        if not self._tracks or self._delivery_future is not None:
+            return
+        if self._delivery_payload is not None:
+            self._delivery_future = self._executor.submit(
+                self._agent_memory_ipc.request, "observe_transcript_segments", self._delivery_payload,
+            )
+            return
+        # Only advance past time covered by every source. Buffer the faster
+        # source so the PWM assembler never receives a later answer before an
+        # earlier question. Empty ASR batches still advance coverage.
+        covered_until = min(self._asr_progress.values())
+        if self._failed_until:
+            covered_until = min(covered_until, self._failed_until)
+        ordered = sorted(self._buffered_segments, key=lambda segment: (
+            _parse_timestamp(segment["started_at"]),
+            _parse_timestamp(segment["ended_at"]),
+            segment.get("metadata", {}).get("audio_source", ""),
+        ))
+        count = 0
+        for segment in ordered:
+            if not final and _parse_timestamp(segment["ended_at"]) > covered_until:
+                break
+            count += 1
+        if not final and count < len(ordered):
+            covered_until = min(covered_until, _parse_timestamp(ordered[count]["started_at"]))
+        if final and not self._failed_batches:
+            covered_until = max(self._asr_progress.values())
+        if count == 0 and covered_until <= self._published_until:
+            return
+        batch_id = f"{self._recording_id}:merged:{self._delivery_index + 1}"
+        # IPC can wait on the PWM writer. Run it in the serial worker rather
+        # than blocking the PCM append loop and losing incoming audio.
+        self._delivery_payload = {
+            "ownerId": self._agent_memory_ipc.owner_id,
+            "recordingId": self._recording_id,
+            "batchId": batch_id,
+            "segments": ordered[:count],
+            "processedThrough": covered_until.isoformat(),
+            "tags": ["qwen-audio-agent", "ambient-recording", self._recording_id],
+        }
+        self._delivery_future = self._executor.submit(
+            self._agent_memory_ipc.request, "observe_transcript_segments", self._delivery_payload,
+        )
+        self._delivery_until = covered_until
+        self._buffered_segments = ordered[count:]
 
     def _finalize_memory_recording(self) -> None:
         if self._memory_finalized:
@@ -473,12 +568,12 @@ class AmbientAudioRecordingService:
             "recordingId": self._recording_id,
             "recording": bool(self._recording_id and not self._stopping),
             "stopping": bool(self._recording_id and self._stopping),
-            "sampleRate": self._recording_sample_rate or 0,
-            "openBatchSeconds": round(
-                self._batch_samples / self._recording_sample_rate,
-                3,
-            ) if self._recording_sample_rate else 0.0,
-            "pendingBatches": len(self._pending),
+            "sources": list(self._tracks),
+            "tracks": {source: {
+                "sampleRate": track.sample_rate or 0,
+                "openBatchSeconds": round(track.batch_samples / track.sample_rate, 3) if track.sample_rate else 0.0,
+            } for source, track in self._tracks.items()},
+            "pendingBatches": len(self._pending) + int(self._delivery_payload is not None),
             "failedBatches": self._failed_batches,
             "memoryFinalized": self._memory_finalized,
             "completedBatches": completed,
@@ -490,15 +585,14 @@ class AmbientAudioRecordingService:
         payload = {
             "recording_id": self._recording_id,
             "started_at": self._recording_started_at.isoformat() if self._recording_started_at else "",
-            "sample_rate": self._recording_sample_rate,
+            "tracks": {source: {
+                "sample_rate": track.sample_rate,
+                "open_batch_seconds": round(track.batch_samples / track.sample_rate, 3) if track.sample_rate else 0.0,
+            } for source, track in self._tracks.items()},
             "asr_sample_rate": self._asr_sample_rate,
             "chunk_duration_seconds": self._chunk_duration_seconds,
             "stopping": self._stopping,
-            "open_batch_seconds": round(
-                self._batch_samples / self._recording_sample_rate,
-                3,
-            ) if self._recording_sample_rate else 0.0,
-            "pending_batches": len(self._pending),
+            "pending_batches": len(self._pending) + int(self._delivery_payload is not None),
             "failed_batches": self._failed_batches,
             "audio_files": list(self._audio_file_names),
         }

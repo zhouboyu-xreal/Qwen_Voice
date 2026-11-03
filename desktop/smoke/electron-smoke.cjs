@@ -6,6 +6,7 @@ let tray
 app.whenReady().then(async () => {
   app.dock?.hide()
   await require('./settings-smoke.cjs')({ BrowserWindow, ipcMain })
+  await require('./ambient-audio-smoke.cjs')({ BrowserWindow, ipcMain })
   await require('./permission-smoke.cjs')({ BrowserWindow })
   const window = new BrowserWindow({
     width: 120,

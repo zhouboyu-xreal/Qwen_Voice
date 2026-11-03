@@ -4,11 +4,14 @@ import {
   pwmSettingsChanged,
   retainPwmSecrets,
 } from './pwm-model-service.mjs'
+import { configureSystemAudioCapture, systemAudioCaptureSupported } from './system-audio-capture.mjs'
+import { NativeSystemAudioCapture, nativeSystemAudioExecutable } from './native-system-audio.mjs'
 import { publicPwmSettings } from '../../shared/pwm-model-settings.mjs'
 import {
   app,
   BrowserWindow,
   dialog,
+  desktopCapturer,
   globalShortcut,
   ipcMain,
   Menu,
@@ -384,11 +387,20 @@ ipcMain.handle('qwen-audio-agent:consume-prewake-context', event => {
   return { text }
 })
 
+let desktopAmbientCapturePrepared = false
+let desktopAmbientRecordingSources = ['microphone']
+let desktopAmbientCaptureError = ''
+let desktopAmbientCaptureToken = ''
+let desktopNativeSystemAudio = null
+let desktopAmbientStopPromise = null
+let desktopAmbientFlushRequest = null
+
 function publishAmbientRecordingState(state, details = {}) {
   if (!mainWindow || mainWindow.isDestroyed()) return
   mainWindow.webContents.send('qwen-audio-agent:ambient-recording-state', {
     state,
     recordingId: desktopAmbientRecordingId,
+    sources: desktopAmbientRecordingSources,
     ...details,
   })
 }
@@ -578,27 +590,96 @@ async function finalizeDesktopAmbientRecording() {
   const runtime = desktopAmbientRecordingRuntime
   const recordingId = desktopAmbientRecordingId
   if (!runtime || !recordingId) return
+  let state = 'inactive'
+  let message = ''
   try {
+    let failedBatches = 0
     while (true) {
       const result = await drainDesktopAmbientRecording()
+      failedBatches = result?.failedBatches || 0
       if (!result?.pendingBatches) break
       await new Promise(resolveDelay => setTimeout(resolveDelay, 1_000))
     }
-    logger.info('desktop.ambient_recording.finalized', { recordingId })
-    publishAmbientRecordingState('inactive')
+    logger.info('desktop.ambient_recording.finalized', { recordingId, failedBatches })
+    message = desktopAmbientCaptureError || (failedBatches
+      ? '环境录音已保存，但部分音轨转写失败，请检查日志。' : '')
+    if (message) state = 'error'
   } catch (error) {
     logger.error('desktop.ambient_recording.finalize_failed', { recordingId, error })
-    publishAmbientRecordingState('error', {
-      message: '环境录音已保存，但离线转写或记忆写入尚未完成。',
-    })
+    state = 'error'
+    message = '环境录音已保存，但离线转写或记忆写入尚未完成。'
   } finally {
     stopAmbientRecordingDrainTimer()
+    desktopAmbientCapturePrepared = false
+    await runtime.close()
+    if (desktopAmbientRecordingRuntime === runtime) desktopAmbientRecordingRuntime = null
     desktopAmbientRecordingId = ''
     desktopAmbientRecordingStopping = false
-    await runtime.close()
-    if (desktopAmbientRecordingRuntime === runtime) {
-      desktopAmbientRecordingRuntime = null
-    }
+    // Enable another recording only after the old sidecar has closed.
+    publishAmbientRecordingState(state, { recordingId, message })
+  }
+}
+
+function requestAmbientMicrophoneFlush(recordingId) {
+  if (!mainWindow || mainWindow.isDestroyed()) return Promise.resolve(false)
+  if (desktopAmbientFlushRequest) return desktopAmbientFlushRequest.promise
+  let resolveFlush
+  const promise = new Promise(resolveRequest => { resolveFlush = resolveRequest })
+  const timer = setTimeout(() => desktopAmbientFlushRequest?.resolve(false), 1500)
+  desktopAmbientFlushRequest = {
+    recordingId, promise,
+    resolve: accepted => {
+      clearTimeout(timer)
+      desktopAmbientFlushRequest = null
+      resolveFlush(accepted)
+    },
+  }
+  mainWindow.webContents.send('qwen-audio-agent:ambient-recording-flush-request', { recordingId })
+  return promise
+}
+
+ipcMain.on('qwen-audio-agent:ambient-recording-audio-flushed', (event, payload) => {
+  if (event.sender !== mainWindow?.webContents) return
+  if (desktopAmbientFlushRequest?.recordingId === payload?.recordingId) desktopAmbientFlushRequest.resolve(true)
+})
+
+async function stopDesktopNativeSystemAudio() {
+  const capture = desktopNativeSystemAudio
+  if (!capture) return
+  try { await capture.stop() }
+  finally { if (desktopNativeSystemAudio === capture) desktopNativeSystemAudio = null }
+}
+
+async function startDesktopNativeSystemAudio() {
+  if (desktopNativeSystemAudio) throw new Error('系统音频采集已经启动')
+  const executable = nativeSystemAudioExecutable({
+    packaged: app.isPackaged, resourcesPath: process.resourcesPath, sourceRoot,
+  })
+  if (!existsSync(executable)) throw new Error('系统音频采集组件缺失，请重新构建或安装应用。')
+  const captureToken = desktopAmbientCaptureToken
+  const capture = new NativeSystemAudioCapture({
+    executable, logger,
+    onAudio: async (audio, sampleRate, startedAt) => {
+      if (desktopNativeSystemAudio !== capture || !desktopAmbientRecordingId
+        || !desktopAmbientRecordingRuntime || desktopAmbientRecordingStopping) return
+      await desktopAmbientRecordingRuntime.appendPcm16(audio, sampleRate, desktopAmbientRecordingId,
+        { source: 'system', startedAt })
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('qwen-audio-agent:ambient-system-audio-progress', { captureToken })
+      }
+    },
+    onError: error => {
+      if (desktopNativeSystemAudio !== capture) return
+      logger.warn('desktop.system_audio.failed', { message: error.message })
+      void stopDesktopAmbientRecording({ captureError: error.message })
+        .catch(stopError => logger.error('desktop.ambient_recording.stop_failed', { error: stopError }))
+    },
+  })
+  desktopNativeSystemAudio = capture
+  try { return await capture.start() }
+  catch (error) {
+    await stopDesktopNativeSystemAudio().catch(() => {})
+    throw error
   }
 }
 
@@ -612,26 +693,36 @@ async function startDesktopAmbientRecording() {
     // Runtime option resolution is part of startup too.  Keep it inside the
     // error boundary: otherwise a missing state/config path fails before any
     // recording diagnostic is emitted.
+    if (process.platform === 'darwin' && desktopAmbientRecordingSources.includes('system')
+      && !desktopNativeSystemAudio?.ready) throw new Error('系统音频采集尚未就绪')
     runtime = await ensureDesktopAmbientRecordingRuntime()
     recordingId = randomUUID()
     desktopAmbientRecordingId = recordingId
     desktopAmbientRecordingStopping = false
+    desktopAmbientCaptureError = ''
     logger.info('desktop.ambient_recording.start_requested', { recordingId })
     publishAmbientRecordingState('starting')
     const result = await runtime.startRecording({
       recordingId,
       startedAt: new Date().toISOString(),
+      sources: desktopAmbientRecordingSources,
     })
+    if (!desktopAmbientCapturePrepared) throw new Error('环境录音启动已取消')
+    if (process.platform === 'darwin' && desktopAmbientRecordingSources.includes('system')
+      && !desktopNativeSystemAudio?.ready) throw new Error('系统音频采集尚未就绪')
+    desktopNativeSystemAudio?.begin()
     startAmbientRecordingDrainTimer()
-    logger.info('desktop.ambient_recording.started', { recordingId })
+    logger.info('desktop.ambient_recording.started', { recordingId, sources: desktopAmbientRecordingSources })
     publishAmbientRecordingState('recording')
     return { state: 'recording', recordingId, ...result }
   } catch (error) {
     logger.error('desktop.ambient_recording.start_failed', { recordingId, error })
     desktopAmbientRecordingId = ''
+    desktopAmbientCapturePrepared = false
     publishAmbientRecordingState('error', {
       message: '环境录音启动失败，请检查桌面日志。',
     })
+    await stopDesktopNativeSystemAudio().catch(() => {})
     await runtime?.close()
     if (runtime && desktopAmbientRecordingRuntime === runtime) {
       desktopAmbientRecordingRuntime = null
@@ -640,18 +731,75 @@ async function startDesktopAmbientRecording() {
   }
 }
 
-async function stopDesktopAmbientRecording() {
-  const runtime = desktopAmbientRecordingRuntime
-  const recordingId = desktopAmbientRecordingId
-  if (!runtime || !recordingId) return { state: 'inactive' }
-  if (desktopAmbientRecordingStopping) return { state: 'finalizing', recordingId }
-  desktopAmbientRecordingStopping = true
-  const result = await runtime.stopRecording(recordingId)
-  stopAmbientRecordingDrainTimer()
-  publishAmbientRecordingState('finalizing')
-  void finalizeDesktopAmbientRecording()
-  return { state: 'finalizing', recordingId, ...result }
+async function stopDesktopAmbientRecording({ captureError = '' } = {}) {
+  desktopAmbientCapturePrepared = false
+  if (captureError) desktopAmbientCaptureError = String(captureError).slice(0, 300)
+  if (desktopAmbientStopPromise) return desktopAmbientStopPromise
+  const operation = (async () => {
+    // Keep the recorder accepting system PCM until the native process has
+    // flushed stdout and every final write has been acknowledged.
+    try { await stopDesktopNativeSystemAudio() }
+    catch (error) {
+      desktopAmbientCaptureError ||= error.message
+      logger.warn('desktop.system_audio.stop_failed', { message: error.message })
+    }
+    const runtime = desktopAmbientRecordingRuntime
+    const recordingId = desktopAmbientRecordingId
+    if (!runtime || !recordingId) return { state: 'inactive' }
+    if (desktopAmbientRecordingStopping) return { state: 'finalizing', recordingId }
+    await requestAmbientMicrophoneFlush(recordingId)
+    desktopAmbientRecordingStopping = true
+    let result
+    try { result = await runtime.stopRecording(recordingId) }
+    catch (error) {
+      logger.error('desktop.ambient_recording.stop_failed', { recordingId, error })
+      desktopAmbientCaptureError ||= '环境音频写入或封存失败，请检查桌面日志。'
+    }
+    stopAmbientRecordingDrainTimer()
+    publishAmbientRecordingState('finalizing')
+    void finalizeDesktopAmbientRecording()
+    return { state: 'finalizing', recordingId, ...result }
+  })()
+  desktopAmbientStopPromise = operation
+  try { return await operation }
+  finally { if (desktopAmbientStopPromise === operation) desktopAmbientStopPromise = null }
 }
+
+ipcMain.handle('qwen-audio-agent:ambient-recording-prepare', event => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('ambient recording request was not sent by the Desktop window')
+  }
+  if (desktopAmbientRecordingId) throw new Error('环境录音正在运行或处理，请稍后重试')
+  desktopAmbientCapturePrepared = false
+  const source = desktopSettingsStore.load().ambientRecordingSource
+  desktopAmbientRecordingSources = source === 'microphone'
+    ? ['microphone'] : ['microphone', 'system']
+  if (desktopAmbientRecordingSources.includes('system') && !systemAudioCaptureSupported(
+    process.platform, process.platform === 'darwin' ? process.getSystemVersion() : '',
+  )) throw new Error('当前系统不支持系统音频录制，请在设置中选择“仅麦克风”')
+  desktopAmbientCapturePrepared = true
+  desktopAmbientCaptureToken = randomUUID()
+  return { sources: desktopAmbientRecordingSources, captureToken: desktopAmbientCaptureToken,
+    systemCapture: process.platform === 'darwin' ? 'native' : 'display' }
+})
+
+ipcMain.handle('qwen-audio-agent:ambient-native-audio-start', async (event, captureToken) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents
+    || process.platform !== 'darwin' || !desktopAmbientCapturePrepared
+    || captureToken !== desktopAmbientCaptureToken || !desktopAmbientRecordingSources.includes('system')) {
+    throw new Error('无权启动系统音频采集')
+  }
+  return startDesktopNativeSystemAudio()
+})
+
+ipcMain.handle('qwen-audio-agent:ambient-native-audio-stop', async (event, captureToken) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('无权停止系统音频采集')
+  }
+  // A late cleanup from an earlier renderer must not stop a newer capture.
+  if (captureToken !== desktopAmbientCaptureToken) return
+  await stopDesktopNativeSystemAudio()
+})
 
 ipcMain.handle('qwen-audio-agent:ambient-recording-start', async event => {
   logger.info('desktop.ambient_recording.start_ipc_received', {
@@ -661,6 +809,7 @@ ipcMain.handle('qwen-audio-agent:ambient-recording-start', async event => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
     throw new Error('ambient recording request was not sent by the Desktop window')
   }
+  if (!desktopAmbientCapturePrepared) throw new Error('请先准备环境录音来源')
   return startDesktopAmbientRecording()
 })
 
@@ -672,31 +821,43 @@ ipcMain.on('qwen-audio-agent:ambient-recording-audio', (event, payload) => {
     || !desktopAmbientRecordingRuntime
     || !desktopAmbientRecordingId
     || desktopAmbientRecordingStopping
+    || payload?.recordingId !== desktopAmbientRecordingId
+    || !desktopAmbientRecordingSources.includes(payload?.source)
+    || (process.platform === 'darwin' && payload?.source === 'system')
   ) return
   const audio = typeof payload?.audio === 'string' ? payload.audio : ''
   const sampleRate = Number(payload?.sampleRate)
   if (
     !audio
-    || audio.length > 256 * 1024
+    || audio.length > 1024 * 1024
     || !Number.isInteger(sampleRate)
     || sampleRate < 8_000
     || sampleRate > 192_000
   ) return
-  const operation = desktopAmbientRecordingRuntime.appendPcm16(
+  const recordingId = desktopAmbientRecordingId
+  const recordingRuntime = desktopAmbientRecordingRuntime
+  const operation = recordingRuntime.appendPcm16(
     Buffer.from(audio, 'base64'),
     sampleRate,
-    desktopAmbientRecordingId,
+    recordingId,
+    { source: payload.source, startedAt: payload.startedAt },
   )
   operation?.catch(error => {
     logger.warn('desktop.ambient_recording.append_failed', { error })
+    if (desktopAmbientRecordingId !== recordingId
+      || desktopAmbientRecordingRuntime !== recordingRuntime
+      || desktopAmbientRecordingStopping) return
+    void stopDesktopAmbientRecording({
+      captureError: '环境音频写入或封存失败，请检查桌面日志。',
+    }).catch(stopError => logger.error('desktop.ambient_recording.stop_failed', { error: stopError }))
   })
 })
 
-ipcMain.handle('qwen-audio-agent:ambient-recording-stop', async event => {
+ipcMain.handle('qwen-audio-agent:ambient-recording-stop', async (event, options) => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
     throw new Error('ambient recording request was not sent by the Desktop window')
   }
-  return stopDesktopAmbientRecording()
+  return stopDesktopAmbientRecording({ captureError: options?.captureError })
 })
 
 ipcMain.handle('qwen-audio-agent:voice-reference-recording-start', async event => {
@@ -981,6 +1142,17 @@ function isDesktopRendererUrl(value) {
 
 function configurePermissions(window) {
   const electronSession = window.webContents.session
+  const systemCaptureAllowed = frame => Boolean(
+    process.platform === 'win32' && desktopAmbientCapturePrepared
+    && desktopAmbientRecordingSources.includes('system')
+    && mainWindow && !mainWindow.isDestroyed()
+    && frame === mainWindow.webContents.mainFrame
+    && isDesktopRendererUrl(frame.url)
+  )
+  configureSystemAudioCapture({
+    session: electronSession, desktopCapturer, platform: process.platform,
+    allowed: systemCaptureAllowed,
+  })
   electronSession.setPermissionCheckHandler((
     webContents,
     permission,
@@ -989,7 +1161,9 @@ function configurePermissions(window) {
   ) => {
     const origin = details?.securityOrigin || requestingOrigin
     return webContents === mainWindow?.webContents
-      && permission === 'media' && isDesktopRendererUrl(origin)
+      && isDesktopRendererUrl(origin)
+      && (permission === 'media' || (permission === 'display-capture'
+        && systemCaptureAllowed(webContents.mainFrame)))
   })
   electronSession.setPermissionRequestHandler((
     webContents,
@@ -1005,9 +1179,9 @@ function configurePermissions(window) {
       || mediaTypes.every(type => type === 'audio')
     callback(
       webContents === mainWindow?.webContents
-      && permission === 'media'
-      && audioOnly
-      && isDesktopRendererUrl(source),
+      && isDesktopRendererUrl(source)
+      && ((permission === 'media' && audioOnly)
+        || (permission === 'display-capture' && systemCaptureAllowed(webContents.mainFrame))),
     )
   })
 }
@@ -1163,6 +1337,16 @@ function createWindow() {
   // 悬浮层级与全屏空间可见性统一走 orb-shell 契约（与嵌入宿主同一配方）。
   configureOrbWindow(window)
   configurePermissions(window)
+  const stopLostCapture = () => {
+    if (mainWindow !== window) return
+    desktopAmbientCapturePrepared = false
+    if (!desktopAmbientRecordingId && !desktopNativeSystemAudio) return
+    void stopDesktopAmbientRecording({
+      captureError: '录音页面已关闭或中断，环境录音已停止。',
+    }).catch(error => logger.error('desktop.ambient_recording.stop_failed', { error }))
+  }
+  window.webContents.on('render-process-gone', stopLostCapture)
+  window.on('closed', stopLostCapture)
 
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (isSafeExternalUrl(url)) void shell.openExternal(url)
@@ -1975,6 +2159,10 @@ if (!app.requestSingleInstanceLock()) {
     app,
     cleanup: async () => {
       logger.info('desktop.stopping')
+      await stopDesktopNativeSystemAudio().catch(error => {
+        logger.warn('desktop.system_audio.stop_on_shutdown_failed', { message: error.message })
+      })
+      if (desktopAmbientRecordingId) await requestAmbientMicrophoneFlush(desktopAmbientRecordingId)
       desktopPeriodicTasks?.stop()
       if (desktopPeriodicTasks) powerMonitor.removeListener('resume', desktopPeriodicTasks.check)
       memoryWindow.close()

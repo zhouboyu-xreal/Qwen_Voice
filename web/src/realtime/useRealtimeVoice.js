@@ -898,6 +898,7 @@ export default function useRealtimeVoice({
         const inputResampler = createStreamingResampler()
         let ambientParts = []
         let ambientSampleCount = 0
+        let ambientStartedAt = 0
         let voiceReferenceParts = []
         let voiceReferenceSampleCount = 0
         let inputResamplerSocket = null
@@ -916,7 +917,9 @@ export default function useRealtimeVoice({
             }
             ambientParts = []
             ambientSampleCount = 0
-            ambientRecordingAudioRef.current?.(pcmBase64(merged), context.sampleRate)
+            ambientRecordingAudioRef.current?.(
+              pcmBase64(merged), context.sampleRate, new Date(ambientStartedAt).toISOString(),
+            )
           }
           const appendVoiceReferenceAudio = samples => {
             if (!samples.length) return
@@ -946,6 +949,10 @@ export default function useRealtimeVoice({
               // Persist the browser-processed capture stream at its native
               // sample rate. The recording sidecar writes this PCM directly
               // into WAV; only offline ASR normalizes a sealed file to 16 kHz.
+              if (!ambientSampleCount) {
+                ambientStartedAt = performance.timeOrigin + performance.now()
+                  - rawSamples.length / context.sampleRate * 1000
+              }
               const ambientAudio = new Float32Array(rawSamples)
               ambientParts.push(ambientAudio)
               ambientSampleCount += ambientAudio.length

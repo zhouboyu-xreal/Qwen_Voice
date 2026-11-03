@@ -37,6 +37,7 @@ const wakeShortcut = document.querySelector('#wake-shortcut')
 const recordWakeShortcut = document.querySelector('#record-wake-shortcut')
 const resetWakeShortcut = document.querySelector('#reset-wake-shortcut')
 const wakeWordEnabled = document.querySelector('#wake-word-enabled')
+const ambientRecordingSource = document.querySelector('#ambient-recording-source')
 const desktopLanguage = document.querySelector('#desktop-language')
 const dashscopeApiKey = document.querySelector('#dashscope-api-key')
 const realtimeBaseUrl = document.querySelector('#realtime-base-url')
@@ -887,6 +888,7 @@ function formSettings() {
     autoHideSeconds: Number(autoHideSeconds.value),
     wakeShortcut: wakeShortcut.value,
     wakeWordEnabled: wakeWordEnabled.checked,
+    ambientRecordingSource: ambientRecordingSource.value,
     dashscopeApiKey: dashscopeApiKey.value,
     realtimeBaseUrl: realtimeBaseUrl.value,
     realtimeProvider: selectedRealtimeProvider(),
@@ -914,6 +916,7 @@ function fingerprint(value) {
     autoHideSeconds: value.autoHideSeconds,
     wakeShortcut: value.wakeShortcut,
     wakeWordEnabled: value.wakeWordEnabled,
+    ambientRecordingSource: value.ambientRecordingSource,
     dashscopeApiKey: value.dashscopeApiKey,
     realtimeBaseUrl: value.realtimeBaseUrl,
     realtimeProvider: value.realtimeProvider,
@@ -1176,6 +1179,7 @@ function render() {
   autoHideSeconds.value = hideValue
   wakeShortcut.value = settings.wakeShortcut
   wakeWordEnabled.checked = settings.wakeWordEnabled || false
+  ambientRecordingSource.value = settings.ambientRecordingSource || 'microphone-system'
   desktopLanguage.value = settings.language || 'auto'
   applyLanguage(desktopLanguage.value)
   renderVoiceReferenceRecording()
@@ -1223,6 +1227,7 @@ for (const control of [
   nodePathInput,
   ...realtimeProviderInputs,
   wakeWordEnabled,
+  ambientRecordingSource,
   desktopLanguage,
 ]) {
   control.addEventListener('input', () => {

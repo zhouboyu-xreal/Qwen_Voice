@@ -63,6 +63,13 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
       poll()
     })`)
     assert.equal(await evaluate(`document.querySelector('#gateway-pairing-code') === null`), true)
+    assert.equal(await evaluate(`document.querySelector('#ambient-recording-source').value`), 'microphone-system')
+    await evaluate(`(() => {
+      const field = document.querySelector('#ambient-recording-source')
+      field.value = 'microphone'
+      field.dispatchEvent(new Event('change', { bubbles: true }))
+    })()`)
+
     assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-settings-tab]'), tab => tab.dataset.settingsTab)`), ['voice', 'pwm', 'backend', 'app'])
     assert.equal(await evaluate(`(() => {
       document.querySelector('#pwm-tab').click()
@@ -95,6 +102,12 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
       }
       poll()
     })`)
+    assert.equal(settings.ambientRecordingSource, 'microphone')
+    assert.equal(await evaluate(`(() => {
+      document.querySelector('#app-tab').click()
+      const select = document.querySelector('#ambient-recording-source')
+      return select.value === 'microphone' && select.options.length === 2
+    })()`), true)
     assert.equal(settings.pwmLlmModel, 'fixture-chat')
     assert.equal(settings.pwmLlmApiKey, 'fixture-llm-key')
     assert.equal(await evaluate(`document.querySelector('#pwm-llm-key').value`), '')

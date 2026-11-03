@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>ai.qwenaudio.agent.system-audio</string>
+  <key>CFBundleName</key><string>Qwen Audio Agent</string>
+  <key>CFBundleDisplayName</key><string>Qwen Audio Agent</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>NSAudioCaptureUsageDescription</key><string>录制会议等系统播放音频，用于环境录音和个人世界模型。</string>
+</dict></plist>

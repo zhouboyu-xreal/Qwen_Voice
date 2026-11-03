@@ -275,7 +275,11 @@ class MemoryRuntime:
                     "queued": queued,
                     "reason": str(append_report.get("reason") or "queue_rejected"),
                 }
-        if ambient_recording_enabled:
+        externally_managed_coverage = all(
+            segment.get("metadata", {}).get("ambient_asr_watermark_managed") is True
+            for segment in normalized_segments
+        )
+        if ambient_recording_enabled and not externally_managed_coverage:
             watermark: Optional[datetime] = None
             for normalized_segment in normalized_segments:
                 watermark = self._memory_context_manager.update_ambient_asr_watermark(

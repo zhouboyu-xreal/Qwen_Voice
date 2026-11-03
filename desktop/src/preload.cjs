@@ -52,15 +52,31 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
     'qwen-audio-agent:wake-word-audio',
     { audio, sampleRate },
   ),
+  prepareAmbientRecording: () => ipcRenderer.invoke('qwen-audio-agent:ambient-recording-prepare'),
+  startNativeSystemAudioCapture: token => ipcRenderer.invoke('qwen-audio-agent:ambient-native-audio-start', token),
+  stopNativeSystemAudioCapture: token => ipcRenderer.invoke('qwen-audio-agent:ambient-native-audio-stop', token),
+  onAmbientSystemAudioProgress: callback => {
+    const listener = (_event, details) => callback(details || {})
+    ipcRenderer.on('qwen-audio-agent:ambient-system-audio-progress', listener)
+    return () => ipcRenderer.removeListener('qwen-audio-agent:ambient-system-audio-progress', listener)
+  },
+  onAmbientRecordingFlushRequest: callback => {
+    const listener = (_event, details) => callback(details || {})
+    ipcRenderer.on('qwen-audio-agent:ambient-recording-flush-request', listener)
+    return () => ipcRenderer.removeListener('qwen-audio-agent:ambient-recording-flush-request', listener)
+  },
+  confirmAmbientRecordingAudioFlushed: recordingId => ipcRenderer.send(
+    'qwen-audio-agent:ambient-recording-audio-flushed', { recordingId },
+  ),
   startAmbientRecording: () => ipcRenderer.invoke(
     'qwen-audio-agent:ambient-recording-start',
   ),
-  appendAmbientRecordingAudio: (audio, sampleRate) => ipcRenderer.send(
+  appendAmbientRecordingAudio: (audio, sampleRate, options = {}) => ipcRenderer.send(
     'qwen-audio-agent:ambient-recording-audio',
-    { audio, sampleRate },
+    { audio, sampleRate, ...options },
   ),
-  stopAmbientRecording: () => ipcRenderer.invoke(
-    'qwen-audio-agent:ambient-recording-stop',
+  stopAmbientRecording: options => ipcRenderer.invoke(
+    'qwen-audio-agent:ambient-recording-stop', options,
   ),
   onAmbientRecordingState: callback => {
     if (typeof callback !== 'function') return () => {}

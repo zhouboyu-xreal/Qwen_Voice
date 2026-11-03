@@ -17,6 +17,7 @@ import MessageContent from './MessageContent.jsx'
 import MultimodalComposer from './composer/MultimodalComposer.jsx'
 import TaskArtifacts from './TaskArtifacts.jsx'
 import PermissionActions from './PermissionActions.jsx'
+import { createAmbientRecordingController } from './desktop/ambient-recording-controller.js'
 import AmbientRecordingButton from './desktop/AmbientRecordingButton.jsx'
 import DesktopFluidOrb from './desktop/DesktopFluidOrb.jsx'
 import DesktopSpriteOrb from './desktop/DesktopSpriteOrb.jsx'
@@ -219,6 +220,7 @@ export default function App() {
   }))
   const [waitingForVoice, setWaitingForVoice] = useState(false)
   const [ambientRecordingState, setAmbientRecordingState] = useState('inactive')
+  const ambientRecordingControllerRef = useRef(null)
   const [voiceReferenceRecordingState, setVoiceReferenceRecordingState] = useState('inactive')
   const [messages, setMessages] = useState([])
   const [activity, setActivity] = useState(t('正在检查后台 Agent'))
@@ -855,6 +857,7 @@ export default function App() {
     clientStates: desktopOrbMode ? ['sleeping'] : [],
     onEvent: onRealtimeEvent,
     onInputError: message => {
+      ambientRecordingControllerRef.current?.failMicrophone(message)
       setVoiceEnabled(false)
       setWaitingForVoice(false)
       setActivity(message)
@@ -868,8 +871,8 @@ export default function App() {
       window.qwenAudioAgentDesktop?.acceptWakeWordAudio(audio, sampleRate)
     },
     ambientRecording: desktopOrbMode && ambientRecordingState === 'recording',
-    onAmbientRecordingAudio: (audio, sampleRate) => {
-      window.qwenAudioAgentDesktop?.appendAmbientRecordingAudio(audio, sampleRate)
+    onAmbientRecordingAudio: (audio, sampleRate, startedAt) => {
+      ambientRecordingControllerRef.current?.appendMicrophone(audio, sampleRate, startedAt)
     },
     voiceReferenceRecording: (
       desktopOrbMode && voiceReferenceRecordingState === 'recording'
@@ -881,15 +884,28 @@ export default function App() {
   gatewayCommandsRef.current = voice
   useEffect(() => {
     if (!desktopOrbMode) return undefined
-    return window.qwenAudioAgentDesktop?.onAmbientRecordingState?.(state => {
+    const controller = createAmbientRecordingController({
+      desktop: window.qwenAudioAgentDesktop,
+      flushMicrophone: () => gatewayCommandsRef.current?.flushAmbientRecordingAudio(),
+      onError: message => setActivity(t(message)),
+    })
+    ambientRecordingControllerRef.current = controller
+    const unsubscribe = window.qwenAudioAgentDesktop?.onAmbientRecordingState?.(state => {
       const next = ['starting', 'recording', 'finalizing', 'error'].includes(state?.state)
         ? state.state
         : 'inactive'
       setAmbientRecordingState(next)
       if (next === 'starting') setActivity(t('正在启动环境录音'))
-      if (next === 'recording') setActivity(t('正在录制环境音频'))
-      if (next === 'error' && state?.message) setActivity(state.message)
+      if (next === 'recording') setActivity(t(state?.sources?.includes('system')
+        ? '正在录制麦克风和系统音频' : '正在录制麦克风音频'))
+      if (next === 'inactive' || next === 'error' || next === 'finalizing') controller.release()
+      if (next === 'error' && state?.message) setActivity(t(state.message))
     })
+    return () => {
+      unsubscribe?.()
+      void controller.stop().catch(() => {})
+      ambientRecordingControllerRef.current = null
+    }
   }, [])
 
   useEffect(() => {
@@ -906,6 +922,14 @@ export default function App() {
         setVoiceEnabled(false)
         gatewayCommandsRef.current?.interrupt()
       }
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!desktopOrbMode) return undefined
+    return window.qwenAudioAgentDesktop?.onAmbientRecordingFlushRequest?.(({ recordingId } = {}) => {
+      gatewayCommandsRef.current?.flushAmbientRecordingAudio()
+      window.qwenAudioAgentDesktop?.confirmAmbientRecordingAudioFlushed(recordingId)
     })
   }, [])
 
@@ -1208,10 +1232,9 @@ export default function App() {
     if (ambientRecordingState === 'recording') {
       // Send the renderer's sub-second PCM tail before the main process seals
       // its final WAV batch.  The subsequent invoke is ordered after this IPC.
-      voice.flushAmbientRecordingAudio()
       setAmbientRecordingState('finalizing')
       try {
-        await desktop.stopAmbientRecording()
+        await ambientRecordingControllerRef.current.stop()
       } catch (error) {
         setAmbientRecordingState('error')
         setActivity(error?.message || t('环境录音停止失败'))
@@ -1228,10 +1251,12 @@ export default function App() {
     setAmbientRecordingState('starting')
     setActivity(t('正在启动环境录音'))
     try {
-      await desktop.startAmbientRecording()
+      await ambientRecordingControllerRef.current.start()
     } catch (error) {
       setAmbientRecordingState('error')
-      setActivity(error?.message || t('环境录音启动失败'))
+      setActivity(error?.name === 'NotAllowedError'
+        ? t('系统音频授权已取消或被拒绝，请授权后重试，或在设置中选择“仅麦克风”')
+        : t(error?.message || '环境录音启动失败'))
     }
   }
 

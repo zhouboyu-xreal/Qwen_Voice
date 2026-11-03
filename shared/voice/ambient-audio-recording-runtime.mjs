@@ -222,16 +222,17 @@ export class AmbientAudioRecordingRuntime {
     })
   }
 
-  async startRecording({ recordingId, startedAt } = {}) {
+  async startRecording({ recordingId, startedAt, sources = ['microphone'] } = {}) {
     const result = await this.request('recording.start', {
       recordingId: clean(recordingId, 128),
       startedAt: clean(startedAt, 120),
+      sources,
     }, { timeoutMs: 120_000 })
     this.ready = true
     return result
   }
 
-  appendPcm16(chunk, sampleRate, recordingId) {
+  appendPcm16(chunk, sampleRate, recordingId, { source = 'microphone', startedAt = '' } = {}) {
     if (
       !this.ready
       || !Buffer.isBuffer(chunk)
@@ -242,6 +243,8 @@ export class AmbientAudioRecordingRuntime {
       recordingId: clean(recordingId, 128),
       audio: chunk.toString('base64'),
       sampleRate,
+      source,
+      startedAt,
     }, { timeoutMs: 5_000, audio: true })
   }
 

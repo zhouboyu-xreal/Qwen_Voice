@@ -418,6 +418,11 @@ class AgentMemoryRuntime:
             )
             if report.get("reason") == "memory_disabled":
                 raise RuntimeError("agent_memory is disabled")
+        processed_through = params.get("processedThrough")
+        if processed_through:
+            # The recorder coordinates coverage across microphone/system
+            # tracks, including windows with no speech on one or both tracks.
+            holder.pwm.update_ambient_asr_watermark(processed_through)
         holder.remember([dedupe_key])
         result = {
             "observed": True,

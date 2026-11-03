@@ -3,6 +3,7 @@ productName: Qwen Audio Agent
 electronVersion: 43.2.0
 asar: true
 npmRebuild: false
+beforePack: desktop/native/before-pack.cjs
 asarUnpack:
   - node_modules/sherpa-onnx/**/*.wasm
   # open-computer-use is spawned by external backend Agent processes (plain
@@ -52,6 +53,11 @@ extraResources:
       - "**/*"
 
 mac:
+  extraResources:
+    - from: desktop/native/bin/${arch}/qwen-system-audio
+      to: native/qwen-system-audio
+  binaries:
+    - Contents/Resources/native/qwen-system-audio
   category: public.app-category.productivity
   icon: desktop/build/icon.icns
   hardenedRuntime: true
@@ -60,7 +66,8 @@ mac:
   notarize: true
   extendInfo:
     LSUIElement: true
-    NSMicrophoneUsageDescription: Qwen Audio Agent 需要使用麦克风进行实时语音对话。
+    NSMicrophoneUsageDescription: Qwen Audio Agent 需要使用麦克风进行实时语音对话和环境录音。
+    NSAudioCaptureUsageDescription: Qwen Audio Agent 需要录制会议等系统播放音频，用于环境录音和个人世界模型。
   target:
     - dmg
     - zip
