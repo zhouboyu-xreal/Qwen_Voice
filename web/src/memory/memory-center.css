@@ -12,7 +12,7 @@
   font: 14px/1.6 Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 .memory-center * { box-sizing: border-box; }
-.memory-center button, .memory-center select {
+.memory-center button, .memory-center select, .memory-center input {
   font: inherit;
   color: inherit;
   background: var(--memory-surface);
@@ -39,6 +39,11 @@
 .memory-filters { margin-top: 14px; gap: 14px; }
 .memory-filters label { display: flex; align-items: center; gap: 7px; color: var(--memory-muted); font-size: 12px; }
 .memory-filters select { max-width: 170px; font-size: 13px; }
+.memory-filters input { min-width: 0; max-width: 170px; font-size: 13px; color-scheme: dark; }
+.memory-source-window summary { cursor: pointer; color: #d1c5f3; }
+.memory-source-window blockquote { margin: 14px 0; padding-left: 13px; border-left: 2px solid #b1a1dd50; }
+.memory-source-window p { white-space: pre-wrap; }
+.memory-source-window small { color: var(--memory-muted); }
 .memory-columns { display: grid; grid-template-columns: minmax(220px, .9fr) minmax(0, 1.1fr); flex: 1; min-height: 0; }
 .memory-list-pane { display: flex; flex-direction: column; min-height: 0; min-width: 0; border-right: 1px solid var(--memory-line); }
 .memory-list-count { padding: 12px 18px 0; color: var(--memory-muted); font-size: 12px; }

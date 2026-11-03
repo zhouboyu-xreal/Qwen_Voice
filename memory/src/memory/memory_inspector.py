@@ -16,10 +16,12 @@ from typing import Any, Iterator
 
 INTENT_TYPES = {"goal", "plan", "work_item"}
 STATE_TYPES = {"enduring_state", "recurring_state", "situational_state"}
+ACTIVITY_ROLES = {"actor", "participant", "contextual"}
 CURRENT_INTENT_STATUSES = {"active", "planned", "rescheduled", "open", "in_progress", "blocked"}
 CURRENT_STATE_STATUSES = {"active", "weakened"}
 STATUSES = CURRENT_INTENT_STATUSES | CURRENT_STATE_STATUSES | {"completed", "cancelled", "occurred", "expired"}
 DETAIL_PAGE_SIZE = 20
+SOURCE_PAGE_SIZE = 6
 
 
 def _json(value: Any, fallback: Any) -> Any:
@@ -62,6 +64,25 @@ def _bounded(value: Any, limit: int = 4000) -> str:
     return str(value or "").replace("\0", "")[:limit]
 
 
+def _reference_ids(value: Any) -> list[int]:
+    return list(dict.fromkeys(item for item in _json(value, [])
+                              if type(item) is int and 0 < item <= 2**53 - 1))
+
+
+def _instant(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str) or len(value) > 40:
+        raise ValueError("invalid activity time")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("invalid activity time") from None
+    if parsed.tzinfo is None:
+        raise ValueError("activity time requires timezone")
+    return parsed.isoformat()
+
+
 class MemoryInspector:
     def __init__(self, memory_path: Path, model_path: Path, *, owner_name: str = "用户本人") -> None:
         self.memory_path = memory_path
@@ -70,6 +91,8 @@ class MemoryInspector:
 
     def inspect(self, params: dict[str, Any]) -> dict[str, Any]:
         section = params.get("section")
+        if section == "activities":
+            return self._activities(params)
         if section not in {"intents", "states"}:
             raise ValueError("section must be intents or states")
         types = INTENT_TYPES if section == "intents" else STATE_TYPES
@@ -142,6 +165,93 @@ class MemoryInspector:
                 self._state_detail(connection, result, item_id, evidence_page, history_page)
             return result
 
+    def _activities(self, params: dict[str, Any]) -> dict[str, Any]:
+        role = params.get("role", "")
+        if not isinstance(role, str) or role and role not in ACTIVITY_ROLES:
+            raise ValueError("invalid activity role")
+        after, before = _instant(params.get("from")), _instant(params.get("to"))
+        if after and before and datetime.fromisoformat(after) >= datetime.fromisoformat(before):
+            raise ValueError("invalid activity time range")
+        page = _positive(params.get("page", 1), "page")
+        size = _positive(params.get("pageSize", 20), "pageSize", 100)
+        item_id = _positive(params["id"], "id", 2**53 - 1) if params.get("id") is not None else None
+        evidence_page = _positive(params.get("evidencePage", 1), "evidencePage")
+        source_page = _positive(params.get("sourcePage", 1), "sourcePage")
+        result = {"supported": True, "available": False, "section": "activities",
+                  "fetchedAt": datetime.now().astimezone().isoformat(),
+                  "page": page, "pageSize": size, "total": 0, "items": []}
+        with _reader(self.memory_path) as connection:
+            if not _table(connection, "memory_user_activity_items"):
+                result["reason"] = "not_created" if connection is None else "schema_unavailable"
+                if item_id is not None:
+                    result["item"] = None
+                return result
+            result["available"] = True
+            if item_id is not None:
+                row = connection.execute("SELECT * FROM memory_user_activity_items WHERE id=?", (item_id,)).fetchone()
+                result["item"] = self._activity_record(dict(row)) if row else None
+                result.pop("items")
+                if row:
+                    self._activity_detail(connection, result, dict(row), evidence_page, source_page)
+                return result
+            clauses, values = [], []
+            start = "COALESCE(julianday(started_at),julianday(ended_at))"
+            end = "COALESCE(julianday(ended_at),julianday(started_at))"
+            if role:
+                clauses.append("user_role=?")
+                values.append(role)
+            # Overlap with [from, to); compare instants, never ISO text across timezones.
+            for value, expression, operator in ((after, end, ">="), (before, start, "<")):
+                if value:
+                    clauses.append(f"{expression} {operator} julianday(?)")
+                    values.append(value)
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
+            result["total"] = connection.execute(
+                f"SELECT COUNT(*) FROM memory_user_activity_items{where}", values,
+            ).fetchone()[0]
+            rows = connection.execute(
+                f"SELECT * FROM memory_user_activity_items{where} ORDER BY {start} DESC,id DESC LIMIT ? OFFSET ?",
+                (*values, size, (page - 1) * size),
+            ).fetchall()
+            result["items"] = [self._activity_record(dict(row)) for row in rows]
+            return result
+
+    @staticmethod
+    def _activity_record(row: dict[str, Any]) -> dict[str, Any]:
+        item = {key: row.get(key) for key in (
+            "id", "user_role", "confidence", "started_at", "ended_at", "created_at", "updated_at",
+        )}
+        item["activity_text"] = _bounded(row.get("activity_text"))
+        item["time_scope"] = "source_window" if _json(row.get("metadata"), {}).get("time_scope") == "source_window" else ""
+        item["evidence_fact_count"] = len(_reference_ids(row.get("evidence_fact_ids")))
+        item["source_segment_count"] = len(_reference_ids(row.get("source_segment_ids")))
+        return item
+
+    def _activity_detail(self, connection, result, row, evidence_page, source_page):
+        fact_ids = _reference_ids(row.get("evidence_fact_ids"))
+        selected = fact_ids[(evidence_page - 1) * DETAIL_PAGE_SIZE:evidence_page * DETAIL_PAGE_SIZE]
+        evidence = [{"evidence_type": "fact", "evidence_id": key, "role": "support"} for key in selected]
+        self._resolve_evidence(connection, evidence, include_sources=False)
+        result["evidence"] = {"items": evidence, "total": len(fact_ids),
+                              "page": evidence_page, "pageSize": DETAIL_PAGE_SIZE}
+        source_ids = _reference_ids(row.get("source_segment_ids"))
+        selected = source_ids[(source_page - 1) * SOURCE_PAGE_SIZE:source_page * SOURCE_PAGE_SIZE]
+        by_id = {}
+        if selected and _table(connection, "memory_source_segments"):
+            placeholders = ",".join("?" for _ in selected)
+            by_id = {item["id"]: item for item in connection.execute(
+                f"SELECT id,text,started_at,ended_at FROM memory_source_segments WHERE id IN ({placeholders})", selected,
+            )}
+        sources = []
+        for key in selected:
+            source = by_id.get(key)
+            sources.append({"id": key, "resolved": source is not None,
+                            "text": _bounded(source["text"], 2000) if source else "",
+                            "started_at": source["started_at"] if source else None,
+                            "ended_at": source["ended_at"] if source else None})
+        result["sources"] = {"items": sources, "total": len(source_ids),
+                             "page": source_page, "pageSize": SOURCE_PAGE_SIZE}
+
     @staticmethod
     def _record(row: dict[str, Any], section: str) -> dict[str, Any]:
         keys = ("id", "status", "confidence", "created_at", "updated_at")
@@ -190,7 +300,7 @@ class MemoryInspector:
                 if field in event:
                     event[field] = _json(event[field], [])
 
-    def _resolve_evidence(self, connection, items):
+    def _resolve_evidence(self, connection, items, *, include_sources=True):
         specs = {
             "fact": ("memory_facts", "summary"), "user_claim": ("memory_user_claims", "claim_text"),
             "user_activity": ("memory_user_activity_items", "activity_text"),
@@ -214,6 +324,8 @@ class MemoryInspector:
                 continue
             row = dict(row)
             evidence.update(resolved=True, text=_bounded(row.get(spec[1])), occurred_at=row.get("event_time_key") or row.get("last_observed_at") or row.get("updated_at") or "")
+            if not include_sources:
+                continue
             facts = [key] if kind == "fact" else _json(row.get("evidence_fact_ids"), [])
             segments = _json(row.get("source_segment_ids"), [])
             if kind == "user_action_signal":

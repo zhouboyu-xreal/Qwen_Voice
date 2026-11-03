@@ -1,5 +1,8 @@
 import { t } from '../i18n.js'
 
+export const SECTIONS = { activities: '我的活动', intents: '意图与安排', states: '我的状态' }
+export const ACTIVITY_ROLES = { actor: '亲自行动', participant: '参与活动或交流', contextual: '情境接触' }
+
 export const TYPES = {
   intents: { goal: '目标', plan: '计划', work_item: '待办' },
   states: { situational_state: '当前状态', recurring_state: '规律习惯', enduring_state: '长期特征' },
@@ -41,6 +44,7 @@ const OPERATIONS = {
 }
 
 export function typeLabel(item) {
+  if (isActivity(item)) return t('用户活动')
   return t(TYPES.intents[item.object_type] || TYPES.states[item.state_type] || '未分类')
 }
 export function domainLabel(value) { return t(DOMAINS[value] || value || '未分类') }
@@ -48,7 +52,13 @@ export function statusLabel(item) {
   if (item.object_type === 'goal' && item.status === 'active') return t('推进中')
   return t(STATUSES[item.status] || item.status || '未明确')
 }
-export function titleFor(item) { return item.summary || item.state_text || item.state_topic || t('无标题') }
+export function titleFor(item) { return item.activity_text || item.summary || item.state_text || item.state_topic || t('无标题') }
+export function isActivity(item) { return typeof item.activity_text === 'string' }
+export function activityRoleLabel(role) { return t(ACTIVITY_ROLES[role] || '未明确') }
+export function observationWindow(item) {
+  if (!item.started_at && !item.ended_at) return t('未明确')
+  return `${formatTime(item.started_at)} — ${formatTime(item.ended_at)}`
+}
 export function fieldLabel(key) { return t(FIELDS[key] || key) }
 export function evidenceLabel(kind) { return t(EVIDENCE[kind] || kind) }
 export function operationLabel(event) { return t(OPERATIONS[event.operation || event.event_type] || '更新') }
@@ -86,6 +96,10 @@ export function valueText(value) {
 }
 
 export function recordFields(item) {
+  if (isActivity(item)) return [
+    { key: 'user_role', label: t('参与角色'), value: activityRoleLabel(item.user_role) },
+    { key: 'observation_window', label: t('观察时间窗口'), value: observationWindow(item) },
+  ]
   const fields = item.object_type
     ? [['status', statusLabel(item)], ['time_start', item.time_start], ['time_end', item.time_end],
         ...Object.entries(item.details || {}).filter(([key]) => Object.hasOwn(FIELDS, key)

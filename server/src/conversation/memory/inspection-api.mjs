@@ -2,6 +2,7 @@
 const TYPES = {
   intents: ['goal', 'plan', 'work_item'],
   states: ['situational_state', 'recurring_state', 'enduring_state'],
+  activities: [],
 }
 const STATUSES = new Set([
   'active', 'planned', 'rescheduled', 'open', 'in_progress', 'blocked',
@@ -13,6 +14,17 @@ function positive(value, fallback, maximum) {
   if (typeof value !== 'string' || !/^[1-9]\d*$/u.test(value)) return null
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed <= maximum ? parsed : null
+}
+
+function instant(value) {
+  if (value === undefined || value === '') return ''
+  if (typeof value !== 'string' || value.length > 40
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$/u.test(value)) return null
+  const timestamp = Date.parse(value)
+  const day = new Date(`${value.slice(0, 10)}T00:00:00Z`)
+  if (!Number.isFinite(timestamp) || !Number.isFinite(day.getTime())
+    || day.toISOString().slice(0, 10) !== value.slice(0, 10)) return null
+  return new Date(timestamp).toISOString()
 }
 
 export function memoryInspectionOptions(section, id, query = {}) {
@@ -28,6 +40,17 @@ export function memoryInspectionOptions(section, id, query = {}) {
   if (id !== undefined) {
     options.id = positive(id, null, Number.MAX_SAFE_INTEGER)
     if (options.id === null) return null
+  }
+  if (section === 'activities') {
+    if (query.role !== undefined && typeof query.role !== 'string') return null
+    options.role = query.role || ''
+    if (options.role && !['actor', 'participant', 'contextual'].includes(options.role)) return null
+    options.from = instant(query.from)
+    options.to = instant(query.to)
+    options.sourcePage = positive(query.sourcePage, 1, 1_000_000)
+    if (options.from === null || options.to === null || options.sourcePage === null) return null
+    if (options.from && options.to && Date.parse(options.from) >= Date.parse(options.to)) return null
+    return options
   }
   for (const key of ['type', 'scope', 'status', 'domain']) {
     if (query[key] !== undefined && typeof query[key] !== 'string') return null

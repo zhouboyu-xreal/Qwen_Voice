@@ -63,3 +63,19 @@ PWM 启动、worker 空闲和普通任务完成都不会自动触发周期检查
 `drain_pending_user_state_claims()`，然后等待状态更新任务完成。
 在线周期信号使用 `trigger_user_state_update()`，离线完整处理使用
 `drain_pending_user_state_claims()`，两者均不在 PWM 内部计时。
+
+## 我的活动只读查看
+
+“我的记忆”中的“我的活动”读取当前用户 `memory.db` 的
+`memory_user_activity_items`，复用认证后的 `inspect` 路径，不启动提炼任务。
+
+- 列表：`GET /api/pwm/activities?page=1&pageSize=20`。
+- 详情：`GET /api/pwm/activities/{id}?evidencePage=1&sourcePage=1`。
+- `role` 可选 `actor`、`participant`、`contextual`；空值表示全部角色。
+- `from`、`to` 使用带时区的 ISO 时间，查询观察窗口与 `[from, to)` 重叠的记录。
+  界面日期按用户本地整天转换，结束日期包含当天。
+- 关联事实每页最多 20 条，来源窗口每页最多 6 段；来源不可用时保留缺失提示。
+
+活动表示采集当时观察到的行为、交谈或环境情境。观察时间来自整个来源窗口，
+不表示精确活动时长；来源窗口也可能包含其他话题。活动列表不套用意图和状态的
+领域、状态或当前/历史筛选。

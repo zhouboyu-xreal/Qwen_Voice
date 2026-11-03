@@ -3,6 +3,8 @@ import test from 'node:test'
 import { setRuntimeLanguage } from '../src/i18n.js'
 setRuntimeLanguage('zh-CN')
 import { eventChanges, formatTime, recordFields, statusLabel, validityLabel } from '../src/memory/presentation.js'
+import { activityRoleLabel, observationWindow, titleFor } from '../src/memory/presentation.js'
+import { memoryListQuery } from '../src/memory/inspection-query.js'
 
 test('preserves distinct intent statuses and does not infer completion from dates', () => {
   assert.equal(statusLabel({ object_type: 'goal', status: 'active' }), '推进中')
@@ -41,4 +43,28 @@ test('typed intent times and flattened history aliases are displayed once', () =
   assert.equal(eventChanges({
     previous_payload: {}, new_payload: { target_at: '2026-11-04', details: { target_at: '2026-11-04' } },
   }).filter(field => field.key === 'target_at').length, 1)
+})
+
+test('activity presentation uses roles and observation windows without inferring status or duration', () => {
+  const item = { activity_text: '与助手讨论旅行计划', user_role: 'participant', started_at: '', ended_at: '' }
+  assert.equal(titleFor(item), item.activity_text)
+  assert.equal(activityRoleLabel('participant'), '参与活动或交流')
+  assert.equal(observationWindow(item), '未明确')
+  assert.deepEqual(recordFields(item).map(field => field.key), ['user_role', 'observation_window'])
+})
+
+test('activity date filters cover whole local days and never send stale state filters', () => {
+  const query = memoryListQuery({ section: 'activities', role: 'actor', fromDate: '2026-11-03', toDate: '2026-11-03',
+    status: 'active', scope: 'current', type: 'goal', domain: 'work' })
+  assert.equal(new Date(query.get('from')).getHours(), 0)
+  assert.equal(new Date(query.get('from')).getDate(), 3)
+  assert.equal(new Date(query.get('to')).getHours(), 0)
+  assert.equal(new Date(query.get('to')).getDate(), 4)
+  for (const key of ['status', 'scope', 'type', 'domain']) assert.equal(query.has(key), false)
+  assert.equal(query.get('role'), 'actor')
+  const states = memoryListQuery({ section: 'states', role: 'actor', fromDate: '2026-11-03' })
+  assert.equal(states.has('role'), false)
+  assert.equal(states.has('from'), false)
+  assert.throws(() => memoryListQuery({ section: 'activities', fromDate: '2026-02-30' }), RangeError)
+  assert.throws(() => memoryListQuery({ section: 'activities', fromDate: '2026-11-04', toDate: '2026-11-03' }), RangeError)
 })
