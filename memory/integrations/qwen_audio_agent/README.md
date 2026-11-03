@@ -39,3 +39,27 @@ Sidecar 默认追加运行日志到
 
 逐 turn 写入、原生 PCM 采集、以及面向前台模型的独立 `memory_recall` function tool
 尚未在本阶段启用；它们需要对 qwen-audio-agent 的 Provider 生命周期和工具面继续扩展。
+
+## 外部周期任务
+
+桌面应用启动后，由 `desktop/src/periodic-task-controller.mjs` 独立计时。默认每
+1800 秒发送一次 `user_state_from_claims` 信号，首次发送在启动一个完整周期后。
+配置 `QWEN_AUDIO_PWM_USER_STATE_INTERVAL_SECONDS` 可调整秒数，`0` 可关闭；修改后需重启应用。
+图标休眠和环境录音开关不影响计时；退出停止计时，重新启动从零开始，系统恢复后不补发所有错过的周期。
+
+计时器只判断周期，不读取 claim 数据。Gateway 的
+`POST /api/memory/periodic-task` 接收 `{ "taskId": "user_state_from_claims" }`，
+使用认证身份经 Provider / Sidecar 调用 `PersonWorldModel.trigger_user_state_update()`。
+PWM 在接收信号时直接检查已持久化的待处理 claim，无增量立即返回
+`queued: false, reason: no_changed_claims`。`queued: true` 表示实际状态更新任务已入队，
+不表示模型处理已完成；检查本身不生成独立任务，也不等待正在提炼的新 claim。
+
+有增量则按 `user_state_claim_batch_limit` 提交一批状态更新，由 PWM worker 串行执行；
+不再检查周期、最少 claim 数或最长等待时间。
+任务成功才确认处理过的 claim 版本；失败和执行期间产生的新版本留待后续周期处理。
+PWM 启动、worker 空闲和普通任务完成都不会自动触发周期检查。
+
+离线任务需要处理全部批次时，先等待 claim 提炼任务完成，再显式调用
+`drain_pending_user_state_claims()`，然后等待状态更新任务完成。
+在线周期信号使用 `trigger_user_state_update()`，离线完整处理使用
+`drain_pending_user_state_claims()`，两者均不在 PWM 内部计时。

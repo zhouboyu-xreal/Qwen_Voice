@@ -4,8 +4,8 @@
 Unlike run_clongeval_conversation.py, this runner never recalls or answers a
 question. Distinct ``context`` values are replayed in JSON/JSONL input order
 through one PersonWorldModel and one pair of databases. Each context forms a
-session boundary, and the script drains memory tasks plus the claim-state
-window before recording a progress snapshot.
+session boundary, and the script drains memory tasks plus pending claim-state
+batches before recording a progress snapshot.
 
 CLongEval contexts may represent different fictional people. A shared database
 is useful for pipeline testing, but is not an identity-isolated benchmark.
@@ -336,13 +336,12 @@ def replay_context(
         raise RuntimeError(f"Finalization rejected for {context_id}: {finalization}")
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError(f"Memory task queue did not drain for {context_id}")
-    # The normal claim-state task uses a thirty-minute window. A benchmark
-    # context boundary explicitly drains it so this context's state is visible.
-    state_tick = pwm.trigger_user_state_time_tick(now=last_timestamp, force=True)
-    if state_tick.get("reason") in {
+    # Explicitly drain all claim-state batches at the benchmark context boundary.
+    state_drain = pwm.drain_pending_user_state_claims()
+    if state_drain.get("reason") in {
         "worker_queue_full", "worker_shutdown", "task_handler_not_registered",
     }:
-        raise RuntimeError(f"Claim-state tick rejected for {context_id}: {state_tick}")
+        raise RuntimeError(f"Claim-state drain rejected for {context_id}: {state_drain}")
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError(f"State task queue did not drain for {context_id}")
     return {
@@ -350,7 +349,7 @@ def replay_context(
         "turn_pairs": turns,
         "last_turn_timestamp": last_timestamp.isoformat() if last_timestamp else None,
         "finalization": finalization,
-        "claim_state_tick": state_tick,
+        "claim_state_tick": state_drain,
     }
 
 

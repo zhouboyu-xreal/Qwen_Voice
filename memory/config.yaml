@@ -212,11 +212,7 @@ personal_world_model:
     user_action_min_signal_facts: 8
     interaction_user_action_min_signal_batches: 3
     interaction_user_action_min_signal_facts: 5
-    # Claim-to-state projection is evaluated every 30 minutes. Distinct changed
-    # claims carry over between windows; low-volume changes flush after 2 hours.
-    user_state_claim_window_seconds: 1800
-    user_state_claim_min_changed_claims: 3
-    user_state_claim_max_wait_seconds: 7200
+    # The host supplies periodic signals; PWM only checks and processes pending claims.
     user_state_claim_batch_limit: 80
 
   memory_manager:

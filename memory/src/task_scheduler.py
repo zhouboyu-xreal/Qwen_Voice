@@ -377,27 +377,12 @@ class TaskScheduler:
             except Exception:
                 self._task_execution_db.close()
                 raise
-        self._claim_state_window_seconds = max(
-            1.0, float(settings.get("user_state_claim_window_seconds", 1800) or 1800),
-        )
-        self._claim_state_min_changed_claims = max(
-            1, int(settings.get("user_state_claim_min_changed_claims", 3) or 3),
-        )
-        self._claim_state_max_wait_seconds = max(
-            self._claim_state_window_seconds,
-            float(settings.get("user_state_claim_max_wait_seconds", 7200) or 7200),
-        )
         self._claim_state_batch_limit = max(
             1, int(settings.get("user_state_claim_batch_limit", 80) or 80),
         )
         self._claim_state_lock = threading.Lock()
         self._claim_state_task_pending = False
         self._claim_state_force_requested = False
-        self._next_claim_state_tick_at = (
-            time.monotonic()
-            + self._claim_state_window_seconds
-            - (time.time() % self._claim_state_window_seconds)
-        )
         self._fact_followup_thresholds = {
             "memory_user_claim_update": {
                 "default": {
@@ -557,8 +542,6 @@ class TaskScheduler:
         with self._worker_lock:
             if not self._shutdown_event.is_set():
                 self._ensure_worker_locked()
-        if self._claim_state_database is not None:
-            self.trigger_user_state_time_tick()
 
     def submit(
         self,
@@ -762,7 +745,6 @@ class TaskScheduler:
             try:
                 task = self._queue.get(timeout=0.2)
             except queue.Empty:
-                self._maybe_tick_claim_state_window()
                 continue
             try:
                 self._execute_scheduled_task(task)
@@ -774,19 +756,6 @@ class TaskScheduler:
                 )
             finally:
                 self._queue.task_done()
-            self._maybe_tick_claim_state_window()
-
-    def _maybe_tick_claim_state_window(self) -> None:
-        if self._claim_state_database is None:
-            return
-        now = time.monotonic()
-        if now < self._next_claim_state_tick_at:
-            return
-        self._next_claim_state_tick_at = now + self._claim_state_window_seconds
-        try:
-            self.trigger_user_state_time_tick()
-        except Exception:
-            self._logger.exception("Claim state time-window tick failed")
 
     def _execute_scheduled_task(self, task: Dict[str, Any]) -> None:
         """Execute, apply result bookkeeping, report, then schedule follow-ups."""
@@ -875,102 +844,93 @@ class TaskScheduler:
             task_kind, task_id, self._queue.qsize(),
         )
 
-    def trigger_user_state_time_tick(
-        self, *, now: Optional[datetime] = None, force: bool = False,
-    ) -> Dict[str, Any]:
-        """Queue changed claims after the time window, or immediately on final flush."""
-        if self._task_execution_db is None:
-            return {"queued": False, "reason": "task_execution_database_unavailable"}
-        effective_now = now or datetime.now().astimezone()
-        if effective_now.tzinfo is None:
-            effective_now = effective_now.astimezone()
-        with self._execution_lock:
-            with self._claim_state_lock:
-                if self._claim_state_task_pending:
-                    if force:
-                        self._claim_state_force_requested = True
-                    return {"queued": False, "reason": "claim_state_task_pending"}
-                pending = self._task_execution_db.get_pending_user_state_claims(
-                    limit=self._claim_state_batch_limit,
-                )
-                items = pending["items"]
-                if not items:
-                    return {"queued": False, "reason": "no_changed_claims"}
-                first_detected = datetime.fromisoformat(
-                    pending["first_detected_at"].replace("Z", "+00:00")
-                )
-                if first_detected.tzinfo is None:
-                    first_detected = first_detected.astimezone()
-                age_seconds = max(
-                    0.0, (effective_now - first_detected).total_seconds(),
-                )
-                if not force and age_seconds < self._claim_state_window_seconds:
-                    self._logger.info(
-                        "claim state window deferred reason=window_not_elapsed "
-                        "pending_claims=%s age_seconds=%.1f",
-                        pending["pending_count"], age_seconds,
-                    )
-                    return {
-                        "queued": False, "reason": "claim_window_not_elapsed",
-                        "pending_claim_count": pending["pending_count"],
-                    }
-                if not force and (
-                    pending["pending_count"] < self._claim_state_min_changed_claims
-                    and age_seconds < self._claim_state_max_wait_seconds
-                ):
-                    self._logger.info(
-                        "claim state window deferred reason=threshold_not_met "
-                        "pending_claims=%s age_seconds=%.1f",
-                        pending["pending_count"], age_seconds,
-                    )
-                    return {
-                        "queued": False, "reason": "claim_threshold_not_met",
-                        "pending_claim_count": pending["pending_count"],
-                    }
-                versions = [
-                    (int(item["claim_id"]), int(item["generation"]))
-                    for item in items
-                ]
-                newest = max(items, key=lambda item: item["last_detected_at"])
-                with self._worker_lock:
-                    latest_input_time_end = self._latest_input_time_end
-                reference_timestamp = (
-                    newest["reference_timestamp"] or latest_input_time_end or None
-                )
-                self._claim_state_task_pending = True
-        state_payload = {
-            "new_claim_ids": [claim_id for claim_id, _ in versions],
-            "claim_relations": pending["claim_relations"],
-            "reference_timestamp": reference_timestamp,
-        }
-        report = self.submit(
-            "user_state_update_from_user_claims",
-            state_payload,
-            completion_context={
-                "claim_state_window_versions": versions,
-                "claim_state_final_flush": force,
-            },
-            report_payload={
-                "new_claim_ids": state_payload["new_claim_ids"],
-                "relation_event_count": len(state_payload["claim_relations"]),
-                "reference_timestamp": reference_timestamp,
-            },
-        )
-        if not report.get("queued"):
-            with self._claim_state_lock:
-                self._claim_state_task_pending = False
+    def trigger_user_state_update(self, *, drain: bool = False) -> Dict[str, Any]:
+        """Inspect persisted claims now and enqueue only the actual state update.
+
+        TaskExecutionDB owns a separate connection and lock. Do not acquire
+        _execution_lock here or wait for model calls / future claim results.
+        Timing and cadence are exclusively owned by the application host.
+        """
         self._logger.info(
-            "claim state window evaluated pending_claims=%s selected_claims=%s "
-            "age_seconds=%.1f force=%s queued=%s reason=%s",
-            pending["pending_count"], len(versions), age_seconds,
-            force, bool(report.get("queued")), report.get("reason") or "",
+            "trigger_user_state_update received drain=%s batch_limit=%s queue_depth=%s",
+            drain, self._claim_state_batch_limit, self._queue.qsize(),
         )
-        return {
-            **report,
-            "pending_claim_count": pending["pending_count"],
-            "selected_claim_count": len(versions),
-            "oldest_change_age_seconds": round(age_seconds, 1),
-        }
+        if self._task_execution_db is None:
+            self._logger.warning(
+                "trigger_user_state_update skipped drain=%s queued=False "
+                "reason=task_execution_database_unavailable", drain,
+            )
+            return {"queued": False, "reason": "task_execution_database_unavailable"}
+        with self._claim_state_lock:
+            if self._claim_state_task_pending:
+                if drain:
+                    self._claim_state_force_requested = True
+                self._logger.info(
+                    "trigger_user_state_update skipped drain=%s queued=False "
+                    "reason=claim_state_task_pending drain_requested=%s",
+                    drain, self._claim_state_force_requested,
+                )
+                return {"queued": False, "reason": "claim_state_task_pending"}
+            self._claim_state_task_pending = True
+        queued = False
+        try:
+            pending = self._task_execution_db.get_pending_user_state_claims(
+                limit=self._claim_state_batch_limit,
+            )
+            items = pending["items"]
+            if not items:
+                self._logger.info(
+                    "trigger_user_state_update skipped drain=%s pending_claims=0 "
+                    "selected_claims=0 queued=False reason=no_changed_claims", drain,
+                )
+                return {"status": "empty", "queued": False, "reason": "no_changed_claims"}
+            versions = [(int(item["claim_id"]), int(item["generation"])) for item in items]
+            newest = max(items, key=lambda item: item["last_detected_at"])
+            with self._worker_lock:
+                latest_input_time_end = self._latest_input_time_end
+            # This is evidence time, not the time the host sent its signal.
+            reference_timestamp = newest["reference_timestamp"] or latest_input_time_end or None
+            self._logger.info(
+                "trigger_user_state_update submitting drain=%s pending_claims=%s "
+                "selected_claims=%s relation_events=%s",
+                drain, pending["pending_count"], len(versions), len(pending["claim_relations"]),
+            )
+            report = self.submit(
+                "user_state_update_from_user_claims",
+                {"new_claim_ids": [claim_id for claim_id, _ in versions],
+                 "claim_relations": pending["claim_relations"],
+                 "reference_timestamp": reference_timestamp},
+                completion_context={"claim_state_window_versions": versions,
+                                    "claim_state_final_flush": drain},
+                report_payload={
+                    "new_claim_ids": [claim_id for claim_id, _ in versions],
+                    "relation_event_count": len(pending["claim_relations"]),
+                    "reference_timestamp": reference_timestamp,
+                },
+            )
+            queued = bool(report.get("queued"))
+            self._logger.info(
+                "trigger_user_state_update evaluated drain=%s pending_claims=%s "
+                "selected_claims=%s queued=%s task_id=%s reason=%s",
+                drain, pending["pending_count"], len(versions), queued,
+                report.get("task_id") or "", report.get("reason") or "",
+            )
+            return {**report, "pending_claim_count": pending["pending_count"],
+                    "selected_claim_count": len(versions)}
+        except Exception:
+            self._logger.exception(
+                "trigger_user_state_update failed drain=%s queued=%s", drain, queued,
+            )
+            raise
+        finally:
+            if not queued:
+                with self._claim_state_lock:
+                    self._claim_state_task_pending = False
+                    self._claim_state_force_requested = False
+
+    def drain_pending_user_state_claims(self) -> Dict[str, Any]:
+        """Explicitly process successive batches; never start a periodic clock."""
+        return self.trigger_user_state_update(drain=True)
 
     def submit_flush_fact_followup_tasks(self) -> Dict[str, Any]:
         """Queue a FIFO boundary; resolve pending signals only when it executes."""
@@ -1243,7 +1203,7 @@ class TaskScheduler:
         if (completion.get("completed_successfully") and (
                 context.get("claim_state_final_flush")
                 or completion.get("force_requested"))):
-            self.trigger_user_state_time_tick(force=True)
+            self.drain_pending_user_state_claims()
 
     def _postprocess_fact_followup_task(
         self, event: Dict[str, Any],

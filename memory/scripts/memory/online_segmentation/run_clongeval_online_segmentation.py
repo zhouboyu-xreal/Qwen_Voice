@@ -473,7 +473,7 @@ def segment_context_group(
     group_id = context_group_id(context, group_index)
     days = parse_context_days(context)
     exchanges = build_exchanges(days)
-    segmenter = MemoryContextManager(embedding_client, segmentation_config)
+    segmenter = MemoryContextManager(config=segmentation_config)
     exchange_by_index = {exchange.index: exchange for exchange in exchanges}
     segments: List[FinalizedSegment] = []
     last_scoring_decision: Optional[MemorySegmentDecision] = None

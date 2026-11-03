@@ -163,6 +163,7 @@ class AgentMemoryRuntime:
                 owner_name=str(self._manager_config.get("world_owner_entity_name") or "用户本人"),
             ).inspect(params)
         handlers = {
+            "trigger_periodic_task": self.trigger_periodic_task,
             "observe": self.observe,
             "set_ambient_recording_state": self.set_ambient_recording_state,
             "observe_transcript_segments": self.observe_transcript_segments,
@@ -546,6 +547,22 @@ class AgentMemoryRuntime:
             len(str(result.get("memory_context") or "")),
         )
         return result
+
+    def trigger_periodic_task(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        task_id = _clean(params.get("taskId"), 80)
+        if task_id != "user_state_from_claims":
+            raise ValueError(f"unsupported periodic task: {task_id}")
+        owner_id = _clean(params.get("ownerId"), 240)
+        if not owner_id:
+            raise ValueError("ownerId must be non-empty")
+        # Resolve the owner even before their first conversation after restart,
+        # so persisted claims from a previous application session are included.
+        holder = self._owner_runtime(owner_id)
+        result = holder.pwm.trigger_user_state_update()
+        self._logger.info("periodic task signal owner=%s task=%s queued=%s reason=%s",
+                          _owner_key(owner_id)[:12], task_id,
+                          bool(result.get("queued")), result.get("reason") or "")
+        return {"supported": True, "taskId": task_id, **result}
 
     def health(self, _params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "activeOwners": len(self._owners)}

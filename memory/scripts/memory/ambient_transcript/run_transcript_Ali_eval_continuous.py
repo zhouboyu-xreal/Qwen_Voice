@@ -259,11 +259,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise RuntimeError(f"Finalization rejected for {path.name}: {finalization}")
             if not pwm.wait_for_memory_tasks():
                 raise RuntimeError(f"Memory tasks did not drain for {path.name}")
-            state_tick = pwm.trigger_user_state_time_tick(force=True)
-            if state_tick.get("reason") in {
+            state_drain = pwm.drain_pending_user_state_claims()
+            if state_drain.get("reason") in {
                 "worker_queue_full", "worker_shutdown", "task_handler_not_registered",
             }:
-                raise RuntimeError(f"State tick rejected for {path.name}: {state_tick}")
+                raise RuntimeError(f"State drain rejected for {path.name}: {state_drain}")
             if not pwm.wait_for_memory_tasks():
                 raise RuntimeError(f"State tasks did not drain for {path.name}")
 
@@ -282,7 +282,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "synthetic_session_end": end_time.isoformat(),
                 "input_report": input_report,
                 "finalization": finalization,
-                "state_tick": state_tick,
+                "state_tick": state_drain,
                 "table_counts": table_counts(pwm),
                 "operation_delta": delta,
             }

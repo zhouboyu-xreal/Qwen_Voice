@@ -236,11 +236,12 @@ class PersonWorldModel:
     def wait_for_memory_tasks(self, timeout: Optional[float] = None) -> bool:
         return self._task_scheduler.flush(timeout=timeout)
 
-    def trigger_user_state_time_tick(
-        self, *, now: Optional[datetime] = None, force: bool = False,
-    ) -> Dict[str, Any]:
-        """Evaluate the claim-to-state window, optionally draining it for tests."""
-        return self._task_scheduler.trigger_user_state_time_tick(now=now, force=force)
+    def trigger_user_state_update(self) -> Dict[str, Any]:
+        """Check persisted claims on a host signal and enqueue their state update."""
+        return self._task_scheduler.trigger_user_state_update()
+
+    def drain_pending_user_state_claims(self) -> Dict[str, Any]:
+        return self._task_scheduler.drain_pending_user_state_claims()
 
     def get_user_states(
         self,

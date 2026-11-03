@@ -266,11 +266,8 @@ def extract_meeting(
         raise RuntimeError(f"Meeting finalization rejected: {report['finalization']}")
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError("Memory extraction tasks did not drain")
-    # Evaluate claims below the normal state-window threshold at this file's
-    # data time, not the date this test runs or the next meeting's timestamp.
-    report["state_tick"] = pwm.trigger_user_state_time_tick(
-        now=datetime.fromisoformat(meeting["last_utterance_start"]), force=True,
-    )
+    # Drain every pending batch using the timestamps persisted with its claims.
+    report["state_tick"] = pwm.drain_pending_user_state_claims()
     if not pwm.wait_for_memory_tasks():
         raise RuntimeError("User state tasks did not drain")
     report["table_counts"] = {
