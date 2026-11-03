@@ -7,10 +7,14 @@ Example (run from the repository root)::
         --meeting-file '/path/to/文字记录：会议名称 2025年12月24日.md' \
         --owner-name 沈劲阳 --parse-only
 
-Pass multiple paths after --meeting-file, or repeat it, to process meetings in
-the supplied order with one PWM instance and shared databases. Omit --parse-only
-to run the configured extraction pipeline, without recall.
-Only exact speaker-name matches identify the owner; anonymous room speakers
+Use --meeting-dir DIR --file-limit N to select the earliest N Markdown meetings
+in that directory (non-recursive; 0 means all). Pass filenames after
+--meeting-file together with --meeting-dir to select specific files, or pass
+file paths without a directory. Multiple paths and repeated --meeting-file
+are supported. All selected meetings are ordered by their actual meeting start
+time, not filename or modification time, and share one PWM and databases.
+Omit --parse-only to run extraction, without recall. Exact owner names may
+include Feishu's " 在 <meeting room>" suffix; anonymous room/device speakers
 are never inferred to be that person. Exported offsets are utterance STARTS,
 not measured speech durations: inputs use point timestamps, with this
 limitation recorded explicitly in the parsed transcript and report.
@@ -25,7 +29,7 @@ import re
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "src") not in sys.path:
@@ -95,14 +99,72 @@ def resolve_meeting_start(
     return datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
 
 
+def read_meeting_metadata(lines: Iterable[str]) -> Dict[str, str]:
+    """Read only the export header, never treating speech as metadata."""
+    metadata = {"title": "", "heading": "", "time_description": ""}
+    for raw_line in lines:
+        line = plain_markdown(raw_line)
+        if HEADER_RE.fullmatch(line):
+            break
+        if line.startswith("# ") and not metadata["heading"]:
+            metadata["heading"] = line[2:].strip()
+            if not metadata["title"]:
+                metadata["title"] = metadata["heading"]
+        elif line.lstrip("> ").startswith("会议主题："):
+            metadata["title"] = line.lstrip("> ").split("：", 1)[1].strip() or metadata["title"]
+        elif line.lstrip("> ").startswith("会议时间："):
+            metadata["time_description"] = line.lstrip("> ").split("：", 1)[1].strip()
+    return metadata
+
+
+def select_meeting_files(args: argparse.Namespace) -> List[Path]:
+    """Resolve explicit files or sort directory exports before applying the limit."""
+    directory = args.meeting_dir.expanduser().resolve() if args.meeting_dir else None
+    if directory is not None and not directory.is_dir():
+        raise NotADirectoryError(f"Meeting directory does not exist or is not a directory: {directory}")
+    if args.meeting_file:
+        candidates = []
+        for path in args.meeting_file:
+            source = path.expanduser()
+            if directory is not None and not source.is_absolute():
+                source = directory / source
+            candidates.append(source.resolve())
+    else:
+        candidates = [
+            path.resolve() for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() == ".md"
+        ]
+    if not candidates:
+        raise ValueError(f"No Markdown meeting files found in {directory}")
+    dated_files = []
+    for source in dict.fromkeys(candidates):
+        if not source.is_file():
+            raise FileNotFoundError(f"Meeting file does not exist or is not a file: {source}")
+        with source.open(encoding="utf-8-sig") as stream:
+            metadata = read_meeting_metadata(stream)
+        try:
+            start = resolve_meeting_start(
+                title=metadata["heading"] or metadata["title"],
+                time_description=metadata["time_description"], filename=source.name,
+                override=args.session_start,
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid meeting time in {source}: {exc}") from exc
+        dated_files.append((start.timestamp(), str(source), source))
+    dated_files.sort(key=lambda item: (item[0], item[1]))
+    paths = [item[2] for item in dated_files]
+    return paths[:args.file_limit] if args.file_limit else paths
+
+
 def parse_meeting(path: Path, *, owner_name: str, session_start: str = "") -> Dict[str, Any]:
     """Read Feishu speaker/HH:MM:SS blocks, keeping text and source line numbers."""
     owner = speaker_name(owner_name)
     if not owner:
         raise ValueError("--owner-name must not be empty")
     lines = path.read_text(encoding="utf-8-sig").splitlines()
-    title = ""
-    time_description = ""
+    metadata = read_meeting_metadata(lines)
+    title = metadata["title"]
+    time_description = metadata["time_description"]
     blocks: List[Dict[str, Any]] = []
     current: Optional[Dict[str, Any]] = None
     body: List[str] = []
@@ -131,28 +193,25 @@ def parse_meeting(path: Path, *, owner_name: str, session_start: str = "") -> Di
             body = []
         elif current is not None:
             body.append(raw_line)
-        elif line.startswith("# ") and not title:
-            title = line[2:].strip()
-        elif line.lstrip("> ").startswith("会议主题："):
-            title = line.lstrip("> ").split("：", 1)[1].strip() or title
-        elif line.lstrip("> ").startswith("会议时间："):
-            time_description = line.lstrip("> ").split("：", 1)[1].strip()
     finish_block()
     if not blocks:
         raise ValueError(f"No speaker/timestamp speech blocks found in {path}")
     # The topic may omit the date while the H1 includes it.
-    heading = next((plain_markdown(line) for line in lines if line.startswith("# ")), "")
     start = resolve_meeting_start(
-        title=heading or title, time_description=time_description,
+        title=metadata["heading"] or title, time_description=time_description,
         filename=path.name, override=session_start,
     )
     source_speakers = list(dict.fromkeys(item["original_speaker"] for item in blocks))
-    if owner not in source_speakers:
+    owner_labels = {
+        name for name in source_speakers
+        if name == owner or name.startswith(f"{owner} 在 ")
+    }
+    if not owner_labels:
         raise ValueError(f"Owner {owner!r} not found among speakers: {source_speakers}")
     # Never overwrite a non-owner export label that already uses the reserved ID.
     if OWNER_SPEAKER in source_speakers and owner != OWNER_SPEAKER:
         raise ValueError("A non-owner speaker already uses the reserved owner label")
-    mapping = {name: OWNER_SPEAKER if name == owner else name for name in source_speakers}
+    mapping = {name: OWNER_SPEAKER if name in owner_labels else name for name in source_speakers}
     reordered = any(
         left["offset_seconds"] > right["offset_seconds"]
         for left, right in zip(blocks, blocks[1:])
@@ -220,8 +279,12 @@ def write_json(path: Path, value: Any) -> None:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--meeting-file", type=Path, nargs="+", action="extend", required=True,
-                        help="One or more Feishu Markdown files in processing order; may be repeated")
+    parser.add_argument("--meeting-dir", type=Path,
+                        help="Directory containing Feishu Markdown exports; non-recursive")
+    parser.add_argument("--meeting-file", type=Path, nargs="+", action="extend", default=[],
+                        help="Specific files, optionally relative to --meeting-dir; may be repeated; ordered by meeting time")
+    parser.add_argument("--file-limit", type=int, default=0,
+                        help="First N files after chronological sorting; 0 means all")
     parser.add_argument("--owner-name", required=True, help="Exact owner name in the export, e.g. 沈劲阳")
     parser.add_argument("--config", type=Path, default=REPO_ROOT / "config.yaml")
     parser.add_argument("--output-dir", type=Path, help="New or empty directory; existing data is never reused")
@@ -232,10 +295,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--llm-base-url")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     args = parser.parse_args(argv)
+    if not args.meeting_file and args.meeting_dir is None:
+        parser.error("supply --meeting-dir or --meeting-file")
+    if args.file_limit < 0:
+        parser.error("--file-limit must be nonnegative")
     if args.segment_limit < 0:
         parser.error("--segment-limit must be nonnegative")
     if args.session_start and len(args.meeting_file) != 1:
-        parser.error("--session-start only supports one meeting file; multiple files use their own meeting times")
+        parser.error("--session-start requires one explicit --meeting-file; other files use their own meeting times")
     return args
 
 
@@ -406,10 +473,9 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     meetings = []
-    # Parse every source before starting models so an invalid later file cannot
-    # leave a partially executed extraction run. Do not sort the supplied paths.
-    for path in args.meeting_file:
-        source = path.expanduser().resolve()
+    # Sort by export timestamps and apply the file limit before parsing speech.
+    # Validate all selected sources before starting models or creating output.
+    for source in select_meeting_files(args):
         meeting = parse_meeting(source, owner_name=args.owner_name, session_start=args.session_start)
         if args.segment_limit:
             meeting["segments"] = meeting["segments"][:args.segment_limit]
