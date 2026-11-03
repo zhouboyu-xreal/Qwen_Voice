@@ -160,12 +160,6 @@ function OrbControlIcon({ type, muted = false, collapsed = false }) {
       <path d="M4 5h7a3 3 0 0 1 3 3v12a4 4 0 0 0-3-2H4zm16 0h-3a3 3 0 0 0-3 3v12a4 4 0 0 1 3-2h3z" />
     </svg>
   }
-  if (type === 'settings') {
-    return <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="12" cy="12" r="3" />
-      <path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.04.04a2 2 0 0 1-2.83 2.83l-.04-.04a1.8 1.8 0 0 0-1.98-.36 1.8 1.8 0 0 0-1.08 1.65V21a2 2 0 0 1-4 0v-.06A1.8 1.8 0 0 0 8.8 19.3a1.8 1.8 0 0 0-1.98.36l-.04.04a2 2 0 0 1-2.83-2.83l.04-.04a1.8 1.8 0 0 0 .36-1.98A1.8 1.8 0 0 0 2.7 13.8H2.6a2 2 0 0 1 0-4h.06A1.8 1.8 0 0 0 4.3 8.72a1.8 1.8 0 0 0-.36-1.98l-.04-.04a2 2 0 0 1 2.83-2.83l.04.04a1.8 1.8 0 0 0 1.98.36A1.8 1.8 0 0 0 9.82 2.6V2.5a2 2 0 0 1 4 0v.06A1.8 1.8 0 0 0 14.9 4.2a1.8 1.8 0 0 0 1.98-.36l.04-.04a2 2 0 0 1 2.83 2.83l-.04.04a1.8 1.8 0 0 0-.36 1.98 1.8 1.8 0 0 0 1.65 1.08h.1a2 2 0 0 1 0 4h-.06A1.8 1.8 0 0 0 19.4 15Z" />
-    </svg>
-  }
   if (type === 'conversation') {
     return <svg viewBox="0 0 24 24" aria-hidden="true">
       <path d="M5 5.5h14v10H9l-4 3v-13Z" />
@@ -1434,16 +1428,6 @@ export default function App() {
           >
             <OrbControlIcon type="memory" />
           </button>
-          <button
-            onClick={event => {
-              event.stopPropagation()
-              window.qwenAudioAgentDesktop?.openSettings()
-            }}
-            aria-label={t('设置')}
-            title={t('设置')}
-          >
-            <OrbControlIcon type="settings" />
-          </button>
           {desktopCards.length > 0 && <button
             onClick={event => {
               event.stopPropagation()
@@ -1454,17 +1438,6 @@ export default function App() {
           >
             <OrbControlIcon type="tasks" collapsed={desktopTasksCollapsed} />
           </button>}
-          <button
-            className="danger"
-            onClick={event => {
-              event.stopPropagation()
-              window.qwenAudioAgentDesktop?.quit()
-            }}
-            aria-label={t('退出')}
-            title={t('退出')}
-          >
-            <OrbControlIcon type="close" />
-          </button>
         </nav>
         </section>
       </div>
