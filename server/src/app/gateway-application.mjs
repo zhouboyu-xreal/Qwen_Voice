@@ -1,4 +1,5 @@
 import { registerMemoryInspectionRoutes } from '../conversation/memory/inspection-api.mjs'
+import { registerMemoryPeriodicTaskRoutes } from '../conversation/memory/periodic-task-api.mjs'
 import express from 'express'
 import { PERMISSION_DECISIONS } from '../core/work-authorization.mjs'
 import { createServer } from 'http'
@@ -789,6 +790,7 @@ app.get('/api/health', (req, res) => {
 // It exposes the same bounded documents used by Realtime without leaking the
 // Markdown default or any injected provider's persistence details.
 registerMemoryInspectionRoutes(app, { memory: frontendMemoryRuntime })
+registerMemoryPeriodicTaskRoutes(app, { memory: frontendMemoryRuntime })
 
 app.get('/api/memory', (req, res, next) => {
   if (!frontendMemoryRuntime) {

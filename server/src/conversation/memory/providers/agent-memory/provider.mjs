@@ -191,6 +191,7 @@ export class AgentMemoryProvider {
         sessionObservation: true,
         audioStreamObservation: false,
         structuredInspection: true,
+        periodicTasks: true,
       },
     }
   }
@@ -267,6 +268,12 @@ export class AgentMemoryProvider {
     pendingForSession.add(operation)
     this.pendingObservations.set(observationKey, operation)
     return operation
+  }
+
+  async triggerPeriodicTask(ownerId, taskId) {
+    return this.sidecar.request('trigger_periodic_task', {
+      ownerId: ownerKey(ownerId), taskId,
+    })
   }
 
   async flush(ownerId, context = {}) {

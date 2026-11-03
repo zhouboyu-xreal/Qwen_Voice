@@ -7,6 +7,7 @@ import {
   Menu,
   nativeImage,
   Notification,
+  powerMonitor,
   safeStorage,
   screen,
   shell,
@@ -37,6 +38,8 @@ import {
   effectiveDesktopLanguage,
 } from './i18n.mjs'
 import { readGatewayHealth } from '../../shared/gateway/http-client.mjs'
+import { createPeriodicTaskController } from './periodic-task-controller.mjs'
+import { desktopPwmPeriodicTasks, sendPwmPeriodicSignal } from './pwm-periodic-tasks.mjs'
 import { GatewayConnectionProfileStore } from '../../shared/gateway/connection-profiles.mjs'
 import {
   desktopGatewayCredential,
@@ -156,6 +159,7 @@ const desktopGatewayProfiles = new GatewayConnectionProfileStore({
   credentialStore: desktopGatewayCredentials,
 })
 let desktopConversationSessionId = desktopSettingsStore.conversationSession.load()
+let desktopPeriodicTasks = null
 const desktopGatewayClientInstanceId = desktopSettingsStore.gatewayClientInstance.load()
 const orbPlacement = createOrbPlacement({
   getDisplays: () => screen.getAllDisplays(),
@@ -1851,6 +1855,21 @@ if (!app.requestSingleInstanceLock()) {
   })
 
   app.whenReady().then(async () => {
+    // One host clock per application run, independent of windows, wake words,
+    // conversations and the contents of the user's PWM databases.
+    try {
+      desktopPeriodicTasks = createPeriodicTaskController({
+        tasks: desktopPwmPeriodicTasks(configuredGatewayEnvironment()),
+        onTrigger: ({ taskId, signal }) => sendPwmPeriodicSignal({
+          origin: appOrigin, accessToken: gatewayAccessToken, taskId, signal,
+        }).then(result => logger.info('desktop.periodic_task.signal_sent', { taskId, queued: result.queued })),
+        onError: (error, taskId) => logger.warn('desktop.periodic_task.signal_failed', { taskId, error }),
+      })
+      desktopPeriodicTasks.start()
+      powerMonitor.on('resume', desktopPeriodicTasks.check)
+    } catch (error) {
+      logger.error('desktop.periodic_task.configuration_failed', { error })
+    }
     if (process.platform === 'darwin' && process.defaultApp) {
       app.setActivationPolicy('accessory')
       app.dock?.hide()
@@ -1924,6 +1943,8 @@ if (!app.requestSingleInstanceLock()) {
     app,
     cleanup: async () => {
       logger.info('desktop.stopping')
+      desktopPeriodicTasks?.stop()
+      if (desktopPeriodicTasks) powerMonitor.removeListener('resume', desktopPeriodicTasks.check)
       memoryWindow.close()
       desktopPresence.destroy()
       desktopWakeWord.stop()

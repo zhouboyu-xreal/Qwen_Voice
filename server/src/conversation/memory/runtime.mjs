@@ -120,6 +120,15 @@ export class FrontendMemoryRuntime {
     return result
   }
 
+  async triggerPeriodicTask(ownerId, taskId) {
+    if (!this.capabilities().periodicTasks) return { supported: false }
+    const result = await this.provider.triggerPeriodicTask(ownerId, taskId)
+    if (!result || typeof result !== 'object' || Array.isArray(result)) {
+      throw new TypeError('MemoryProvider triggerPeriodicTask() must return an object')
+    }
+    return result
+  }
+
   async observe(ownerId, exchange = {}, context = {}) {
     if (!this.ownsSessionObservation()) return { observed: false }
     const result = await this.provider.observe(ownerId, exchange, context)

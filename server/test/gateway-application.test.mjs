@@ -1271,3 +1271,34 @@ test('serves read-only PWM inspection through the authenticated control plane', 
     assert.equal(response.headers.get('cache-control'), 'no-store')
   } finally { await application.close() }
 })
+
+
+test('authenticates periodic PWM signals and ignores forged owner identity', async t => {
+  const calls = []
+  const accessToken = 'periodic-remote-access-token-over-24-characters'
+  const application = createTestGatewayApplication({
+    config: { ...config, port: 0, memoryAutoEnabled: false, webSearchProvider: 'none', webSearchMcpUrl: '',
+      gatewayAccessToken: accessToken, gatewayAccessKeys: '' },
+    parentPort: null, autoStart: false, frontendMcp: null, frontendOpenApi: null,
+    frontendMemory: {
+      triggerPeriodicTask: async (...args) => { calls.push(args); return { supported: true, queued: true } },
+      health: () => ({ ok: true }), close: async () => {},
+    },
+  })
+  t.after(() => application.close())
+  application.start()
+  if (!application.server.listening) await once(application.server, 'listening')
+  const port = application.server.address().port
+  const body = { taskId: 'user_state_from_claims', ownerId: 'forged' }
+  const denied = await requestJson({ port, path: '/api/memory/periodic-task', method: 'POST',
+    headers: { Host: 'gateway.example.test' }, body })
+  assert.equal(denied.status, 401)
+  assert.equal(calls.length, 0)
+  const accepted = await requestJson({ port, path: '/api/memory/periodic-task', method: 'POST',
+    headers: { Host: 'gateway.example.test', Authorization: `Bearer ${accessToken}` }, body })
+  assert.equal(accepted.status, 202)
+  assert.equal(calls.length, 1)
+  assert.ok(calls[0][0])
+  assert.notEqual(calls[0][0], 'forged')
+  assert.equal(calls[0][1], 'user_state_from_claims')
+})

@@ -126,3 +126,23 @@ test('structured inspection uses the same owner partition as memory writes', asy
   assert.equal(calls[0].params.ownerId, calls[1].params.ownerId)
   await provider.close()
 })
+
+
+test('forwards periodic signals to the sidecar without querying claim counts', async () => {
+  const calls = []
+  const provider = new AgentMemoryProvider({
+    stateDirectory: mkdtempSync(join(tmpdir(), 'qwaudio-periodic-memory-')),
+    sidecar: {
+      request: async (...args) => { calls.push(args); return { supported: true, queued: true } },
+      close() {},
+    },
+  })
+  assert.equal(provider.describe().capabilities.periodicTasks, true)
+  assert.equal((await provider.triggerPeriodicTask('owner-a', 'user_state_from_claims')).queued, true)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0][0], 'trigger_periodic_task')
+  assert.deepEqual(Object.keys(calls[0][1]).sort(), ['ownerId', 'taskId'])
+  assert.match(calls[0][1].ownerId, /^[a-f0-9]{64}$/u)
+  assert.equal(calls[0][1].taskId, 'user_state_from_claims')
+  await provider.close()
+})

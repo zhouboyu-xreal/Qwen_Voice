@@ -40,6 +40,8 @@ export function describeMemoryProvider(provider) {
         && description.capabilities?.audioStreamObservation === true,
       ...(protocolVersion >= 2 && description.capabilities?.structuredInspection === true
         ? { structuredInspection: true } : {}),
+      ...(protocolVersion >= 2 && description.capabilities?.periodicTasks === true
+        ? { periodicTasks: true } : {}),
     },
   }
 }
@@ -62,6 +64,7 @@ export function describeMemoryProvider(provider) {
  *   flush(ownerId, context) -> void
  *   observeAudio(ownerId, event, context) -> void
  *   inspect(ownerId, options) -> Promise<structured view> (structuredInspection)
+ *   triggerPeriodicTask(ownerId, taskId) -> Promise<queue report> (periodicTasks)
  *
  * Providers advertise semanticQuery/sessionObservation/audioStreamObservation
  * from describe(). observeAudio() runs on the accepted PCM16 input hot path
@@ -108,6 +111,9 @@ export function assertMemoryProvider(value, { name = 'MemoryProvider' } = {}) {
   }
   if (description.capabilities.structuredInspection && typeof value.inspect !== 'function') {
     throw new TypeError(`${name} advertises structuredInspection but has no inspect method`)
+  }
+  if (description.capabilities.periodicTasks && typeof value.triggerPeriodicTask !== 'function') {
+    throw new TypeError(`${name} advertises periodicTasks but has no triggerPeriodicTask method`)
   }
   if (value.flush != null && typeof value.flush !== 'function') {
     throw new TypeError(`${name} flush must be a function when provided`)
