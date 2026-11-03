@@ -28,6 +28,7 @@ from .memory_manager import (
 from llm_client import LLMClient
 from task_scheduler import TaskScheduler
 from .memory_context_manager import (
+    FactExtractionTaskDecision,
     MemoryContextManager,
     TranscriptUnitAssembler,
     build_memory_context_manager_config,
@@ -93,8 +94,7 @@ class MemoryRuntime:
         )
         self._transcript_ambient_recording_enabled = False
         self._memory_context_manager = MemoryContextManager(
-            self._embedding_client,
-            memory_context_manager_config,
+            config=memory_context_manager_config,
         )
         self._user_activity_tags: List[str] = []
 
@@ -118,7 +118,7 @@ class MemoryRuntime:
     ) -> Dict[str, Any]:
         """Accept one interaction turn or one batch of transcript segments.
 
-        Both input kinds enter one shared semantic buffer.  Transcript
+        Both input kinds enter one shared input buffer. Transcript
         fragments first pass through :class:`TranscriptUnitAssembler`.
         ``ambient_recording_enabled`` only controls whether a detected fact
         boundary can submit immediately or must wait for ambient-ASR coverage.
@@ -126,7 +126,7 @@ class MemoryRuntime:
         Exactly one of ``interaction_turn`` and ``transcript_segments`` must
         be supplied.  Transcript callers should pass the complete ASR batch;
         the runtime processes it in order and only completed assembled units
-        are eligible for semantic boundary scoring.
+        are eligible for fact-window capacity/time-gap checks.
         """
         has_interaction = isinstance(interaction_turn, dict)
         has_transcripts = transcript_segments is not None
@@ -346,7 +346,7 @@ class MemoryRuntime:
         ambient_recording_enabled: bool,
         evaluate_user_activity: bool = True,
     ) -> Dict[str, Any]:
-        """Append one normalized input unit to the shared semantic buffer."""
+        """Append one normalized input unit to the shared fact window."""
         decision = self._memory_context_manager.insert_incoming_unit(
             unit,
             ambient_recording_enabled,
@@ -392,17 +392,18 @@ class MemoryRuntime:
     def _handle_memory_fact_task_decision(
         self,
         *,
-        decision: Any,
+        decision: FactExtractionTaskDecision,
         evaluate_user_activity: bool,
     ) -> Dict[str, Any]:
-        """Log one boundary and schedule fact extraction for sealed chapters."""
+        """Submit only the pre-insertion unit snapshot chosen by the decision."""
         self._logger.info(
             "memory fact task decision trigger=%s "
-            "reason=%s sealed_chapter_count=%s sealed_token_count=%s",
+            "reason=%s batch_unit_count=%s batch_token_count=%s time_gap_seconds=%s",
             decision.should_trigger,
             decision.reason,
-            decision.sealed_chapter_count,
-            decision.sealed_token_count,
+            decision.batch_unit_count,
+            decision.batch_token_count,
+            decision.time_gap_seconds,
         )
         if not decision.should_trigger:
             return {
@@ -410,8 +411,9 @@ class MemoryRuntime:
                 "queued": False,
                 "reason": decision.reason,
             }
-        self._log_sealed_memory_input_chapters_for_fact_task(decision=decision)
-        store_report = self._trigger_memory_store_task_for_sealed_memory_input()
+        store_report = self._trigger_memory_fact_extraction_task_for_pending_units(
+            decision.batch_units,
+        )
         if not store_report.get("queued"):
             return {
                 "accepted": False,
@@ -435,62 +437,6 @@ class MemoryRuntime:
             "user_activity": user_activity_report,
         }
 
-    def _log_sealed_memory_input_chapters_for_fact_task(
-        self,
-        *,
-        decision: Any,
-    ) -> None:
-        """Log the exact sealed chapter window before it is submitted.
-
-        This is intentionally emitted only for a fact-task trigger.  The
-        ordinary boundary log remains compact for append decisions, while this
-        payload makes it possible to audit the chapter grouping that supplied
-        one extraction request.
-        """
-        sealed_chapters = self._memory_context_manager.sealed_chapter_snapshot()
-        chapter_payloads: List[Dict[str, Any]] = []
-        for chapter_index, chapter in enumerate(sealed_chapters, 1):
-            units = list(chapter.units)
-            chapter_payloads.append({
-                "chapter_index": chapter_index,
-                "boundary_reason": chapter.boundary_reason,
-                "unit_count": len(units),
-                "token_count": sum(unit.token_count for unit in units),
-                "started_at": (
-                    units[0].start_time
-                    if units
-                    else ""
-                ),
-                "ended_at": (
-                    units[-1].end_time
-                    if units
-                    else ""
-                ),
-                "units": [
-                    {
-                        "unit_index": unit_index,
-                        "started_at": unit.start_time,
-                        "ended_at": unit.end_time,
-                        "token_count": unit.token_count,
-                        "entry_count": len(unit.texts or []),
-                        "text": unit.text,
-                    }
-                    for unit_index, unit in enumerate(units, 1)
-                ],
-            })
-        self._log_info(
-            "memory_runtime",
-            "memory_fact_task_sealed_chapters",
-            {
-                "trigger_reason": str(getattr(decision, "reason", "") or ""),
-                "sealed_chapter_count": len(chapter_payloads),
-                "sealed_token_count": sum(
-                    int(chapter.get("token_count") or 0)
-                    for chapter in chapter_payloads
-                ),
-                "chapters": chapter_payloads,
-            },
-        )
 
     def _flush_pending_memory_input_units(
         self,
@@ -525,8 +471,15 @@ class MemoryRuntime:
                 "queued": queued,
                 "reason": str(drain_report.get("reason") or "queue_rejected"),
             }
-        self._memory_context_manager.seal_pending_units(boundary_reason=reason)
-        store_report = self._trigger_memory_store_task_for_sealed_memory_input()
+        store_report = self._trigger_memory_fact_extraction_task_for_pending_units(
+            self._memory_context_manager.take_pending_units(),
+        )
+        if not store_report.get("queued") and store_report.get("reason") != "no_pending_units":
+            return {
+                "accepted": False,
+                "queued": queued,
+                "reason": str(store_report.get("reason") or "queue_rejected"),
+            }
         user_activity_report = self._trigger_memory_user_activity(
             reason=reason,
             tags=tags,
@@ -564,93 +517,93 @@ class MemoryRuntime:
             "fact_followup_dispatch": fact_followup_dispatch,
         }
 
-    def _trigger_memory_store_task_for_sealed_memory_input(
+    def _trigger_memory_fact_extraction_task_for_pending_units(
         self,
+        units: Sequence[MemoryUnit],
     ) -> Dict[str, Any]:
-        """Submit the currently sealed chapters as one fact task."""
-        sealed_chapters = self._memory_context_manager.sealed_chapter_snapshot()
-        if not sealed_chapters:
-            return {"queued": False, "reason": "no_sealed_chapters"}
-        sealed_units = [
-            unit
-            for chapter in sealed_chapters
-            for unit in chapter.units
-        ]
-        self._logger.info(
-            "memory fact task submitting sealed_chapter_count=%s "
-            "sealed_token_count=%s boundary_reasons=%s",
-            len(sealed_chapters),
-            sum(unit.token_count for unit in sealed_units),
-            [chapter.boundary_reason for chapter in sealed_chapters],
-        )
-        pending_units = list(sealed_units)
-        canonical_units, deduplication_report = (
-            self._deduplicate_memory_input_units(pending_units)
-        )
-        preceding_context_units = (
-            self._memory_context_manager.preceding_context_units_snapshot()
-        )
-        if not canonical_units:
-            return {"queued": False, "reason": "invalid_pending_units"}
-        tags = {
-            str(tag)
-            for unit in canonical_units
-            for tag in unit.tags
-            if tag is not None and str(tag).strip()
-        }
-        self._log_info(
-            "memory_runtime",
-            "memory_input_batch_detail",
-            {
-                "tags": sorted(tags),
-                "original_unit_entry_count": deduplication_report[
-                    "original_unit_entry_count"
-                ],
-                "semantic_unit_count": len(canonical_units),
-                "original_semantic_unit_count": len(pending_units),
-                "preceding_context_unit_count": len(preceding_context_units),
-                "preceding_context_task_unit_count": len(preceding_context_units),
-                "deduplication": deduplication_report,
-                "preceding_context_units": self._memory_units_log_view(
-                    preceding_context_units,
-                ),
-                "units": self._memory_units_log_view(canonical_units),
-            },
-        )
-        store_completion_context = self._memory_store_completion_context(
-            canonical_units,
-        )
-        queue_report = self._task_scheduler.submit(
-            "memory_fact_extraction",
-            {
-                "units": canonical_units,
-                "preceding_context_units": preceding_context_units,
-                "tags": sorted(tags),
-            },
-            completion_context=store_completion_context,
-            report_payload={"tags": sorted(tags)},
-        )
-        queued = bool(queue_report.get("queued"))
-        if queued:
-            self._memory_context_manager.clear_sealed_chapter_buffers()
-            self._user_activity_tags = sorted(set(self._user_activity_tags).union(tags))
-            self._memory_context_manager.record_stored_units(
+        """Submit a detached window, restoring it on rejection or exception."""
+        pending_units = list(units)
+        if not pending_units:
+            return {"queued": False, "reason": "no_pending_units"}
+        queued = False
+        try:
+            self._logger.info(
+                "memory fact task submitting unit_count=%s token_count=%s",
+                len(pending_units),
+                sum(unit.token_count for unit in pending_units),
+            )
+            canonical_units, deduplication_report = (
+                self._deduplicate_memory_input_units(pending_units)
+            )
+            preceding_context_units = (
+                self._memory_context_manager.preceding_context_units_snapshot()
+            )
+            if not canonical_units:
+                return {"queued": False, "reason": "invalid_pending_units"}
+            tags = {
+                str(tag)
+                for unit in canonical_units
+                for tag in unit.tags
+                if tag is not None and str(tag).strip()
+            }
+            self._log_info(
+                "memory_runtime",
+                "memory_input_batch_detail",
+                {
+                    "tags": sorted(tags),
+                    "original_unit_entry_count": deduplication_report[
+                        "original_unit_entry_count"
+                    ],
+                    "unit_count": len(canonical_units),
+                    "original_unit_count": len(pending_units),
+                    "preceding_context_unit_count": len(preceding_context_units),
+                    "batch_token_count": sum(unit.token_count for unit in canonical_units),
+                    "preceding_context_token_count": sum(
+                        unit.token_count for unit in preceding_context_units
+                    ),
+                    "deduplication": deduplication_report,
+                    "preceding_context_units": self._memory_units_log_view(
+                        preceding_context_units,
+                    ),
+                    "units": self._memory_units_log_view(canonical_units),
+                },
+            )
+            store_completion_context = self._memory_store_completion_context(
                 canonical_units,
             )
-            self._memory_context_manager.record_preceding_context_units(
-                sealed_chapters[-1].units,
+            queue_report = self._task_scheduler.submit(
+                "memory_fact_extraction",
+                {
+                    "units": canonical_units,
+                    "preceding_context_units": preceding_context_units,
+                    "tags": sorted(tags),
+                },
+                completion_context=store_completion_context,
+                report_payload={"tags": sorted(tags)},
             )
-            self._logger.info(
-                "memory user activity source queued semantic_unit_count=%s "
-                "preceding_context_unit_count=%s",
-                len(canonical_units),
-                len(preceding_context_units),
-            )
-        return {
-            **queue_report,
-            "queued": queued,
-            "reason": "" if queued else str(queue_report.get("reason") or "queue_rejected"),
-        }
+            queued = bool(queue_report.get("queued"))
+            if queued:
+                self._user_activity_tags = sorted(set(self._user_activity_tags).union(tags))
+                self._memory_context_manager.record_stored_units(
+                    canonical_units,
+                )
+                self._memory_context_manager.record_preceding_context_units(
+                    canonical_units,
+                )
+                self._logger.info(
+                    "memory user activity source queued unit_count=%s "
+                    "preceding_context_unit_count=%s",
+                    len(canonical_units),
+                    len(preceding_context_units),
+                )
+            return {
+                **queue_report,
+                "queued": queued,
+                "reason": "" if queued else str(queue_report.get("reason") or "queue_rejected"),
+            }
+        finally:
+            if not queued:
+                self._memory_context_manager.restore_pending_units(pending_units)
 
     def _log_info(self, scope: str, event: str, payload: Dict[str, Any]) -> None:
         """Emit a structured JSON log record for runtime diagnostics."""
