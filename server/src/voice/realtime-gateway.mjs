@@ -326,6 +326,11 @@ export function attachRealtimeGateway(server, {
     ws.on('pong', () => { ws.isAlive = true })
     const ownerId = identity.ownerId
     const sessionId = url.searchParams.get('sessionId') || 'main'
+    // Capture before asynchronous transcript/model completion. Old turns retain
+    // their token even when reset finishes before their observation arrives.
+    const captureMemoryGeneration = () => Promise.resolve(memoryService?.memoryGeneration?.(ownerId))
+      .catch(() => 'unavailable')
+    let latestMemoryGeneration = captureMemoryGeneration()
     const replayKey = `${ownerId}\u0000${sessionId}`
     let replayBuffer = replayBuffers.get(replayKey)
     if (!replayBuffer) {
@@ -996,6 +1001,10 @@ export function attachRealtimeGateway(server, {
       const timing = memoryTurnTiming.get(key) || {}
       if (field === 'userStartedAt') {
         timing.userStartedAt ??= timestamp
+        if (!timing.memoryGeneration) {
+          latestMemoryGeneration = captureMemoryGeneration()
+          timing.memoryGeneration = latestMemoryGeneration
+        }
       } else if (field === 'assistantStartedAt') {
         timing.assistantStartedAt ??= timestamp
       } else {
@@ -1061,6 +1070,7 @@ export function attachRealtimeGateway(server, {
         messages,
       }, {
         source: 'turn-complete',
+        memoryGeneration: turnTiming.memoryGeneration || latestMemoryGeneration,
         sessionId,
         turnTiming,
       })).catch(error => {
@@ -2228,6 +2238,7 @@ export function attachRealtimeGateway(server, {
       if (memoryService?.ownsSessionObservation?.()) {
         const flushing = Promise.resolve(memoryService.flush(ownerId, {
           source: 'session-close',
+          memoryGeneration: latestMemoryGeneration,
           sessionId,
         })).catch(error => {
           connectionLogger.warn('memory.provider_flush_hook_failed', {

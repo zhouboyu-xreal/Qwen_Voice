@@ -7,6 +7,8 @@ const STORAGE = 'qwen.feishuImportJob'
 const TERMINAL = new Set(['completed', 'partial', 'failed', 'interrupted'])
 const ERRORS = {
   invalid_feishu_document: '无法解析此文件，请选择包含会议日期、时间及说话人时间戳的飞书 Markdown 文字记录，并选择正确的本人姓名。',
+  memory_resetting: '记忆正在清空或等待恢复，请先完成清空。',
+  stale_memory_generation: '记忆版本已更新，请重新尝试导入。',
   feishu_import_busy: '请先结束环境录音，并等待已有导入完成后重试。',
   feishu_import_not_found: '导入任务不存在，请重新选择文件。',
   feishu_import_unsupported: '当前记忆提供方不支持飞书会议导入。',
@@ -28,7 +30,7 @@ function remember(id) {
   try { if (id) sessionStorage.setItem(STORAGE, id); else sessionStorage.removeItem(STORAGE) } catch { /* Optional reload recovery. */ }
 }
 
-export default function FeishuMeetingImport({ onCompleted }) {
+export default function FeishuMeetingImport({ onCompleted, disabled = false }) {
   const dialog = useRef(null)
   const [open, setOpen] = useState(false)
   const [document, setDocument] = useState(null)
@@ -96,7 +98,7 @@ export default function FeishuMeetingImport({ onCompleted }) {
       : job?.status === 'failed' ? t('导入未完成，请查看后台日志。') : t(PHASES[job?.phase] || '等待导入')
 
   return <>
-    <button type="button" onClick={() => setOpen(true)}>{working ? t('查看导入进度') : t('导入飞书会议')}</button>
+    <button type="button" disabled={disabled} onClick={() => setOpen(true)}>{working ? t('查看导入进度') : t('导入飞书会议')}</button>
     <dialog className="memory-import-dialog" ref={dialog} aria-labelledby="memory-import-title"
       onCancel={event => { event.preventDefault(); setOpen(false) }}>
       <div className="memory-import-heading"><h2 id="memory-import-title">{t('导入飞书会议')}</h2>

@@ -235,3 +235,14 @@ node scripts/compare-microphone-aec.mjs --audio /absolute/path/to/playback.wav
 独立工具支持 `--probe-only`：只验证两种模式的音频帧与回退，不播放素材。
 没有采集到 PCM 的测试标记为 `no-pcm`/`inconclusive`，不会当作 AEC 消除了所有声音。
 macOS 可能把从终端或 Codex 启动的进程归到启动器的麦克风权限；以系统实际授权提示为准。
+
+
+### 清空当前用户记忆
+
+“我的记忆 → 清空记忆”需要确认不可恢复的范围。环境录音（含转写收尾）或飞书导入未结束时拒绝开始；普通 PWM 任务自动等待排空。重置为异步任务，依次等待旧 PWM 完成及关闭、删除当前 owner 的 `memory.db` / `user_model.db` / `task_scheduler.db` 及其 SQLite 附属文件、消息去重记录、`meeting-imports` 私有归档，再创建新 PWM。保留原始环境录音、用户原始会议文件、配置和本人声音样本。重建数据库可能包含必要的初始元数据，但不包含旧的个人记忆。
+
+Gateway 在已鉴权及同源检查后提供 `POST /api/pwm/reset`（JSON `confirmation: "clear-memory"`）和 `GET /api/pwm/reset`。只使用鉴权 owner，客户端不能指定数据库路径。状态保存在 state-dir 下 `memory-resets/<owner-key>.json`，独立于被清理的数据；同一用户重复请求运行中的重置返回同一任务。失败或进程中断保持暂停记忆读写，用户重新确认清空后重试，不自动恢复旧任务或显示成功。
+
+`memory_generation` 提供 owner 的持久化版本；清空开始即更新版本并封锁写入。Gateway 在语音轮次开始时捕获版本，观察、收尾、周期信号及导入携带 `memoryGeneration`；环境录音在启动时获取版本，后续转写及最终收尾沿用该版本。旧版本在重置完成后仍被拒绝。首次清空前兼容缺省版本 `0`，清空后不再接受缺失的版本。清空状态和预览可读，记忆查看/召回在重置期间暂停。
+
+任务排空可能等待当前模型调用及后续任务，界面可以关闭并重新查询进度；请求超时不表示后台停止。清空完成后重新开启语音或环境录音。

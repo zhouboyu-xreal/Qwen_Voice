@@ -239,14 +239,19 @@ class AmbientAudioRecordingService:
         self._memory_finalized = False
         self._reset_splitter(self._recording_started_at)
         self._write_manifest()
-        self._agent_memory_ipc.request(
+        generation = self._agent_memory_ipc.request("memory_generation", {"ownerId": self._agent_memory_ipc.owner_id})
+        self._memory_generation = generation.get("generation", "0")
+        registration = self._agent_memory_ipc.request(
             "set_ambient_recording_state",
             {
                 "ownerId": self._agent_memory_ipc.owner_id,
                 "recordingId": recording_id,
                 "active": True,
+                "memoryGeneration": self._memory_generation,
             },
         )
+        if registration.get("ok") is False:
+            raise RuntimeError("Memory is resetting; recording was not started")
         self._logger.info(
             "ambient recording started recording_id=%s split_policy=joint_silence "
             "split_min_seconds=%.3f silence_seconds=%.3f hard_limit=none",
@@ -601,7 +606,13 @@ class AmbientAudioRecordingService:
             # A failed/lost response leaves the exact payload intact for retry;
             # new segments must never be attached to the same batch id.
             try:
-                self._delivery_future.result()
+                delivery = self._delivery_future.result()
+                if delivery.get("ok") is False:
+                    if delivery.get("code") != "stale_memory_generation":
+                        raise RuntimeError("Memory rejected an ambient transcript delivery")
+                    # A reset permanently invalidated this input. Acknowledge
+                    # the discard rather than retrying stale text forever.
+                    self._logger.info("ambient transcript discarded after memory reset recording_id=%s", self._recording_id)
                 self._delivery_index += 1
                 self._published_until = self._delivery_until
                 self._delivery_payload = None
@@ -647,6 +658,7 @@ class AmbientAudioRecordingService:
             "ownerId": self._agent_memory_ipc.owner_id,
             "recordingId": self._recording_id,
             "batchId": batch_id,
+            "memoryGeneration": self._memory_generation,
             "segments": ordered[:count],
             "processedThrough": covered_until.isoformat(),
             "tags": ["qwen-audio-agent", "ambient-recording", self._recording_id],
@@ -665,8 +677,11 @@ class AmbientAudioRecordingService:
             {
                 "ownerId": self._agent_memory_ipc.owner_id,
                 "recordingId": self._recording_id,
+                "memoryGeneration": self._memory_generation,
             },
         )
+        if result.get("ok") is False and result.get("code") != "stale_memory_generation":
+            raise RuntimeError("Memory rejected ambient recording finalization")
         self._memory_finalized = True
         self._logger.info(
             "ambient recording memory finalized recording_id=%s user_activity_queued=%s",

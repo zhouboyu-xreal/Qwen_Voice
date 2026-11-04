@@ -49,6 +49,7 @@ test('provider bridge uses the current owner and sidecar rather than starting a 
   const provider = new AgentMemoryProvider({ sidecar: { start() {}, request: async (...args) => { calls.push(args); return { ok: true } } } })
   const runtime = new FrontendMemoryRuntime({ provider })
   await runtime.feishuMeeting('trusted', 'import', { ...file, ownerId: 'forged' })
+  assert.equal(calls.shift()[0], 'memory_generation')
   assert.equal(calls[0][0], 'import_feishu_meeting')
   assert.equal(calls[0][1].ownerId, createHash('sha256').update('trusted').digest('hex'))
   assert.equal(calls[0][1].content, file.content)

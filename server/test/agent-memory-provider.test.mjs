@@ -66,7 +66,7 @@ test('forwards completed sessions and semantic recall to the sidecar', async () 
   assert.equal(result.context, '用户喜欢喝茶。')
   assert.deepEqual(result.memories, [])
   assert.notEqual(calls[0].params.ownerId, 'owner-a')
-  assert.equal(calls[0].params.promptLanguage, 'zh')
+  assert.equal(calls.find(call => call.method === 'recall').params.promptLanguage, 'zh')
 
   await provider.observe('owner-a', {
     messages: [
@@ -139,9 +139,10 @@ test('forwards periodic signals to the sidecar without querying claim counts', a
   })
   assert.equal(provider.describe().capabilities.periodicTasks, true)
   assert.equal((await provider.triggerPeriodicTask('owner-a', 'user_state_from_claims')).queued, true)
-  assert.equal(calls.length, 1)
+  assert.equal(calls.length, 2)
+  assert.equal(calls.shift()[0], 'memory_generation')
   assert.equal(calls[0][0], 'trigger_periodic_task')
-  assert.deepEqual(Object.keys(calls[0][1]).sort(), ['ownerId', 'taskId'])
+  assert.deepEqual(Object.keys(calls[0][1]).sort(), ['memoryGeneration', 'ownerId', 'taskId'])
   assert.match(calls[0][1].ownerId, /^[a-f0-9]{64}$/u)
   assert.equal(calls[0][1].taskId, 'user_state_from_claims')
   await provider.close()

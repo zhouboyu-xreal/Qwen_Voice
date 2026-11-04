@@ -111,6 +111,15 @@ export class FrontendMemoryRuntime {
     )
   }
 
+  async memoryGeneration(ownerId) {
+    return this.provider.memoryGeneration?.(ownerId)
+  }
+
+  async resetMemory(ownerId, operation) {
+    if (typeof this.provider.resetMemory !== 'function') return { supported: false }
+    return this.provider.resetMemory(ownerId, operation)
+  }
+
   async feishuMeeting(ownerId, operation, input = {}) {
     if (typeof this.provider.feishuMeeting !== 'function') return { supported: false }
     return this.provider.feishuMeeting(ownerId, operation, input)

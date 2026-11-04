@@ -22,7 +22,7 @@ export function registerFeishuImportRoutes(app, { memory }) {
       const result = await memory.feishuMeeting(req.identity.ownerId, operation, input)
       if (result?.supported === false) return res.status(501).json({ code: 'feishu_import_unsupported' })
       if (result?.ok === false) {
-        const statuses = { invalid_feishu_document: 400, feishu_import_busy: 409, feishu_import_not_found: 404 }
+        const statuses = { invalid_feishu_document: 400, feishu_import_busy: 409, feishu_import_not_found: 404, memory_resetting: 409, stale_memory_generation: 409 }
         const code = Object.hasOwn(statuses, result.code) ? result.code : 'feishu_import_unavailable'
         return res.status(statuses[code] || 503).json({ code })
       }

@@ -105,3 +105,9 @@ html[data-view="memory"] body { margin: 0; overflow: auto; }
 .memory-import-summary dt { color: #b0b5c4; }
 .memory-import-summary dd { margin: 0; overflow-wrap: anywhere; }
 .memory-import-result { padding: 16px; margin-top: 18px; border: 1px solid #ffffff20; border-radius: 10px; white-space: normal; overflow-wrap: anywhere; }
+
+.memory-shell[hidden] { display: none; }
+.memory-center button.memory-danger { color: #ffadb1; border-color: #e7616d70; }
+.memory-center button.memory-danger:hover:not(:disabled) { background: #a12d3b35; }
+.memory-reset-confirm { display: flex; align-items: flex-start; gap: 10px; margin: 22px 0; font-size: 14px; line-height: 1.6; }
+.memory-reset-confirm input { flex-shrink: 0; margin-top: 5px; }

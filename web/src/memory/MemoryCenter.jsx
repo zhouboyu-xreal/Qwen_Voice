@@ -8,6 +8,7 @@ import {
   titleFor, typeLabel, validityLabel, isActivity, observationWindow,
 } from './presentation.js'
 import FeishuMeetingImport from './FeishuMeetingImport.jsx'
+import MemoryReset from './MemoryReset.jsx'
 import './memory-center.css'
 
 const PAGE_SIZE = 20
@@ -98,6 +99,7 @@ export function MemoryRecordDetail({ data, evidencePage = 1, historyPage = 1, so
 }
 
 export default function MemoryCenter() {
+  const [resetBlocked, setResetBlocked] = useState(false)
   const [section, setSection] = useState('intents')
   const [type, setType] = useState('')
   const [scope, setScope] = useState('current')
@@ -124,6 +126,11 @@ export default function MemoryCenter() {
   const listKey = `${section}:${type}:${scope}:${status}:${domain}:${role}:${fromDate}:${toDate}:${page}`
   const detailKey = `${section}:${selected}:${evidencePage}:${historyPage}:${sourcePage}`
   const refresh = useCallback(() => setRevision(value => value + 1), [])
+  const resetCompleted = useCallback(() => {
+    setList(null); setDetail(null); setSelected(null); setPage(1)
+    setEvidencePage(1); setHistoryPage(1); setSourcePage(1)
+    refresh()
+  }, [refresh])
 
   useEffect(() => {
     const refreshVisible = () => {
@@ -212,10 +219,11 @@ export default function MemoryCenter() {
   return <main className="memory-center">
     <header className="memory-titlebar">
       <div><h1>{t('我的记忆')}</h1><span>Qwen Audio · PersonalWorldModel</span></div>
-      <div className="memory-refresh"><FeishuMeetingImport onCompleted={refresh} /><small>{data?.fetchedAt ? t('最近读取：{time}', { time: formatTime(data.fetchedAt) }) : t('等待读取')}</small>
+      <div className="memory-refresh"><FeishuMeetingImport onCompleted={refresh} disabled={resetBlocked} /><MemoryReset onCompleted={resetCompleted} onBlocked={setResetBlocked} /><small>{data?.fetchedAt ? t('最近读取：{time}', { time: formatTime(data.fetchedAt) }) : t('等待读取')}</small>
         <button type="button" onClick={refresh} disabled={listLoading || detailLoading}>{t('刷新')}</button></div>
     </header>
-    <div className="memory-shell">
+    {resetBlocked && <p className="memory-empty" role="status">{t('记忆正在清空或等待恢复，请查看清空状态。')}</p>}
+    <div className="memory-shell" hidden={resetBlocked}>
       <nav className="memory-navigation" aria-label={t('记忆类别')}>
         {Object.entries(SECTIONS).map(([key, label]) => <button type="button" key={key}
           aria-pressed={section === key} onClick={() => changeSection(key)}>{t(label)}</button>)}
@@ -256,7 +264,7 @@ export default function MemoryCenter() {
           </div>
         </div>
         {listError && <div className="memory-error" role="alert">{listError}</div>}
-        {data?.available === false && <p className="memory-empty">{t(data.reason === 'not_created'
+        {data?.available === false && <p className="memory-empty">{t(data.reason === 'memory_resetting' ? '记忆正在清空或等待恢复，请查看清空状态。' : data.reason === 'not_created'
           ? '当前用户尚未生成这类记忆，提炼并保存后会显示在这里'
           : '当前数据库结构不支持查看，请更新 Agent Memory')}</p>}
         <div className="memory-columns">

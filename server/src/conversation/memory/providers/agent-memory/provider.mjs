@@ -206,10 +206,22 @@ export class AgentMemoryProvider {
     )
   }
 
+  async memoryGeneration(ownerId) {
+    const result = await this.sidecar.request('memory_generation', { ownerId: ownerKey(ownerId) }, { timeoutMs: 5_000 })
+    return result.generation || '0'
+  }
+
+  async resetMemory(ownerId, operation) {
+    if (!['start', 'status'].includes(operation)) throw new TypeError('Invalid memory reset operation')
+    return this.sidecar.request(operation === 'start' ? 'reset_memory' : 'memory_reset_status',
+      { ownerId: ownerKey(ownerId) }, { timeoutMs: 10_000 })
+  }
+
   async feishuMeeting(ownerId, operation, input = {}) {
     const methods = { preview: 'preview_feishu_meeting', import: 'import_feishu_meeting', status: 'feishu_import_status' }
     if (!Object.hasOwn(methods, operation)) throw new TypeError('Invalid meeting import operation')
-    return this.sidecar.request(methods[operation], { ...input, ownerId: ownerKey(ownerId) }, { timeoutMs: 10_000 })
+    return this.sidecar.request(methods[operation], { ...input, ownerId: ownerKey(ownerId),
+      ...(operation === 'import' ? { memoryGeneration: await this.memoryGeneration(ownerId) } : {}) }, { timeoutMs: 10_000 })
   }
 
   async inspect(ownerId, options = {}) {
@@ -222,6 +234,7 @@ export class AgentMemoryProvider {
   async query(ownerId, query, { limit = 5 } = {}, context = {}) {
     const result = await this.sidecar.request('recall', {
       ownerId: ownerKey(ownerId),
+      memoryGeneration: await this.memoryGeneration(ownerId),
       query: clean(query, 2_000),
       topK: Math.max(1, Math.min(10, Number(limit) || 5)),
       timeEnd: clean(context?.timeEnd, 120),
@@ -234,6 +247,7 @@ export class AgentMemoryProvider {
   }
 
   async observe(ownerId, exchange, context = {}) {
+    const memoryGeneration = await (context.memoryGeneration ?? this.memoryGeneration(ownerId))
     const timing = turnTimingFields(context.turnTiming)
     const messages = Array.isArray(exchange?.messages)
       ? exchange.messages.map(message => ({
@@ -264,6 +278,7 @@ export class AgentMemoryProvider {
       ownerId: owner,
       sessionId,
       messages,
+      memoryGeneration,
     }, { timeoutMs: this.backgroundTimeoutMs }).finally(() => {
       this.pendingObservations.delete(observationKey)
       pendingForSession.delete(operation)
@@ -278,7 +293,7 @@ export class AgentMemoryProvider {
 
   async triggerPeriodicTask(ownerId, taskId) {
     return this.sidecar.request('trigger_periodic_task', {
-      ownerId: ownerKey(ownerId), taskId,
+      ownerId: ownerKey(ownerId), taskId, memoryGeneration: await this.memoryGeneration(ownerId),
     })
   }
 
@@ -287,6 +302,7 @@ export class AgentMemoryProvider {
       ownerId: ownerKey(ownerId),
       sessionId: clean(context.sessionId, 200),
       boundary: 'checkpoint',
+      memoryGeneration: await (context.memoryGeneration ?? this.memoryGeneration(ownerId)),
     }, { timeoutMs: this.backgroundTimeoutMs })
   }
 
@@ -295,12 +311,14 @@ export class AgentMemoryProvider {
     const sessionId = clean(context.sessionId, 200)
     if (!sessionId) return { finalized: false, reason: 'missing_session_id' }
     const sessionKey = `${owner}\u0000${sessionId}`
+    const memoryGeneration = await (context.memoryGeneration ?? this.memoryGeneration(ownerId))
     const pending = [...(this.pendingObservationsBySession.get(sessionKey) || [])]
     if (pending.length) await Promise.allSettled(pending)
     return this.sidecar.request('finalize', {
       ownerId: owner,
       sessionId,
       boundary: 'session_end',
+      memoryGeneration,
     }, { timeoutMs: this.backgroundTimeoutMs })
   }
 
