@@ -16,6 +16,7 @@ import binascii
 import hashlib
 import json
 import logging
+import math
 import re
 import socket
 import sys
@@ -35,6 +36,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from config import load_voice_runtime_config
 from voice.voice_runtime import VoiceRuntime
+from voice.ambient_audio_splitter import JointSilenceSplitter
 
 
 _RECORDING_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
@@ -77,13 +79,14 @@ class _AudioBatch:
     sample_count: int
     sample_rate: int
     source: str
+    cut_reason: str
+    shared_cut_at: Optional[datetime]
 
 
 @dataclass
 class _AudioTrack:
     source: str
     sample_rate: Optional[int] = None
-    chunk_samples: int = 0
     batch_index: int = 0
     batch_started_at: Optional[datetime] = None
     batch_samples: int = 0
@@ -134,7 +137,7 @@ class _AgentMemoryIpcClient:
 
 
 class AmbientAudioRecordingService:
-    """Keep independent source tracks and merge ASR in capture-time order."""
+    """Persist both tracks; seal together at shared quiet capture timestamps."""
 
     def __init__(
         self,
@@ -144,6 +147,9 @@ class AmbientAudioRecordingService:
         chunk_duration_seconds: float,
         agent_memory_ipc: _AgentMemoryIpcClient,
         logger: logging.Logger,
+        split_silence_seconds: float = 0.8,
+        split_quiet_max_rms_dbfs: float = -35.0,
+        detector_factory=None,
     ) -> None:
         # Starting a recording must only open a durable WAV stream.  Loading
         # the offline ASR runtime here can take seconds (or longer on the
@@ -161,6 +167,22 @@ class AmbientAudioRecordingService:
         )
         self._asr_sample_rate = max(1, int(sample_rate_value))
         self._chunk_duration_seconds = float(chunk_duration_seconds)
+        self._split_silence_seconds = float(split_silence_seconds)
+        if not math.isfinite(self._chunk_duration_seconds) or self._chunk_duration_seconds <= 0:
+            raise ValueError("chunk-duration-seconds must be finite and positive")
+        if not math.isfinite(self._split_silence_seconds) or self._split_silence_seconds <= 0:
+            raise ValueError("split-silence-seconds must be finite and positive")
+        self._split_quiet_max_rms_dbfs = float(split_quiet_max_rms_dbfs)
+        if not math.isfinite(self._split_quiet_max_rms_dbfs) or not -120 <= self._split_quiet_max_rms_dbfs <= 0:
+            raise ValueError("split quiet RMS threshold must be between -120 and 0 dBFS")
+        self._detector_factory = detector_factory
+        self._split_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ambient-split-vad")
+        self._split_pending = []
+        self._split_epoch = 0
+        self._splitter = None
+        self._split_detection_from = None
+        self._shared_batch_started_at = None
+        self._split_events = []
         self._tracks: Dict[str, _AudioTrack] = {}
         self._asr_progress: Dict[str, datetime] = {}
         self._buffered_segments: List[Dict[str, Any]] = []
@@ -215,6 +237,7 @@ class AmbientAudioRecordingService:
         self._published_until = self._recording_started_at
         self._stopping = False
         self._memory_finalized = False
+        self._reset_splitter(self._recording_started_at)
         self._write_manifest()
         self._agent_memory_ipc.request(
             "set_ambient_recording_state",
@@ -225,9 +248,11 @@ class AmbientAudioRecordingService:
             },
         )
         self._logger.info(
-            "ambient recording started recording_id=%s chunk_seconds=%.3f",
+            "ambient recording started recording_id=%s split_policy=joint_silence "
+            "split_min_seconds=%.3f silence_seconds=%.3f hard_limit=none",
             recording_id,
             self._chunk_duration_seconds,
+            self._split_silence_seconds,
         )
         return self._result()
 
@@ -253,43 +278,47 @@ class AmbientAudioRecordingService:
         started_at = _parse_timestamp(params["startedAt"]) if params.get("startedAt") else None
         if started_at and started_at < self._recording_started_at - timedelta(seconds=1):
             raise ValueError("audio startedAt precedes the recording")
+        self._harvest_split_analysis()
         if track.sample_rate is not None and track.sample_rate != sample_rate:
-            # Device switches can change rates. Seal the old format instead of
-            # writing differently sampled PCM into the same WAV header.
-            self._seal_current_batch(track)
+            # Format changes are exceptional boundaries, never silence. Keep
+            # the old valid WAV and restart joint detection after the change.
+            self._seal_current_batch(track, reason="sample_rate_change")
             track.sample_rate = None
+            self._reset_splitter(started_at or track.batch_started_at)
         if track.sample_rate is None:
             track.sample_rate = sample_rate
-            track.chunk_samples = max(sample_rate, int(self._chunk_duration_seconds * sample_rate))
             track.batch_started_at = started_at or track.batch_started_at or self._recording_started_at
             self._logger.info("ambient track capture format source=%s sample_rate=%s", source, sample_rate)
-        elif started_at is not None:
-            expected = track.batch_started_at + timedelta(seconds=track.batch_samples / sample_rate)
-            if abs((started_at - expected).total_seconds()) > 0.25:
-                self._seal_current_batch(track)
-                track.batch_started_at = started_at
-                self._logger.info("ambient track discontinuity source=%s started_at=%s", source, started_at)
-        offset = 0
-        while offset < len(payload):
-            self._ensure_writer(track)
-            available_samples = track.chunk_samples - track.batch_samples
-            take_bytes = min(len(payload) - offset, available_samples * 2)
-            if take_bytes <= 0:
-                self._seal_current_batch(track)
-                continue
-            chunk = payload[offset : offset + take_bytes]
-            assert track.writer is not None
-            track.writer.writeframes(chunk)
-            track.batch_samples += len(chunk) // 2
-            offset += len(chunk)
-            if track.batch_samples >= track.chunk_samples:
-                self._seal_current_batch(track)
+        expected = track.batch_started_at + timedelta(seconds=track.batch_samples / sample_rate)
+        if started_at is not None and abs((started_at - expected).total_seconds()) > 0.25:
+            self._seal_current_batch(track, reason="discontinuity")
+            track.batch_started_at = started_at
+            self._reset_splitter(started_at)
+            self._logger.info("ambient track discontinuity source=%s started_at=%s", source, started_at)
+        actual_start = track.batch_started_at + timedelta(seconds=track.batch_samples / sample_rate)
+        self._ensure_writer(track)
+        track.writer.writeframes(payload)
+        track.batch_samples += len(payload) // 2
+        # Audio is already durable before analysis is queued. Analyse only a
+        # short warmup before the gate, then continue until a shared quiet span
+        # exists. There is deliberately no duration-based forced split.
+        ended_at = actual_start + timedelta(seconds=len(payload) / (sample_rate * 2))
+        if ended_at > self._split_detection_from:
+            skip = max(0, math.ceil((self._split_detection_from - actual_start).total_seconds() * sample_rate))
+            analysis_start = actual_start + timedelta(seconds=skip / sample_rate)
+            future = self._split_executor.submit(self._splitter.accept, source, payload[skip * 2:],
+                                                 sample_rate, analysis_start)
+            self._split_pending.append((self._split_epoch, future))
         self._harvest_completed()
         return self._result(include_completed=True)
 
     def stop(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._require_active_recording(params)
         self._stopping = True
+        self._split_epoch += 1
+        for _, future in self._split_pending:
+            future.cancel()
+        self._split_pending.clear()
         for track in self._tracks.values():
             if track.batch_samples > 0:
                 self._seal_current_batch(track)
@@ -325,6 +354,7 @@ class AmbientAudioRecordingService:
             self._harvest_completed()
             if self._pending or self._delivery_future is not None:
                 time.sleep(0.01)
+        self._split_executor.shutdown(wait=True, cancel_futures=True)
         self._executor.shutdown(wait=True, cancel_futures=False)
         if self._recording_id and not self._memory_finalized:
             self._finalize_memory_recording()
@@ -337,65 +367,143 @@ class AmbientAudioRecordingService:
         if not self._recording_id or recording_id != self._recording_id:
             raise ValueError("recordingId does not identify the active recording")
 
+    def _reset_splitter(self, started_at: datetime) -> None:
+        self._split_epoch += 1
+        for _, future in self._split_pending:
+            future.cancel()
+        self._split_pending.clear()
+        self._shared_batch_started_at = started_at
+        self._split_detection_from = started_at + timedelta(seconds=max(0, self._chunk_duration_seconds - 1))
+        self._splitter = JointSilenceSplitter(
+            sources=self._tracks, started_at=started_at,
+            min_duration_seconds=self._chunk_duration_seconds,
+            silence_seconds=self._split_silence_seconds, quiet_max_rms_dbfs=self._split_quiet_max_rms_dbfs,
+            vad_config=self._voice_config.get("vad"), detector_factory=self._detector_factory)
+
+    def _harvest_split_analysis(self) -> None:
+        while self._split_pending and self._split_pending[0][1].done():
+            epoch, future = self._split_pending.pop(0)
+            if epoch != self._split_epoch or future.cancelled():
+                continue
+            try:
+                cuts = future.result()
+            except Exception as exc:
+                self._logger.exception("ambient joint silence detection failed; saved PCM is retained")
+                raise RuntimeError("ambient joint silence detection failed; stop and preserve recorded audio") from exc
+            for cut_at in cuts:
+                self._seal_shared_batch(cut_at)
+
+    def _seal_shared_batch(self, cut_at: datetime) -> None:
+        # Both analyses have covered this point, so both durable streams must
+        # cover it too. Never pair unrelated quiet spans or synthesize silence.
+        for track in self._tracks.values():
+            if track.sample_rate is None or track.batch_started_at is None:
+                raise RuntimeError("shared cut does not have audio from every source")
+            end = track.batch_started_at + timedelta(seconds=track.batch_samples / track.sample_rate)
+            if not track.batch_started_at < cut_at <= end + timedelta(microseconds=1):
+                raise RuntimeError("shared cut falls outside a saved source interval")
+        duration = (cut_at - self._shared_batch_started_at).total_seconds()
+        for track in self._tracks.values():
+            self._seal_current_batch(track, reason="joint_silence", cut_at=cut_at)
+        self._split_events.append({"reason": "joint_silence", "cut_at": cut_at.isoformat(),
+                                   "duration_seconds": duration, "silence_seconds": self._split_silence_seconds})
+        self._shared_batch_started_at = cut_at
+        self._logger.info("ambient shared batch sealed reason=joint_silence cut_at=%s "
+                          "duration_s=%.3f silence_s=%.3f sources=%s", cut_at.isoformat(),
+                          duration, self._split_silence_seconds, ",".join(self._tracks))
+
+    def _partial_path(self, track: _AudioTrack, started_at: datetime, index: int) -> Path:
+        stem = (f"{started_at.astimezone().strftime('%Y%m%d_%H%M%S')}"
+                f"_{track.source}_{index:06d}_{self._recording_short_id()}")
+        return self._recordings_dir / f"{stem}.partial.wav"
+
+    @staticmethod
+    def _open_writer(path: Path, sample_rate: int):
+        writer = wave.open(str(path), "wb")
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        return writer
+
     def _ensure_writer(self, track: _AudioTrack) -> None:
         if track.writer is not None:
             return
-        if (
-            track.batch_started_at is None
-            or track.sample_rate is None
-            or track.chunk_samples <= 0
-        ):
+        if track.batch_started_at is None or track.sample_rate is None:
             raise RuntimeError("ambient recording has not started")
         track.batch_index += 1
-        stem = (
-            f"{track.batch_started_at.astimezone().strftime('%Y%m%d_%H%M%S')}"
-            f"_{track.source}_{track.batch_index:06d}_{self._recording_short_id()}"
-        )
-        track.partial_path = self._recordings_dir / f"{stem}.partial.wav"
-        writer = wave.open(str(track.partial_path), "wb")
-        writer.setnchannels(1)
-        writer.setsampwidth(2)
-        writer.setframerate(track.sample_rate)
-        track.writer = writer
+        track.partial_path = self._partial_path(track, track.batch_started_at, track.batch_index)
+        track.writer = self._open_writer(track.partial_path, track.sample_rate)
         track.batch_samples = 0
 
-    def _seal_current_batch(self, track: _AudioTrack) -> None:
-        if track.writer is None or track.partial_path is None or track.batch_started_at is None:
+    @staticmethod
+    def _copy_frames(reader, writer, count: int) -> None:
+        # A delayed source may arrive after the faster source has written past
+        # the agreed cut. Split that disk-backed tail with bounded memory.
+        while count:
+            frames = reader.readframes(min(count, 65_536))
+            if not frames:
+                raise RuntimeError("saved PCM ended before the shared cut")
+            writer.writeframes(frames)
+            count -= len(frames) // 2
+
+    def _seal_current_batch(self, track: _AudioTrack, *, reason="stop", cut_at=None) -> None:
+        if track.partial_path is None or track.batch_started_at is None or not track.batch_samples:
             return
-        writer = track.writer
+        if track.writer is not None:
+            track.writer.close()
+            track.writer = None
         partial_path = track.partial_path
-        sample_count = track.batch_samples
+        total_samples = track.batch_samples
+        sample_count = total_samples if cut_at is None else round(
+            (cut_at - track.batch_started_at).total_seconds() * track.sample_rate)
+        if not 0 < sample_count <= total_samples:
+            raise ValueError("cut must preserve a non-empty prefix of saved PCM")
         started_at = track.batch_started_at
-        track.writer = None
-        track.partial_path = None
-        track.batch_samples = 0
-        writer.close()
-        final_path = partial_path.with_name(partial_path.name.replace(".partial.wav", ".wav"))
-        self._audio_file_names.append(final_path.name)
-        partial_path.replace(final_path)
-        assert track.sample_rate is not None
         ended_at = started_at + timedelta(seconds=sample_count / track.sample_rate)
-        batch = _AudioBatch(
-            index=track.batch_index,
-            path=final_path,
-            started_at=started_at,
-            ended_at=ended_at,
-            sample_count=sample_count,
-            sample_rate=track.sample_rate,
-            source=track.source,
-        )
+        final_path = partial_path.with_name(partial_path.name.replace(".partial.wav", ".wav"))
+        tail_samples = total_samples - sample_count
+        tail_writer = None
+        tail_path = None
+        if tail_samples:
+            prefix_path = partial_path.with_suffix(".sealing")
+            tail_path = self._partial_path(track, ended_at, track.batch_index + 1)
+            try:
+                with wave.open(str(partial_path), "rb") as reader:
+                    with self._open_writer(prefix_path, track.sample_rate) as prefix_writer:
+                        self._copy_frames(reader, prefix_writer, sample_count)
+                    tail_writer = self._open_writer(tail_path, track.sample_rate)
+                    self._copy_frames(reader, tail_writer, tail_samples)
+                prefix_path.replace(final_path)
+            except Exception:
+                if tail_writer is not None:
+                    tail_writer.close()
+                prefix_path.unlink(missing_ok=True)
+                if tail_path is not None:
+                    tail_path.unlink(missing_ok=True)
+                # The full original WAV remains available for stop/error
+                # finalization if a split could not be completed.
+                raise
+            partial_path.unlink()
+        else:
+            partial_path.replace(final_path)
+        batch = _AudioBatch(index=track.batch_index, path=final_path, started_at=started_at,
+                            ended_at=ended_at, sample_count=sample_count, sample_rate=track.sample_rate,
+                            source=track.source, cut_reason=reason, shared_cut_at=cut_at)
+        self._audio_file_names.append(final_path.name)
         track.batch_started_at = ended_at
+        track.batch_samples = tail_samples
+        track.writer = tail_writer
+        track.partial_path = tail_path
+        if tail_samples:
+            track.batch_index += 1
         future = self._executor.submit(self._transcribe_batch, batch)
         self._pending.append(future)
         self._pending_batches[future] = batch
         self._write_manifest()
-        self._logger.info(
-            "ambient audio batch sealed recording_id=%s batch=%s duration_s=%.3f path=%s",
-            self._recording_id,
-            batch.index,
-            sample_count / track.sample_rate,
-            final_path.name,
-        )
+        self._logger.info("ambient audio batch sealed recording_id=%s source=%s batch=%s "
+                          "reason=%s duration_s=%.3f shared_cut_at=%s path=%s", self._recording_id,
+                          track.source, batch.index, reason, sample_count / track.sample_rate,
+                          cut_at.isoformat() if cut_at else "", final_path.name)
 
     def _discard_empty_partial(self, track: _AudioTrack) -> None:
         if track.writer is not None:
@@ -426,6 +534,8 @@ class AmbientAudioRecordingService:
                 "ambient_asr_watermark_managed": True,
                 "audio_file": relative_path,
                 "audio_batch_index": batch.index,
+                "audio_cut_reason": batch.cut_reason,
+                "audio_shared_cut_at": batch.shared_cut_at.isoformat() if batch.shared_cut_at else None,
                 "audio_sha256": checksum,
             })
             item["metadata"] = metadata
@@ -443,6 +553,8 @@ class AmbientAudioRecordingService:
             "speechSegmentCount": report.get("speech_segment_count", 0),
             "transcriptSegmentCount": len(segments),
             "source": batch.source,
+            "cutReason": batch.cut_reason,
+            "sharedCutAt": batch.shared_cut_at.isoformat() if batch.shared_cut_at else None,
             "segments": segments,
         }
 
@@ -457,6 +569,8 @@ class AmbientAudioRecordingService:
         return self._voice_runtime
 
     def _harvest_completed(self) -> None:
+        if not self._stopping:
+            self._harvest_split_analysis()
         remaining: List[Future[Dict[str, Any]]] = []
         for future in self._pending:
             if not future.done():
@@ -569,6 +683,8 @@ class AmbientAudioRecordingService:
             "recording": bool(self._recording_id and not self._stopping),
             "stopping": bool(self._recording_id and self._stopping),
             "sources": list(self._tracks),
+            "splitPolicy": "joint_silence",
+            "pendingSplitAnalysis": len(self._split_pending),
             "tracks": {source: {
                 "sampleRate": track.sample_rate or 0,
                 "openBatchSeconds": round(track.batch_samples / track.sample_rate, 3) if track.sample_rate else 0.0,
@@ -591,6 +707,10 @@ class AmbientAudioRecordingService:
             } for source, track in self._tracks.items()},
             "asr_sample_rate": self._asr_sample_rate,
             "chunk_duration_seconds": self._chunk_duration_seconds,
+            "split_policy": "joint_silence",
+            "split_silence_seconds": self._split_silence_seconds,
+            "split_quiet_max_rms_dbfs": self._split_quiet_max_rms_dbfs,
+            "shared_split_events": list(self._split_events),
             "stopping": self._stopping,
             "pending_batches": len(self._pending) + int(self._delivery_payload is not None),
             "failed_batches": self._failed_batches,
@@ -621,7 +741,8 @@ def main() -> int:
     )
     parser.add_argument("--config", default=REPO_ROOT / "config.yaml", type=Path)
     parser.add_argument("--recordings-dir", required=True, type=Path)
-    parser.add_argument("--chunk-duration-seconds", type=float, default=600.0)
+    parser.add_argument("--chunk-duration-seconds", type=float, default=600.0,
+                        help="Minimum batch duration before seeking joint silence; no hard limit.")
     parser.add_argument("--agent-memory-ipc-socket", required=True, type=Path)
     parser.add_argument("--agent-memory-owner-id", required=True)
     parser.add_argument("--log-path", type=Path)
@@ -659,6 +780,8 @@ def main() -> int:
         voice_config=voice_config,
         recordings_dir=args.recordings_dir,
         chunk_duration_seconds=args.chunk_duration_seconds,
+        split_silence_seconds=float((voice_config.get("ambient_recording") or {}).get("split_silence_seconds", 0.8)),
+        split_quiet_max_rms_dbfs=float((voice_config.get("ambient_recording") or {}).get("split_quiet_max_rms_dbfs", -35.0)),
         agent_memory_ipc=_AgentMemoryIpcClient(
             args.agent_memory_ipc_socket,
             args.agent_memory_owner_id,
