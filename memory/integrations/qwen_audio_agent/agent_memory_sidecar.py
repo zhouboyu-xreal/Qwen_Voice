@@ -35,6 +35,8 @@ if str(SRC_ROOT) not in sys.path:
 from config import split_memory_config
 from memory.memory_inspector import MemoryInspector
 from pwm_manager import PersonWorldModel
+from memory.feishu_import import FeishuMeetingImports
+from task_scheduler import TaskOperationReporter
 
 
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -148,6 +150,14 @@ class AgentMemoryRuntime:
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
         self._operation_lock = threading.RLock()
+        self._meeting_imports = FeishuMeetingImports(
+            owner_directory=lambda owner: self._owner_dir / _owner_key(owner),
+            get_pwm=lambda owner: self._owner_runtime(owner).pwm,
+            operation_lock=self._operation_lock,
+            ambient_active=lambda owner: bool(self._owners.get(_owner_key(owner)) and
+                                              self._owners[_owner_key(owner)].active_ambient_recording_ids),
+            logger=self._logger)
+
 
     def dispatch(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """Serialize stdio and local-IPC mutations through the memory service."""
@@ -162,7 +172,21 @@ class AgentMemoryRuntime:
                 owner_dir / "memory.db", owner_dir / "user_model.db",
                 owner_name=str(self._manager_config.get("world_owner_entity_name") or "用户本人"),
             ).inspect(params)
+        if method == "preview_feishu_meeting":
+            return self._meeting_imports.preview(params)
+        if method == "feishu_import_status":
+            return self._meeting_imports.status(_clean(params.get("ownerId"), 240), params.get("id"))
+        if method == "close":
+            return self.close(params)
+        if self._meeting_imports.closed and method != "health":
+            raise RuntimeError("Memory service is closing")
+        if self._meeting_imports.busy(_clean(params.get("ownerId"), 240)) and method in {
+            "observe", "observe_transcript_segments", "set_ambient_recording_state", "finalize",
+            "finalize_transcript_recording", "trigger_periodic_task",
+        }:
+            raise RuntimeError("Meeting import is running; retry after it completes")
         handlers = {
+            "import_feishu_meeting": lambda value: self._meeting_imports.start(_clean(value.get("ownerId"), 240), value),
             "trigger_periodic_task": self.trigger_periodic_task,
             "observe": self.observe,
             "set_ambient_recording_state": self.set_ambient_recording_state,
@@ -177,6 +201,10 @@ class AgentMemoryRuntime:
         if handler is None:
             raise ValueError(f"unsupported method: {method}")
         with self._operation_lock:
+            if self._meeting_imports.busy(_clean(params.get("ownerId"), 240)) and method not in {
+                "import_feishu_meeting", "health", "recall",
+            }:
+                raise RuntimeError("Meeting import is running; retry after it completes")
             return handler(params)
 
     def _owner_runtime(self, owner_id: str) -> OwnerRuntime:
@@ -212,6 +240,7 @@ class AgentMemoryRuntime:
             llm_model_config=self._llm_config,
             embedding_model_config=self._embedding_config,
             task_scheduling_config=self._task_scheduling_config,
+            operation_reporter=TaskOperationReporter(recent_task_limit=10000),
             logger=self._logger.getChild(f"owner.{key[:12]}"),
         )
         created = OwnerRuntime(
@@ -573,6 +602,11 @@ class AgentMemoryRuntime:
         return {"ok": True, "activeOwners": len(self._owners)}
 
     def close(self, _params: Dict[str, Any]) -> Dict[str, Any]:
+        self._meeting_imports.close()
+        with self._operation_lock:
+            return self._close_owners()
+
+    def _close_owners(self) -> Dict[str, Any]:
         failures = 0
         for holder in list(self._owners.values()):
             try:

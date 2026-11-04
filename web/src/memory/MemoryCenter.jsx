@@ -7,6 +7,7 @@ import {
   formatTime, inspectionError, operationLabel, recordFields, statusLabel,
   titleFor, typeLabel, validityLabel, isActivity, observationWindow,
 } from './presentation.js'
+import FeishuMeetingImport from './FeishuMeetingImport.jsx'
 import './memory-center.css'
 
 const PAGE_SIZE = 20
@@ -210,8 +211,8 @@ export default function MemoryCenter() {
 
   return <main className="memory-center">
     <header className="memory-titlebar">
-      <div><h1>{t('我的记忆')}</h1><span>{t('Qwen Audio · 只读')}</span></div>
-      <div className="memory-refresh"><small>{data?.fetchedAt ? t('最近读取：{time}', { time: formatTime(data.fetchedAt) }) : t('等待读取')}</small>
+      <div><h1>{t('我的记忆')}</h1><span>Qwen Audio · PersonalWorldModel</span></div>
+      <div className="memory-refresh"><FeishuMeetingImport onCompleted={refresh} /><small>{data?.fetchedAt ? t('最近读取：{time}', { time: formatTime(data.fetchedAt) }) : t('等待读取')}</small>
         <button type="button" onClick={refresh} disabled={listLoading || detailLoading}>{t('刷新')}</button></div>
     </header>
     <div className="memory-shell">

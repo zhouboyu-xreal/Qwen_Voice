@@ -206,6 +206,12 @@ export class AgentMemoryProvider {
     )
   }
 
+  async feishuMeeting(ownerId, operation, input = {}) {
+    const methods = { preview: 'preview_feishu_meeting', import: 'import_feishu_meeting', status: 'feishu_import_status' }
+    if (!Object.hasOwn(methods, operation)) throw new TypeError('Invalid meeting import operation')
+    return this.sidecar.request(methods[operation], { ...input, ownerId: ownerKey(ownerId) }, { timeoutMs: 10_000 })
+  }
+
   async inspect(ownerId, options = {}) {
     return this.sidecar.request('inspect', {
       ...options,

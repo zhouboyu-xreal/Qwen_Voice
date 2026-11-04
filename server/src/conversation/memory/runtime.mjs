@@ -111,6 +111,11 @@ export class FrontendMemoryRuntime {
     )
   }
 
+  async feishuMeeting(ownerId, operation, input = {}) {
+    if (typeof this.provider.feishuMeeting !== 'function') return { supported: false }
+    return this.provider.feishuMeeting(ownerId, operation, input)
+  }
+
   async inspect(ownerId, options = {}) {
     if (!this.capabilities().structuredInspection) return { supported: false }
     const result = await this.provider.inspect(ownerId, options)

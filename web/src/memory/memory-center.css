@@ -92,3 +92,16 @@ html[data-view="memory"] body { margin: 0; overflow: auto; }
   .memory-titlebar { padding: 15px; }
   .memory-navigation p { width: 100%; margin: 0; }
 }
+
+.memory-refresh { flex-wrap: wrap; }
+.memory-import-dialog { width: min(620px, calc(100vw - 32px)); max-height: 85dvh; overflow: auto; padding: 24px; border: 1px solid #ffffff30; border-radius: 16px; background: #171a25; color: #edf0f7; font: inherit; }
+.memory-import-dialog::backdrop { background: #0009; }
+.memory-import-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+.memory-import-heading h2 { margin: 0; font-size: 20px; }
+.memory-import-dialog p { line-height: 1.6; color: #b0b5c4; font-size: 14px; white-space: normal; }
+.memory-import-file, .memory-import-owner { display: grid; gap: 10px; margin: 20px 0; font-size: 14px; }
+.memory-import-file input { width: 100%; }
+.memory-import-summary { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: 12px; font-size: 14px; }
+.memory-import-summary dt { color: #b0b5c4; }
+.memory-import-summary dd { margin: 0; overflow-wrap: anywhere; }
+.memory-import-result { padding: 16px; margin-top: 18px; border: 1px solid #ffffff20; border-radius: 10px; white-space: normal; overflow-wrap: anywhere; }
