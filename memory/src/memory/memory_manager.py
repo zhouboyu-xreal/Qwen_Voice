@@ -1030,14 +1030,12 @@ class MemoryNodeManager:
             {
                 "id": item.get("id"),
                 "summary": _compact_whitespace(item.get("summary") or item.get("text") or ""),
-                "fact_type": item.get("fact_type") or "",
-                "fact_topic": item.get("fact_topic") or "",
                 "dialogue_time_key": item.get("dialogue_time_key") or "",
                 "event_time_key": item.get("event_time_key") or "",
             }
             for item in fact_list
         ]
-        source_text = self._build_memory_units_for_prompt(
+        source_text = self._build_user_activity_units_for_prompt(
             unit_list,
             prompt_language=prompt_language,
         )
@@ -1049,7 +1047,9 @@ class MemoryNodeManager:
         prompt = (
             prompt_template
             .replace("{source_units}", source_text)
-            .replace("{evidence_facts}", json.dumps(fact_payload, ensure_ascii=False))
+            .replace("{evidence_facts}", json.dumps(
+                fact_payload, ensure_ascii=False, separators=(",", ":"),
+            ))
         )
         allowed_fact_ids = {
             int(item["id"]) for item in fact_list
@@ -1971,6 +1971,59 @@ class MemoryNodeManager:
             })
             for unit in units
         ]
+
+    @staticmethod
+    def _build_user_activity_units_for_prompt(
+        units: Sequence[MemoryUnit],
+        *,
+        prompt_language: str,
+    ) -> str:
+        """Compact activity evidence without losing source types or entry boundaries."""
+        unit_entries = [(unit, unit.entries()) for unit in units]
+        if not unit_entries:
+            return ""
+        is_en = prompt_language == "en"
+
+        raw_times = [
+            entry[field] for _, entries in unit_entries for entry in entries
+            for field in ("started_at", "ended_at")
+        ]
+        parsed_times: List[datetime] = []
+        for value in raw_times:
+            try:
+                parsed_times.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+            except ValueError:
+                break
+        shared_clock = bool(parsed_times) and len(parsed_times) == len(raw_times) and all(
+            value.date() == parsed_times[0].date()
+            and value.utcoffset() == parsed_times[0].utcoffset()
+            for value in parsed_times
+        )
+        lines: List[str] = []
+        if shared_clock:
+            first = parsed_times[0]
+            offset = first.timetz().isoformat()[len(first.time().isoformat()):]
+            zone = offset or ("unspecified" if is_en else "未指定")
+            lines.append(
+                f"Window date: {first.date().isoformat()}; timezone: {zone}"
+                if is_en else f"窗口日期：{first.date().isoformat()}；时区：{zone}"
+            )
+        def display_time(value: str) -> str:
+            if shared_clock:
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).time().isoformat()
+            return value or "?"
+
+        for index, (unit, entries) in enumerate(unit_entries, 1):
+            entry_texts = []
+            for entry in entries:
+                speaker = entry["speaker"] or "unknown_speaker"
+                text = entry["text"].replace("\r", "\\r").replace("\n", "\\n")
+                entry_texts.append(
+                    f"[{display_time(entry['started_at'])}—{display_time(entry['ended_at'])}] "
+                    f"{speaker}: {text}"
+                )
+            lines.append(f"[U{index} {unit.unit_type}] " + " | ".join(entry_texts))
+        return "\n".join(lines)
 
     def _build_memory_units_for_prompt(
         self,

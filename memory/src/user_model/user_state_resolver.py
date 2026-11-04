@@ -374,7 +374,9 @@ class UserStateResolver:
                     else USER_THREAD_STATE_UPDATE_PROMPT_ZH)
         prompt = template
         for key, value in update_input.items():
-            prompt = prompt.replace("{" + key + "}", json.dumps(value, ensure_ascii=False, indent=2))
+            prompt = prompt.replace("{" + key + "}", json.dumps(
+                value, ensure_ascii=False, separators=(",", ":"),
+            ))
         self._logger.info("\n%s", json.dumps({
             "scope": task_kind, "event": "input", "payload": update_input,
         }, ensure_ascii=False, indent=2, default=str))
