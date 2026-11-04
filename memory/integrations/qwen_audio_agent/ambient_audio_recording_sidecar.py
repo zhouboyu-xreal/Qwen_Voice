@@ -203,7 +203,7 @@ class AmbientAudioRecordingService:
             raise ValueError("sources must be a non-empty unique list of microphone/system")
         self._recording_started_at = _parse_timestamp(params.get("startedAt"))
         self._recording_id = recording_id
-        recording_stamp = self._recording_started_at.strftime("%Y%m%d_%H%M%S")
+        recording_stamp = self._recording_started_at.astimezone().strftime("%Y%m%d_%H%M%S")
         self._manifest_path = self._recordings_dir / (
             f"{recording_stamp}_{self._recording_short_id()}.json"
         )
@@ -348,7 +348,7 @@ class AmbientAudioRecordingService:
             raise RuntimeError("ambient recording has not started")
         track.batch_index += 1
         stem = (
-            f"{track.batch_started_at.strftime('%Y%m%d_%H%M%S')}"
+            f"{track.batch_started_at.astimezone().strftime('%Y%m%d_%H%M%S')}"
             f"_{track.source}_{track.batch_index:06d}_{self._recording_short_id()}"
         )
         track.partial_path = self._recordings_dir / f"{stem}.partial.wav"

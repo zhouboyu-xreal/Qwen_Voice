@@ -11,12 +11,27 @@
 ```dotenv
 QWEN_AUDIO_MEMORY_PROVIDER=agent-memory
 AGENT_MEMORY_PYTHON=/absolute/path/to/python
-AGENT_MEMORY_SIDECAR=/absolute/path/to/agent_memory/integrations/qwen_audio_agent/agent_memory_sidecar.py
-AGENT_MEMORY_CONFIG=/absolute/path/to/agent_memory/config.yaml
-AGENT_MEMORY_STATE_DIR=/absolute/path/to/persistent/agent-memory-state
+AGENT_MEMORY_SIDECAR=auto
+AGENT_MEMORY_CONFIG=auto
+AGENT_MEMORY_STATE_DIR=auto
 ```
 
+路径留空或设为 `auto` 时，开发版使用当前工程 `memory/`，安装版使用应用资源
+`Contents/Resources/runtime/memory/`；Python 代码与默认 YAML 随安装包发布，
+不依赖打包机器或源码目录。状态目录默认是 `QWAUDIO_DATA_DIR/memory/agent-memory`
+（未覆盖时为 `~/.config/qwaudio/data/memory/agent-memory`），录音也保存在此目录下。
+
+启动时会将当前工程的默认代码路径，以及指向已删除工程的旧标准路径，自动改为
+`auto`；修改配置前保留 `config.env.before-agent-memory-auto` 备份。
+有效的外部代码路径、自定义 YAML 和已有状态目录保留，缺失的自定义文件仍会报错。
+旧工程连同 `tmp/qwen_audio_agent_online` 已被删除时，改用持久数据目录，无法恢复
+已删除的记忆或录音。已有状态目录不会自动搬迁；如要迁移数据库，应先退出应用。
+Shell 中显式传入的路径只对当前进程解析，不会写回覆盖 `config.env`。
+`AGENT_MEMORY_PREWAKE_CONTEXT_SIDECAR` 和 `AGENT_MEMORY_AMBIENT_RECORDING_SIDECAR`
+默认跟随主 sidecar，显式设为 `auto` 也遵循同一规则。
+
 `AGENT_MEMORY_PYTHON` 必须是安装了本工程 `requirements.txt` 依赖的解释器。
+解释器路径保留用户配置，不随工程路径自动替换。
 Sidecar 会按 Qwen Gateway 的 `ownerId` 进行 SHA-256 分区；每个用户拥有独立的
 `memory.db`、去重索引和 `MemoryRuntime` worker。
 
@@ -134,3 +149,38 @@ Embedding 的模型、请求地址、维度或归一化策略改变后，仅失�
   录音停止后提交剩余转写并统一 finalize；失败批次保留 WAV，界面提示转写未完成。
 - 本阶段没有增加额外回声消除、混音或跨音轨文本去重。外放可能在两个来源中产生重复内容，
   两路相同文本均保留；不依据录音来源直接认定说话人身份。麦克风原有浏览器音频处理保持沿用。
+
+### 麦克风 AEC 诊断与外放对照
+
+桌面应用固定优先使用系统级 all，通过 `{ exact: "all" }` 请求麦克风回声消除，且只有
+`track.getSettings().echoCancellation === "all"` 才确认生效。设置页不再提供模式选择，
+旧的 `QWEN_AUDIO_MICROPHONE_ECHO_CANCELLATION` 配置及页面模式参数不再生效。
+普通网页仍沿用 `echoCancellation: true`；独立对照工具继续支持 default/all 两种模式。
+不支持 all、实际返回未确认，或严格模式启动后 3 秒内没有音频帧时，释放尝试的音轨并
+回退默认模式。静音帧也算有效帧，不会因为环境安静而回退；权限与设备错误仍正常报错。
+
+`desktop.log` 的 `desktop.microphone.capture` 记录实际设备名称、请求/应用模式、
+all 能力状态、回退原因、采样率、声道数、NS/AGC 及能力范围。不会记录音频、正文、
+原始 deviceId/groupId。每次环境录音还会保存 `<recordingId>.microphone.json`，
+与原有录音清单的 `recording_id` 对应；设备切换后的诊断也会追加，最多保留 20 条。
+`advertised` 只表示能力列表包含 all，`confirmed` 表示实际设置返回 all；
+`rejected`/`unconfirmed`/`no-pcm` 不能当作 all 测试成功。
+`allPcmFlow` 记录 all 的音频帧验证结果，`allNegotiatedEchoCancellation` 保留尝试时的实际设置。
+
+macOS 可在工程根目录运行独立对照工具：
+
+```bash
+node scripts/compare-microphone-aec.mjs --audio /absolute/path/to/playback.wav
+```
+
+工具请求真实麦克风权限，使用外部 `afplay` 重放同一素材，分别采集 default/all。
+保持外放音量、输出设备、麦克风位置不变，并在纯回声测试期间保持安静。
+两次采集固定同一输入设备、NS/AGC 参数；all 不可确认时跳过第二次播放并明确标记。
+工具不连接 Gateway、ASR 或 PWM，不会把测试内容写入实际记忆。
+默认输出到 `tmp/microphone-aec-comparison/<timestamp>/`，可用 `--output` 指定目录。
+报告包括实际模式、能力、运行时版本、素材 SHA-256 和 WAV；支持 all 只代表模式
+协商成功，是否消除了外放仍应听取录音并做同条件比较，不能仅靠该标记判断。
+
+独立工具支持 `--probe-only`：只验证两种模式的音频帧与回退，不播放素材。
+没有采集到 PCM 的测试标记为 `no-pcm`/`inconclusive`，不会当作 AEC 消除了所有声音。
+macOS 可能把从终端或 Codex 启动的进程归到启动器的麦克风权限；以系统实际授权提示为准。
