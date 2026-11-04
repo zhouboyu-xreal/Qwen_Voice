@@ -198,6 +198,8 @@ class AgentMemoryRuntime:
             "observe", "observe_transcript_segments", "set_ambient_recording_state", "finalize",
             "finalize_transcript_recording", "trigger_periodic_task",
         }:
+            if method == "trigger_periodic_task":
+                return self._skip_periodic_task(params, reason="meeting_import_running")
             raise RuntimeError("Meeting import is running; retry after it completes")
         handlers = {
             "reset_memory": lambda value: self._resets.start(_clean(value.get("ownerId"), 240)),
@@ -225,6 +227,8 @@ class AgentMemoryRuntime:
             if self._meeting_imports.busy(_clean(params.get("ownerId"), 240)) and method not in {
                 "reset_memory", "import_feishu_meeting", "health", "recall",
             }:
+                if method == "trigger_periodic_task":
+                    return self._skip_periodic_task(params, reason="meeting_import_running")
                 raise RuntimeError("Meeting import is running; retry after it completes")
             return handler(params)
 
@@ -602,6 +606,18 @@ class AgentMemoryRuntime:
             len(str(result.get("memory_context") or "")),
         )
         return result
+
+    def _skip_periodic_task(self, params: Dict[str, Any], *, reason: str) -> Dict[str, Any]:
+        task_id = _clean(params.get("taskId"), 80)
+        owner_id = _clean(params.get("ownerId"), 240)
+        if task_id != "user_state_from_claims":
+            raise ValueError(f"unsupported periodic task: {task_id}")
+        if not owner_id:
+            raise ValueError("ownerId must be non-empty")
+        self._logger.info("periodic task signal owner=%s task=%s queued=False reason=%s",
+                          _owner_key(owner_id)[:12], task_id, reason)
+        return {"supported": True, "taskId": task_id, "queued": False,
+                "status": "skipped", "reason": reason}
 
     def trigger_periodic_task(self, params: Dict[str, Any]) -> Dict[str, Any]:
         task_id = _clean(params.get("taskId"), 80)

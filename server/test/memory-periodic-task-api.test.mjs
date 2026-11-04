@@ -29,6 +29,11 @@ test('periodic route uses authenticated identity, whitelists tasks, and sanitize
   assert.deepEqual(calls[0], ['authenticated-owner', 'user_state_from_claims'])
   result = { supported: true, queued: false, reason: 'claim_state_task_pending' }
   assert.equal((await request({ taskId: 'user_state_from_claims' })).status, 200)
+  result = { supported: true, taskId: 'user_state_from_claims', queued: false,
+    status: 'skipped', reason: 'meeting_import_running' }
+  const skipped = await request({ taskId: 'user_state_from_claims' })
+  assert.equal(skipped.status, 200)
+  assert.deepEqual(await skipped.json(), result)
   result = { supported: false }
   assert.equal((await request({ taskId: 'user_state_from_claims' })).status, 501)
   failure = true

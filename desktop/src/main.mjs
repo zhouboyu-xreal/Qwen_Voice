@@ -2099,7 +2099,7 @@ if (!app.requestSingleInstanceLock()) {
         tasks: desktopPwmPeriodicTasks(configuredGatewayEnvironment()),
         onTrigger: ({ taskId, signal }) => sendPwmPeriodicSignal({
           origin: appOrigin, accessToken: gatewayAccessToken, taskId, signal,
-        }).then(result => logger.info('desktop.periodic_task.signal_sent', { taskId, queued: result.queued })),
+        }).then(result => logger.info('desktop.periodic_task.signal_sent', { taskId, queued: result.queued, reason: result.reason || '' })),
         onError: (error, taskId) => logger.warn('desktop.periodic_task.signal_failed', { taskId, error }),
       })
       desktopPeriodicTasks.start()

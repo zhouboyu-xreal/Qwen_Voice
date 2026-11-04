@@ -246,3 +246,5 @@ Gateway 在已鉴权及同源检查后提供 `POST /api/pwm/reset`（JSON `confi
 `memory_generation` 提供 owner 的持久化版本；清空开始即更新版本并封锁写入。Gateway 在语音轮次开始时捕获版本，观察、收尾、周期信号及导入携带 `memoryGeneration`；环境录音在启动时获取版本，后续转写及最终收尾沿用该版本。旧版本在重置完成后仍被拒绝。首次清空前兼容缺省版本 `0`，清空后不再接受缺失的版本。清空状态和预览可读，记忆查看/召回在重置期间暂停。
 
 任务排空可能等待当前模型调用及后续任务，界面可以关闭并重新查询进度；请求超时不表示后台停止。清空完成后重新开启语音或环境录音。
+
+周期 `user_state_from_claims` 信号在同一用户飞书会议导入期间返回 `queued: false, status: "skipped", reason: "meeting_import_running"`，以 INFO 记录正常跳过。桌面仅继续按时间周期发信号，不检查 claim 或补发错过的周期。导入流程在结束前显式执行 claim 状态更新；下一次周期信号恢复常规资格判断。
