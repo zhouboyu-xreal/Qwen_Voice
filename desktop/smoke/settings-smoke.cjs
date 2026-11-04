@@ -64,6 +64,7 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
     })`)
     assert.equal(await evaluate(`document.querySelector('#gateway-pairing-code') === null`), true)
     assert.equal(await evaluate(`document.querySelector('#ambient-recording-source').value`), 'microphone-system')
+    assert.equal(await evaluate(`document.querySelector('#microphone-echo-cancellation') === null`), true)
     await evaluate(`(() => {
       const field = document.querySelector('#ambient-recording-source')
       field.value = 'microphone'
@@ -71,13 +72,13 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
     })()`)
 
     assert.deepEqual(await evaluate(`Array.from(document.querySelectorAll('[data-settings-tab]'), tab => tab.dataset.settingsTab)`), ['voice', 'pwm', 'backend', 'app'])
-    assert.equal(await evaluate(`(() => {
+    assert.deepEqual(await evaluate(`(() => {
       document.querySelector('#pwm-tab').click()
       const key = document.querySelector('#pwm-llm-key')
-      return document.querySelector('.pwm-section-heading > span').textContent === 'PersonalWorldModel'
-        && document.querySelector('.pwm-card-heading h3').textContent === '语言模型'
-        && key.value === '' && key.placeholder === '已配置；留空保留'
-    })()`), true)
+      return { badge: document.querySelector('.pwm-section-heading > span').textContent,
+        title: document.querySelector('.pwm-card-heading h3').textContent,
+        value: key.value, placeholder: key.placeholder }
+    })()`), { badge: 'PersonalWorldModel', title: '语言模型', value: '', placeholder: '已配置；留空保留' })
     await evaluate(`new Promise((resolve, reject) => {
       const model = document.querySelector('[data-pwm-field="pwmLlmModel"]')
       model.value = 'fixture-chat'
@@ -103,6 +104,7 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
       poll()
     })`)
     assert.equal(settings.ambientRecordingSource, 'microphone')
+    assert.equal(Object.hasOwn(settings, 'microphoneEchoCancellation'), false)
     assert.equal(await evaluate(`(() => {
       document.querySelector('#app-tab').click()
       const select = document.querySelector('#ambient-recording-source')
@@ -149,7 +151,7 @@ module.exports = async function settingsSmoke({ BrowserWindow, ipcMain }) {
         && !document.querySelector('button[type=submit]').disabled
     })()`), true, 'Switching to a local address restores local configuration controls')
   } catch (error) {
-    throw new Error(`${error.message}\n${rendererMessages.join('\n')}`, { cause: error })
+    throw new Error(`${error.stack || error.message}\n${rendererMessages.join('\n')}`, { cause: error })
   } finally {
     window.destroy()
     for (const name of Object.keys(handlers)) ipcMain.removeHandler(`qwen-audio-agent:${name}`)

@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('qwenAudioAgentDesktop', {
     'qwen-audio-agent:wake-word-audio',
     { audio, sampleRate },
   ),
+  reportMicrophoneCapture: details => ipcRenderer.send('qwen-audio-agent:microphone-capture', details),
   prepareAmbientRecording: () => ipcRenderer.invoke('qwen-audio-agent:ambient-recording-prepare'),
   startNativeSystemAudioCapture: token => ipcRenderer.invoke('qwen-audio-agent:ambient-native-audio-start', token),
   stopNativeSystemAudioCapture: token => ipcRenderer.invoke('qwen-audio-agent:ambient-native-audio-stop', token),

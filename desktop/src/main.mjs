@@ -1,3 +1,4 @@
+import { createMicrophoneDiagnosticStore } from './microphone-diagnostics.mjs'
 import {
   loadPwmYamlSettings,
   testPwmModel,
@@ -153,6 +154,11 @@ const logger = createLogger({
   fileName: 'desktop.log',
   directory: clientPaths.logDirectory,
 })
+if (runtimeEnvironment.automaticMemoryPathUpdates.length) {
+  logger.info('desktop.agent_memory.paths_configured', {
+    keys: runtimeEnvironment.automaticMemoryPathUpdates,
+  })
+}
 const skinsRoot = clientPaths.skinsDirectory
 // 设置表单读写共享配置目录的 config.env；悬浮球摆位等
 // 窗口状态是桌面专属，经 ui-state.json 留在桌面版自己的数据目录。
@@ -160,9 +166,15 @@ const desktopSettingsStore = createSettingsStore({
   configDir: runtimeEnvironment.configDirectory,
   clientDir: clientPaths.directory,
   pwmDefaults: env => {
-    try { return loadPwmYamlSettings({ env, sourceRoot }) }
+    try { return loadPwmYamlSettings({ env, sourceRoot: runtimeRoot }) }
     catch { return {} } // The sidecar reports malformed YAML; desktop settings must still open.
   },
+})
+// Desktop capture always requests system-wide AEC; the renderer verifies it and falls back if unavailable.
+const desktopMicrophoneEchoCancellation = 'all'
+const microphoneDiagnostics = createMicrophoneDiagnosticStore({ logger,
+  runtime: { electron: process.versions.electron, chrome: process.versions.chrome,
+    platform: process.platform, osVersion: process.getSystemVersion() },
 })
 const desktopGatewayCredentials = createElectronGatewayCredentialStore({
   filePath: clientPaths.credentialsPath,
@@ -700,7 +712,9 @@ async function startDesktopAmbientRecording() {
     desktopAmbientRecordingId = recordingId
     desktopAmbientRecordingStopping = false
     desktopAmbientCaptureError = ''
-    logger.info('desktop.ambient_recording.start_requested', { recordingId })
+    microphoneDiagnostics.begin({ recordingId, directory: ambientRecordingDirectory(configuredGatewayEnvironment()),
+      requestedMode: desktopMicrophoneEchoCancellation })
+    logger.info('desktop.ambient_recording.start_requested', { recordingId, microphoneEchoCancellation: desktopMicrophoneEchoCancellation })
     publishAmbientRecordingState('starting')
     const result = await runtime.startRecording({
       recordingId,
@@ -716,6 +730,7 @@ async function startDesktopAmbientRecording() {
     publishAmbientRecordingState('recording')
     return { state: 'recording', recordingId, ...result }
   } catch (error) {
+    microphoneDiagnostics.end(recordingId)
     logger.error('desktop.ambient_recording.start_failed', { recordingId, error })
     desktopAmbientRecordingId = ''
     desktopAmbientCapturePrepared = false
@@ -755,6 +770,7 @@ async function stopDesktopAmbientRecording({ captureError = '' } = {}) {
       logger.error('desktop.ambient_recording.stop_failed', { recordingId, error })
       desktopAmbientCaptureError ||= '环境音频写入或封存失败，请检查桌面日志。'
     }
+    microphoneDiagnostics.end(recordingId)
     stopAmbientRecordingDrainTimer()
     publishAmbientRecordingState('finalizing')
     void finalizeDesktopAmbientRecording()
@@ -764,6 +780,11 @@ async function stopDesktopAmbientRecording({ captureError = '' } = {}) {
   try { return await operation }
   finally { if (desktopAmbientStopPromise === operation) desktopAmbientStopPromise = null }
 }
+
+ipcMain.on('qwen-audio-agent:microphone-capture', (event, payload) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return
+  microphoneDiagnostics.record(payload)
+})
 
 ipcMain.handle('qwen-audio-agent:ambient-recording-prepare', event => {
   if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
@@ -2184,6 +2205,7 @@ if (!app.requestSingleInstanceLock()) {
       if (ambientRecordingRuntime && ambientRecordingId) {
         try {
           await ambientRecordingRuntime.stopRecording(ambientRecordingId)
+          microphoneDiagnostics.end(ambientRecordingId)
         } catch (error) {
           logger.warn('desktop.ambient_recording.stop_on_shutdown_failed', { error })
         }

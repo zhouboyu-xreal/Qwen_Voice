@@ -14,6 +14,7 @@ test('desktop client settings initialize from the desktop URL', () => {
     autoHideSeconds: 300,
     wakeWordEnabled: true,
     language: 'en',
+    microphoneEchoCancellation: 'all',
   })
 })
 
@@ -29,11 +30,13 @@ test('desktop client settings hot-apply without replacing unrelated state', () =
     orbSkin: 'firefly',
     autoHideSeconds: 120,
     language: 'en',
+    microphoneEchoCancellation: 'default',
   }), {
     orbSkinId: 'firefly',
     autoHideSeconds: 120,
     wakeWordEnabled: true,
     language: 'en',
+    microphoneEchoCancellation: 'all',
   })
 })
 
@@ -43,4 +46,10 @@ test('legacy settings cannot turn off keyword gating', () => {
   assert.equal(applyDesktopClientSettings(initialDesktopClientSettings(), {
     wakeWordEnabled: false,
   }).wakeWordEnabled, true)
+})
+
+test('desktop always requests all despite legacy URL and hot settings overrides', () => {
+  const current = initialDesktopClientSettings('?microphoneEchoCancellation=default')
+  assert.equal(current.microphoneEchoCancellation, 'all')
+  assert.equal(applyDesktopClientSettings(current, { microphoneEchoCancellation: 'default' }).microphoneEchoCancellation, 'all')
 })

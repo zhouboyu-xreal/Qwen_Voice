@@ -202,6 +202,7 @@ export default function App() {
     orbSkinId,
     autoHideSeconds,
     wakeWordEnabled,
+    microphoneEchoCancellation,
   } = desktopClientSettings
   // `t()` reads the module-level runtime language. Keeping a revision in
   // React state makes a language-only settings update repaint this surface
@@ -864,6 +865,8 @@ export default function App() {
     onWakeWordAudio: (audio, sampleRate) => {
       window.qwenAudioAgentDesktop?.acceptWakeWordAudio(audio, sampleRate)
     },
+    microphoneEchoCancellation: desktopOrbMode ? microphoneEchoCancellation : 'default',
+    onMicrophoneDiagnostics: details => window.qwenAudioAgentDesktop?.reportMicrophoneCapture?.(details),
     ambientRecording: desktopOrbMode && ambientRecordingState === 'recording',
     onAmbientRecordingAudio: (audio, sampleRate, startedAt) => {
       ambientRecordingControllerRef.current?.appendMicrophone(audio, sampleRate, startedAt)

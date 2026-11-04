@@ -27,6 +27,7 @@ import {
   createMicrophoneCaptureLifecycle,
   microphoneErrorKind,
 } from './microphone-capture.js'
+import { acquireMicrophoneWithDiagnostics, waitForMicrophoneFrames } from './microphone-aec.js'
 import { confirmTrackedPlaybackStart } from './playback-lifecycle.js'
 import { t } from '../i18n.js'
 import {
@@ -210,6 +211,8 @@ export default function useRealtimeVoice({
   onWakeWordAudio,
   ambientRecording = false,
   onAmbientRecordingAudio,
+  microphoneEchoCancellation = 'default',
+  onMicrophoneDiagnostics,
   voiceReferenceRecording = false,
   onVoiceReferenceRecordingAudio,
 }) {
@@ -233,6 +236,7 @@ export default function useRealtimeVoice({
   const inputErrorRef = useRef(onInputError)
   const clientActionRef = useRef(onClientAction)
   const wakeWordAudioRef = useRef(onWakeWordAudio)
+  const microphoneDiagnosticsRef = useRef(onMicrophoneDiagnostics)
   const ambientRecordingAudioRef = useRef(onAmbientRecordingAudio)
   const ambientRecordingRef = useRef(ambientRecording)
   const flushAmbientAudioRef = useRef(() => {})
@@ -278,6 +282,7 @@ export default function useRealtimeVoice({
   inputErrorRef.current = onInputError
   clientActionRef.current = onClientAction
   wakeWordAudioRef.current = onWakeWordAudio
+  microphoneDiagnosticsRef.current = onMicrophoneDiagnostics
   ambientRecordingAudioRef.current = onAmbientRecordingAudio
   ambientRecordingRef.current = ambientRecording
   voiceReferenceRecordingAudioRef.current = onVoiceReferenceRecordingAudio
@@ -884,15 +889,22 @@ export default function useRealtimeVoice({
     }
     const capture = createMicrophoneCaptureLifecycle({
       mediaDevices: navigator.mediaDevices,
-      acquire: async () => {
+      acquire: async ({ reason }) => {
         if (!activateAudio()) {
           throw unsupportedInput(t('当前浏览器不支持实时语音播放'))
         }
         const context = audioRef.current
         if (!context) throw unsupportedInput(t('无法初始化实时语音播放'))
         if (context.state === 'suspended') await context.resume()
-        const media = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        const { media } = await acquireMicrophoneWithDiagnostics({
+          mediaDevices: navigator.mediaDevices,
+          mode: microphoneEchoCancellation,
+          verifyFrames: media => waitForMicrophoneFrames({ media, context }),
+          onDiagnostics: details => {
+            const diagnostic = { ...details, reason, contextSampleRate: context.sampleRate }
+            console.info('[microphone.capture]', diagnostic)
+            microphoneDiagnosticsRef.current?.(diagnostic)
+          },
         })
         const wakeWordResampler = createStreamingResampler()
         const inputResampler = createStreamingResampler()
@@ -1071,6 +1083,7 @@ export default function useRealtimeVoice({
     activateAudio,
     captureEnabled,
     captureSuspended,
+    microphoneEchoCancellation,
     inputOnlyMute,
     sendSocketEvent,
     sessionId,

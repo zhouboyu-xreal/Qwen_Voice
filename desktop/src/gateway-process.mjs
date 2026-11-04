@@ -1,4 +1,5 @@
 import { posix } from 'node:path'
+import { resolveAgentMemoryEnvironment } from '../../shared/agent-memory-paths.mjs'
 import {
   backendDefinition,
   effectiveBackendPermissionMode,
@@ -53,10 +54,10 @@ export function desktopGatewayEnvironment({
   sourceRoot = '',
   platform = process.platform,
 } = {}) {
-  const merged = {
-    ...env,
-    ...configured,
-  }
+  const { environment: merged } = resolveAgentMemoryEnvironment({
+    env: { ...env, ...configured },
+    root: runtimeRoot || sourceRoot || undefined,
+  })
   if (Object.hasOwn(configured, 'DASHSCOPE_API_KEY')) {
     merged.QWEN_AUDIO_REALTIME_API_KEY = configured.DASHSCOPE_API_KEY
   }

@@ -1,13 +1,15 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { parse } from 'yaml'
+import { resolveAgentMemoryEnvironment } from '../../shared/agent-memory-paths.mjs'
 import {
   PWM_FIELDS, PWM_SECRET_FIELDS, normalizePwmSettings, pwmSettingsPatch,
   pwmCompletionUrl, pwmEmbeddingUrl,
 } from '../../shared/pwm-model-settings.mjs'
 
 export function loadPwmYamlSettings({ env = process.env, sourceRoot } = {}) {
-  const path = resolve(env.AGENT_MEMORY_CONFIG || resolve(sourceRoot, 'memory/config.yaml'))
+  const { environment } = resolveAgentMemoryEnvironment({ env, root: sourceRoot })
+  const path = resolve(environment.AGENT_MEMORY_CONFIG || resolve(sourceRoot, 'memory/config.yaml'))
   if (!existsSync(path)) return {}
   let pwm
   try { pwm = parse(readFileSync(path, 'utf8'))?.personal_world_model || {} }

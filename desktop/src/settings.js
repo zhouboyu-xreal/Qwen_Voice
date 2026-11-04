@@ -1162,6 +1162,8 @@ function renderSkinOptions(selected) {
 }
 
 function render() {
+  desktopLanguage.value = settings.language || 'auto'
+  applyLanguage(desktopLanguage.value)
   pwmForm.render(settings)
   gatewayUrl.value = settings.gatewayUrl
   renderSkinOptions(settings.orbSkin)
@@ -1180,8 +1182,6 @@ function render() {
   wakeShortcut.value = settings.wakeShortcut
   wakeWordEnabled.checked = settings.wakeWordEnabled || false
   ambientRecordingSource.value = settings.ambientRecordingSource || 'microphone-system'
-  desktopLanguage.value = settings.language || 'auto'
-  applyLanguage(desktopLanguage.value)
   renderVoiceReferenceRecording()
   recordingWakeShortcut = false
   renderWakeShortcut()

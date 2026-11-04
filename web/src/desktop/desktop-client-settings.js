@@ -14,6 +14,7 @@ export function initialDesktopClientSettings(search = '') {
     autoHideSeconds: desktopAutoHideSeconds(search),
     wakeWordEnabled: desktopWakeWordEnabled(search),
     language: params.get('lang') || '',
+    microphoneEchoCancellation: 'all',
   }
 }
 
@@ -27,5 +28,7 @@ export function applyDesktopClientSettings(current, update = {}) {
       : current.autoHideSeconds,
     wakeWordEnabled: true,
     language: update.language || current.language,
+    // Desktop capture always requests system-wide AEC, including with legacy settings.
+    microphoneEchoCancellation: 'all',
   }
 }

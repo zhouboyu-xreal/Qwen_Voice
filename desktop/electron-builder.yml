@@ -40,6 +40,14 @@ files:
   - THIRD_PARTY_NOTICES.md
 
 extraResources:
+  # Python runs outside Electron's asar filesystem. Ship the runtime as real files.
+  - from: memory
+    to: runtime/memory
+    filter:
+      - "src/**/*.py"
+      - "integrations/qwen_audio_agent/*.py"
+      - "config.yaml"
+      - "requirements.txt"
   # Pure path policy is also used by backend launchers outside app.asar.
   - from: shared/runtime-paths.mjs
     to: runtime/shared/runtime-paths.mjs

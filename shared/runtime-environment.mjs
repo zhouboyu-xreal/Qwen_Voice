@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { resolveAgentMemoryEnvironment, persistAutomaticAgentMemoryPaths } from './agent-memory-paths.mjs'
 import {
   chmodSync,
   mkdirSync,
@@ -49,6 +50,12 @@ const USER_CONFIG_TEMPLATE = [
   '# VOICEMEM_INPUT_MODE=text',
   '# VOICEMEM_PYTHON=/absolute/path/to/voicemem-python',
   '# VOICEMEM_SIDECAR=/absolute/path/to/voicemem-sidecar.py',
+  '# PWM：代码与配置自动定位；数据默认保存在 QWAUDIO_DATA_DIR/memory/agent-memory',
+  '# QWEN_AUDIO_MEMORY_PROVIDER=agent-memory',
+  '# AGENT_MEMORY_PYTHON=/absolute/path/to/python-with-pwm-dependencies',
+  '# AGENT_MEMORY_SIDECAR=auto',
+  '# AGENT_MEMORY_CONFIG=auto',
+  '# AGENT_MEMORY_STATE_DIR=auto',
   '',
   '# 可选远程 Client 接入；Gateway 默认仍只监听 127.0.0.1',
   '# 开放同一局域网访问：QWEN_AUDIO_GATEWAY_LAN=1',
@@ -249,6 +256,7 @@ export function loadRuntimeEnvironment({
   readOnly = false,
 } = {}) {
   if (!root) throw new Error('loadRuntimeEnvironment requires root')
+  const inheritedKeys = new Set(Object.keys(env).filter(key => env[key] !== undefined))
   const configDirectory = userConfigDirectory(env, homeDirectory)
   const candidates = [
     resolve(root, '.env.local'),
@@ -278,6 +286,13 @@ export function loadRuntimeEnvironment({
   const configPath = readOnly
     ? resolve(configDirectory, 'config.env')
     : ensureUserConfig(configDirectory)
+  const rawMemoryEnvironment = { ...env }
+  const memoryPaths = resolveAgentMemoryEnvironment({ env, root, dataDirectory })
+  Object.assign(env, memoryPaths.environment)
+  const automaticMemoryPathUpdates = readOnly ? [] : persistAutomaticAgentMemoryPaths({
+    configPath, rawEnvironment: rawMemoryEnvironment,
+    automaticKeys: memoryPaths.automaticKeys, inheritedKeys,
+  })
   const userModelPath = readOnly
     ? resolve(dataDirectory, 'USER.md')
     : ensureUserModel(dataDirectory)
@@ -349,6 +364,7 @@ export function loadRuntimeEnvironment({
     acpWorkspace,
     openClawStateDirectory,
     loadedFiles,
+    automaticMemoryPathUpdates,
     generatedSecret: secret.generated,
     identityPath: secret.identityPath,
   }
