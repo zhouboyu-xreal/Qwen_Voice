@@ -379,7 +379,7 @@ class UserStateResolver:
             "scope": task_kind, "event": "input", "payload": update_input,
         }, ensure_ascii=False, indent=2, default=str))
         parsed = self._llm_client.parse_json_object_from_llm_text(
-            self._llm_client.call_llm(prompt) or ""
+            self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_threads') or "", stage_name='user_state_update_from_user_threads'
         )
         self._logger.info("\n%s", json.dumps({
             "scope": task_kind, "event": "llm_result", "payload": parsed,
@@ -470,7 +470,7 @@ class UserStateResolver:
                     if isinstance(value, (dict, list)) else str(value or ""),
                 )
             parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt) or ""
+                self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_observed_patterns') or "", stage_name='user_state_update_from_user_observed_patterns'
             )
             if not isinstance(parsed, Mapping) or not isinstance(parsed.get("operations"), list):
                 failed += 1
@@ -1247,7 +1247,7 @@ class UserStateResolver:
                 "{review_cases}", json.dumps(batch, ensure_ascii=False, indent=2),
             )
             parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt) or ""
+                self._llm_client.call_llm(prompt, stage_name='user_claim_status_review_from_state_operations') or "", stage_name='user_claim_status_review_from_state_operations'
             )
             raw_decisions = parsed.get("claim_decisions") if isinstance(parsed, Mapping) else None
             if not isinstance(raw_decisions, list) or len(raw_decisions) != len(batch):
@@ -1342,7 +1342,7 @@ class UserStateResolver:
                     value, ensure_ascii=False, indent=2,
                 ) if isinstance(value, (dict, list)) else str(value or ""))
             parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt) or ""
+                self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_claims') or "", stage_name='user_state_update_from_user_claims'
             )
             operations = self._normalize_user_claim_state_operations(
                 parsed, update_input=update_input,

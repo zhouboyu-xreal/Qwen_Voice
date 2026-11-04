@@ -514,6 +514,34 @@ select {
   padding: 0 16px 12px calc(var(--label-width) + 32px);
 }
 
+.voice-reference-reading-template {
+  margin: 0 16px 16px;
+  padding: 16px;
+  border: 1px solid var(--divider);
+  border-radius: 12px;
+  background: var(--page);
+  color: var(--text-primary);
+}
+
+.voice-reference-reading-template h3 {
+  margin: 0 0 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+}
+
+.voice-reference-reading-template p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+
+.voice-reference-reading-template p + p {
+  margin-top: 12px;
+}
+
 .provider-attribution {
   padding: 12px 16px;
   border-top: 1px solid var(--divider);

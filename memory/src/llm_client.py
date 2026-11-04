@@ -49,14 +49,17 @@ class LLMClient:
     def set_logger(self, logger: Optional[logging.Logger]) -> None:
         self._logger = logger or logging.getLogger(__name__)
 
-    def call_llm(self, prompt: str) -> Optional[str]:
+    def call_llm(
+        self, prompt: str, *, stage_name: str = "unspecified",
+    ) -> Optional[str]:
         if (
             not self._api_key
             or not self._base_url
             or self._base_url.strip().lower() == "none"
         ):
             self._logger.debug(
-                "Skipping LLM call because llm_api_key or llm_base_url is not configured"
+                "Skipping LLM call stage_name=%s because llm_api_key or "
+                "llm_base_url is not configured", stage_name,
             )
             return None
         url = f"{self._base_url.rstrip('/')}/chat/completions"
@@ -98,9 +101,9 @@ class LLMClient:
             request_started_at = time.monotonic()
             response: Optional[requests.Response] = None
             self._logger.info(
-                "LLM request started call_id=%s attempt=%s model=%s prompt_chars=%s "
+                "LLM request started stage_name=%s call_id=%s attempt=%s model=%s prompt_chars=%s "
                 "timeout_seconds=%s json_mode=%s thinking=%s",
-                call_id, request_number, self._model, len(prompt), self._timeout,
+                stage_name, call_id, request_number, self._model, len(prompt), self._timeout,
                 "response_format" in item, "thinking" in item,
             )
             try:
@@ -116,27 +119,27 @@ class LLMClient:
                 if choices:
                     message = choices[0].get("message") or {}
                     content = message.get("content")
-                    if content:
+                    if content and str(content).strip():
                         self._logger.info(
-                            "LLM request finished call_id=%s attempt=%s outcome=content "
+                            "LLM request finished stage_name=%s call_id=%s attempt=%s outcome=content "
                             "status_code=%s elapsed_ms=%.1f response_chars=%s",
-                            call_id, request_number, response.status_code,
+                            stage_name, call_id, request_number, response.status_code,
                             (time.monotonic() - request_started_at) * 1000,
                             len(str(content)),
                         )
                         return str(content)
                 self._logger.warning(
-                    "LLM request finished call_id=%s attempt=%s outcome=empty_content "
+                    "LLM request finished stage_name=%s call_id=%s attempt=%s outcome=empty_response "
                     "status_code=%s elapsed_ms=%.1f",
-                    call_id, request_number, response.status_code,
+                    stage_name, call_id, request_number, response.status_code,
                     (time.monotonic() - request_started_at) * 1000,
                 )
             except requests.RequestException as exc:
                 text = str(exc).lower()
                 self._logger.warning(
-                    "LLM request finished call_id=%s attempt=%s outcome=request_error "
+                    "LLM request finished stage_name=%s call_id=%s attempt=%s outcome=request_error "
                     "status_code=%s elapsed_ms=%.1f error_type=%s",
-                    call_id, request_number,
+                    stage_name, call_id, request_number,
                     response.status_code if response is not None else None,
                     (time.monotonic() - request_started_at) * 1000,
                     type(exc).__name__,
@@ -144,14 +147,24 @@ class LLMClient:
                 if "response_format" in text or "json" in text or "thinking" in text:
                     continue
                 return None
+            except Exception as exc:
+                self._logger.exception(
+                    "LLM request finished stage_name=%s call_id=%s attempt=%s "
+                    "outcome=request_error elapsed_ms=%.1f error_type=%s",
+                    stage_name, call_id, request_number,
+                    (time.monotonic() - request_started_at) * 1000,
+                    type(exc).__name__,
+                )
+                raise
         self._logger.warning(
-            "LLM call finished call_id=%s outcome=no_content attempts=%s elapsed_ms=%.1f",
-            call_id, request_number, (time.monotonic() - call_started_at) * 1000,
+            "LLM call finished stage_name=%s call_id=%s outcome=no_content attempts=%s elapsed_ms=%.1f",
+            stage_name, call_id, request_number, (time.monotonic() - call_started_at) * 1000,
         )
         return None
 
-    @staticmethod
-    def parse_json_object_from_llm_text(text: str) -> Optional[Dict[str, Any]]:
+    def parse_json_object_from_llm_text(
+        self, text: str, *, stage_name: str = "unspecified",
+    ) -> Optional[Dict[str, Any]]:
         raw = str(text or "").strip()
         if not raw:
             return None
@@ -167,9 +180,21 @@ class LLMClient:
                 raw = raw[start : end + 1]
         try:
             data = json.loads(raw)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
+            self._logger.warning(
+                "LLM JSON parsing stage_name=%s outcome=invalid_json_object "
+                "reason=json_decode_error response_chars=%s line=%s column=%s",
+                stage_name, len(str(text)), exc.lineno, exc.colno,
+            )
             return None
-        return data if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            self._logger.warning(
+                "LLM JSON parsing stage_name=%s outcome=invalid_json_object "
+                "reason=not_json_object response_chars=%s parsed_type=%s",
+                stage_name, len(str(text)), type(data).__name__,
+            )
+            return None
+        return data
 
     @staticmethod
     def _config_bool(value: Any, default: bool = False) -> bool:

@@ -135,22 +135,6 @@ class UserPrediction:
         ):
             raise ValueError("Prediction events must refer to the world owner's intents")
         intents = [self._intent_snapshot(intent) for intent in rows]
-        fact_ids_by_intent = {}
-        for intent in intents:
-            key = (intent["object_type"], intent["id"])
-            # Query each intent separately so the shared query limit cannot starve another case.
-            fact_ids_by_intent[intent["id"]] = self._db.get_intent_evidence_fact_ids([key]).get(key, [])
-        fact_ids = sorted({fact_id for ids in fact_ids_by_intent.values() for fact_id in ids})
-        related_facts = {}
-        for fact in self._db.get_memory_facts_by_ids(fact_ids) if fact_ids else []:
-            observed_at = self._as_datetime(fact.get("dialogue_time_key"), as_of)
-            if observed_at is not None and observed_at > as_of:
-                continue
-            related_facts[int(fact["id"])] = {
-                "fact_id": int(fact["id"]), "summary": fact.get("summary") or "",
-                "event_time_key": fact.get("event_time_key") or "",
-                "dialogue_time_key": fact.get("dialogue_time_key") or "",
-            }
         existing = self._model_db.get_user_predictions_by_intent_ids(
             intent_ids, statuses=["pending"], user_entity_id=owner_id,
         )
@@ -171,9 +155,6 @@ class UserPrediction:
                     event["event_type"] == "updated" for event in related_events
                 ) else "created",
                 "current_intent": intent, "intent_events": related_events,
-                "related_facts": [related_facts[fact_id]
-                                  for fact_id in fact_ids_by_intent[intent["id"]]
-                                  if fact_id in related_facts],
                 "existing_predictions": [prediction for prediction in existing
                                          if prediction["id"] in links.get(intent["id"], set())],
             })
@@ -213,7 +194,7 @@ class UserPrediction:
             "horizon_hours": horizon_hours,
         })
         if not event_ids:
-            self._log_event("finish", {
+            self._log_event("user_prediction_update_finish", {
                 "status": "empty", "reason": "no_intent_events",
                 "total_elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
             })
@@ -249,7 +230,6 @@ class UserPrediction:
             "intent_cases": [{
                 "event_type": case["event_type"], "current_intent": case["current_intent"],
                 "intent_event_ids": [item["id"] for item in case["intent_events"]],
-                "related_facts": case["related_facts"],
                 "existing_prediction_ids": [item["id"] for item in case["existing_predictions"]],
             } for case in snapshot["intent_cases"]],
             "recurring_states": states,
@@ -375,23 +355,15 @@ class UserPrediction:
             "state_ids": [state["id"] for state in states],
             "horizon_start": as_of.isoformat(), "horizon_end": horizon_end.isoformat(),
         })
-        self._log_event("llm_request", {"stage": "created", "prompt": prompt}, level=logging.DEBUG)
         raw = None
         try:
-            raw = self._llm_client.call_llm(prompt)
-            self._log_event("llm_response", {"stage": "created", "raw_response": raw}, level=logging.DEBUG)
-            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            raw = self._llm_client.call_llm(prompt, stage_name='user_prediction_from_created_intents')
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='user_prediction_from_created_intents')
             if not isinstance(parsed, dict) or set(parsed) != {"prediction_results"}:
                 raise ValueError("Created-intent response must contain only prediction_results")
             predictions, assessments = self._normalize_prediction_results(
                 parsed["prediction_results"], cases=cases, states=states, as_of=as_of, horizon_end=horizon_end,
             )
-            self._log_event("llm_finished", {
-                "stage": "created", "intent_ids": [case["current_intent"]["id"] for case in cases],
-                "prediction_count": len(predictions), "assessments": assessments,
-                "response_chars": len(raw or ""),
-                "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
-            })
             return predictions, assessments
         except Exception as exc:
             self._log_prediction_response_failure(
@@ -412,7 +384,6 @@ class UserPrediction:
             "intent_cases": [{
                 "current_intent": case["current_intent"],
                 "intent_event_ids": [event["id"] for event in case["intent_events"]],
-                "related_facts": case.get("related_facts", []),
                 "existing_prediction_ids": [item["id"] for item in case["existing_predictions"]],
             } for case in cases],
             "allowed_state_ids": [state["id"] for state in states],
@@ -528,9 +499,9 @@ class UserPrediction:
         self._log_event("llm_request", {"stage": "updated", "prompt": prompt}, level=logging.DEBUG)
         raw = None
         try:
-            raw = self._llm_client.call_llm(prompt)
+            raw = self._llm_client.call_llm(prompt, stage_name='user_prediction_from_updated_intents')
             self._log_event("llm_response", {"stage": "updated", "raw_response": raw}, level=logging.DEBUG)
-            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='user_prediction_from_updated_intents')
             if not isinstance(parsed, dict) or set(parsed) != {"retained_prediction_ids", "prediction_results"}:
                 raise ValueError("Updated-intent response requires retained_prediction_ids and prediction_results")
             predictions, retained, assessments = self._normalize_updated_intent_prediction_results(

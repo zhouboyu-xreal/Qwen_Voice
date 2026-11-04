@@ -156,8 +156,8 @@ class UserProactiveService:
         })
         raw = None
         try:
-            raw = self._llm_client.call_llm(prompt)
-            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            raw = self._llm_client.call_llm(prompt, stage_name='user_proactive_policy_evaluation')
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='user_proactive_policy_evaluation')
             if not isinstance(parsed, dict):
                 self._logger.error(
                     "proactive service invalid JSON prediction_id=%s response=%r", prediction_id, raw,

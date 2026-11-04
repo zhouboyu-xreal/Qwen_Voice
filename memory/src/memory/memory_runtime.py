@@ -238,6 +238,10 @@ class MemoryRuntime:
         self._transcript_ambient_recording_enabled = bool(
             ambient_recording_enabled
         )
+        self._user_activity_tags = sorted(
+            set(self._user_activity_tags).union(tags)
+        )
+        queued = False
         for normalized_segment in normalized_segments:
             normalized_segment["tags"] = sorted({
                 *normalized_segment.get("tags", []),
@@ -255,11 +259,6 @@ class MemoryRuntime:
                 normalized_segment["text"],
             )
 
-        self._user_activity_tags = sorted(
-            set(self._user_activity_tags).union(tags)
-        )
-        queued = False
-        for normalized_segment in normalized_segments:
             completed_unit = self._transcript_unit_assembler.append_new_segment(
                 normalized_segment,
             )
@@ -624,6 +623,22 @@ class MemoryRuntime:
                 indent=2,
                 default=str,
             )
+            # Keep the record indented, but render each unit as one JSON object line.
+            for field in ("preceding_context_units", "units"):
+                items = payload.get(field)
+                if not isinstance(items, list) or not items:
+                    continue
+                expanded = json.dumps(
+                    items, ensure_ascii=False, indent=2, default=str,
+                ).replace("\n", "\n    ")
+                compact = "[\n" + ",\n".join(
+                    "      " + json.dumps(item, ensure_ascii=False, default=str)
+                    for item in items
+                ) + "\n    ]"
+                field_prefix = json.dumps(field) + ": "
+                body = body.replace(
+                    field_prefix + expanded, field_prefix + compact, 1,
+                )
         except (TypeError, ValueError):
             body = json.dumps(
                 {
@@ -715,7 +730,7 @@ class MemoryRuntime:
 
     @staticmethod
     def _memory_units_log_view(units: Sequence[MemoryUnit]) -> List[Dict[str, Any]]:
-        """Return serializable task-unit details without Runtime embeddings."""
+        """Return structured task-unit details without Runtime embeddings."""
         return [
             {
                 "unit_type": unit.unit_type,

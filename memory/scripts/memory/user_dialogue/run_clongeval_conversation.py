@@ -442,9 +442,9 @@ def run_reader(
     if not memory_context.strip():
         return ""
     raw = llm_client.call_llm(
-        build_reader_prompt(query, truncate_text(memory_context, max_chars))
+        build_reader_prompt(query, truncate_text(memory_context, max_chars)), stage_name='memory_recall_reader_answer'
     )
-    parsed = llm_client.parse_json_object_from_llm_text(raw or "")
+    parsed = llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_recall_reader_answer')
     if isinstance(parsed, dict):
         return str(parsed.get("answer") or parsed.get("final_answer") or "").strip()
     return str(raw or "").strip()

@@ -103,8 +103,8 @@ class UserThreadUpdater:
         self._log('memory_user_thread_update', f'{stage}_input', {
             'prompt_language': language, field: cases,
         })
-        response = self._llm_client.call_llm(template.format(**{field: text}))
-        result = self._llm_client.parse_json_object_from_llm_text(response or '')
+        response = self._llm_client.call_llm(template.format(**{field: text}), stage_name=f"memory_user_thread_{stage}")
+        result = self._llm_client.parse_json_object_from_llm_text(response or '', stage_name=f"memory_user_thread_{stage}")
         self._log('memory_user_thread_update', f'{stage}_result', {'result': result})
         if not isinstance(result, dict):
             raise ValueError(f'Invalid user thread {stage} response')

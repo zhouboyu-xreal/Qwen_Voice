@@ -36,6 +36,7 @@ from embedding_client import EmbeddingClient
 from llm_client import LLMClient
 from .memory_database import UserMemoryDB
 from .memory_types import MemoryUnit
+from .logging_utils import CompactLogValue, LogJSONEncoder
 from .user_thread_updater import UserThreadUpdater
 from task_scheduler import TaskScheduler
 from prompts_en import (
@@ -881,7 +882,7 @@ class MemoryNodeManager:
             metadata = fact.get("metadata") if isinstance(fact.get("metadata"), dict) else {}
             self._log_info(
                 "memory_fact_extraction",
-                "extract_fact_signals",
+                "fact_info",
                 {
                     "fact_index": index,
                     "fact_count": len(facts),
@@ -923,14 +924,8 @@ class MemoryNodeManager:
         self._log_info("memory_fact_extraction", "start", {
             "source_unit_count": len(current_units),
             "preceding_context_unit_count": len(preceding_units),
-            "current_units": self._build_memory_units_for_prompt(
-                current_units,
-                prompt_language=prompt_language,
-            ),
-            "preceding_context_units": self._build_memory_units_for_prompt(
-                preceding_units,
-                prompt_language=prompt_language,
-            ),
+            "current_units": self._memory_units_log_view(current_units),
+            "preceding_context_units": self._memory_units_log_view(preceding_units),
         })
         prompt_template = (
             UNIFIED_MEMORY_EXTRACTION_PROMPT_EN
@@ -969,46 +964,19 @@ class MemoryNodeManager:
         failure_info: Dict[str, Any] = {}
         for attempt in range(2):
             try:
-                result = self._llm_client.call_llm(prompt)
+                result = self._llm_client.call_llm(prompt, stage_name='memory_fact_extraction')
             except Exception as exc:
                 failure_info = {"reason": "llm_request_error", "error_type": type(exc).__name__}
-                self._logger.exception("Unified memory LLM request failed attempt=%s", attempt + 1)
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "request_error",
-                    "error_type": type(exc).__name__,
-                    "response_chars": 0,
-                    "raw_fact_count": None,
-                    "normalized_fact_count": 0,
-                    "dropped_fact_counts": {},
-                })
                 continue
             response_text = str(result or "")
-            response_chars = len(response_text)
             if not response_text.strip():
                 failure_info = {"reason": "empty_llm_response"}
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "empty_response",
-                    "response_chars": response_chars,
-                    "raw_fact_count": None,
-                    "normalized_fact_count": 0,
-                    "dropped_fact_counts": {},
-                })
                 if attempt == 0:
                     self._logger.debug("Unified memory LLM extraction failed, retrying")
                 continue
-            parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
+            parsed = self._llm_client.parse_json_object_from_llm_text(result or "", stage_name='memory_fact_extraction')
             if parsed is None:
                 failure_info = {"reason": "invalid_llm_json_object"}
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "invalid_json_object",
-                    "response_chars": response_chars,
-                    "raw_fact_count": None,
-                    "normalized_fact_count": 0,
-                    "dropped_fact_counts": {},
-                })
             else:
                 normalization_diagnostics: Dict[str, Any] = {}
                 normalized = self._normalize_memory_fact_extraction_llm_output(
@@ -1018,13 +986,6 @@ class MemoryNodeManager:
                     known_world_owner_aliases=known_world_owner_aliases,
                     diagnostics=normalization_diagnostics,
                 )
-                self._log_info("memory_fact_extraction", "llm_output_diagnostics", {
-                    "attempt": attempt + 1,
-                    "parse_status": "parsed",
-                    "response_chars": response_chars,
-                    "response_keys": sorted(str(key) for key in parsed.keys()),
-                    **normalization_diagnostics,
-                })
                 if normalized is not None:
                     facts = normalized["facts"]
                     return {
@@ -1096,7 +1057,7 @@ class MemoryNodeManager:
         }
         for _ in range(2):
             parsed = self._llm_client.parse_json_object_from_llm_text(
-                self._llm_client.call_llm(prompt) or ""
+                self._llm_client.call_llm(prompt, stage_name='memory_user_activity_extraction') or "", stage_name='memory_user_activity_extraction'
             ) or {}
             raw_items = parsed.get("user_activities")
             if not isinstance(raw_items, list):
@@ -1996,6 +1957,21 @@ class MemoryNodeManager:
             )
         return descriptors
 
+    @staticmethod
+    def _memory_units_log_view(units: Sequence[MemoryUnit]) -> List[CompactLogValue]:
+        """Render each complete unit on one line, independently of log events."""
+        return [
+            CompactLogValue({
+                "unit_type": unit.unit_type,
+                "speakers": list(unit.speakers or []),
+                "texts": list(unit.texts or []),
+                "started_ats": list(unit.started_ats or []),
+                "ended_ats": list(unit.ended_ats or []),
+                "tags": list(unit.tags or []),
+            })
+            for unit in units
+        ]
+
     def _build_memory_units_for_prompt(
         self,
         units: Sequence[MemoryUnit],
@@ -2561,9 +2537,9 @@ class MemoryNodeManager:
                         [self._user_intent_signal_prompt_view(item) for item in batch],
                         ensure_ascii=False,
                         indent=2,
-                    ))
+                    )), stage_name='memory_user_intent_extraction'
                 )
-                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_intent_extraction')
             except Exception as exc:
                 parsed = None
                 batch_error = str(exc)
@@ -3219,9 +3195,9 @@ class MemoryNodeManager:
         try:
             raw = self._llm_client.call_llm(
                 prompt_template.replace("{candidates}", json.dumps(candidate_inputs, ensure_ascii=False, indent=2))
-                .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2))
+                .replace("{existing_objects}", json.dumps(existing, ensure_ascii=False, indent=2)), stage_name='memory_future_intent_reconciliation'
             )
-            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+            parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_future_intent_reconciliation')
             if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
                 raise ValueError("invalid_future_intent_reconciliation_response")
         except Exception as exc:
@@ -3522,8 +3498,8 @@ class MemoryNodeManager:
                 )
                 raw = self._llm_client.call_llm(template.replace(
                     "{observation_cases}", json.dumps(cases, ensure_ascii=False, indent=2),
-                ))
-                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+                ), stage_name='memory_intent_lifecycle_reconciliation')
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_intent_lifecycle_reconciliation')
                 if not isinstance(parsed, dict) or not isinstance(parsed.get("decisions"), list):
                     raise ValueError("invalid_lifecycle_matching_response")
                 for decision in parsed["decisions"]:
@@ -4212,9 +4188,9 @@ class MemoryNodeManager:
             prompt_template.replace("{candidate_claim_groups}", json.dumps(
                 candidate_claim_groups,
                 ensure_ascii=False, indent=2,
-            ))
+            )), stage_name='memory_user_claim_reconciliation'
         )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_claim_reconciliation')
         if not parsed or not isinstance(parsed.get("decisions"), list):
             return [[] for _candidate in candidates]
         else:
@@ -4597,8 +4573,8 @@ class MemoryNodeManager:
                         [self._explicit_claim_signal_prompt_view(item) for item in batch_signal_items],
                         ensure_ascii=False, indent=2,
                     ),
-                ))
-                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+                ), stage_name='memory_explicit_user_claim_extraction')
+                parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_explicit_user_claim_extraction')
             except Exception as exc:
                 parsed = None
                 self._log_info("memory_user_claim", "signal_batch_error", {
@@ -5120,8 +5096,8 @@ class MemoryNodeManager:
                 )
                 for claim in related_claims
             ], ensure_ascii=False, indent=2),
-        ))
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        ), stage_name='memory_derived_user_claim_extraction')
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_derived_user_claim_extraction')
         if parsed is None or not isinstance(parsed.get("claims"), list):
             return None
         return [item for item in parsed["claims"][:16] if isinstance(item, dict)]
@@ -5425,9 +5401,9 @@ class MemoryNodeManager:
                     ],
                 }
                 for pattern in existing_patterns
-            ], ensure_ascii=False, indent=2))
+            ], ensure_ascii=False, indent=2)), stage_name='memory_user_observed_pattern_signal_relation'
         )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_observed_pattern_signal_relation')
         if not parsed or not isinstance(parsed.get("decisions"), list):
             return None
         decisions: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -5816,9 +5792,9 @@ class MemoryNodeManager:
                     ).get("dialogue_time_key") or "",
                 }
                 for signal in signals
-            ], ensure_ascii=False, indent=2))
+            ], ensure_ascii=False, indent=2)), stage_name='memory_user_observed_pattern_extraction'
         )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_observed_pattern_extraction')
         if parsed is None or not isinstance(parsed.get("patterns"), list):
             return None
         available_signal_ids = {int(signal["signal_id"]) for signal in signals}
@@ -6037,9 +6013,9 @@ class MemoryNodeManager:
                     ),
                 }
                 for row in existing
-            ], ensure_ascii=False, indent=2))
+            ], ensure_ascii=False, indent=2)), stage_name='memory_user_observed_pattern_reconciliation'
         )
-        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "")
+        parsed = self._llm_client.parse_json_object_from_llm_text(raw or "", stage_name='memory_user_observed_pattern_reconciliation')
         if not parsed or not isinstance(parsed.get("relations"), list):
             return None
         allowed_ids = {int(row["id"]) for row in existing}
@@ -6440,7 +6416,7 @@ class MemoryNodeManager:
                 ensure_ascii=False,
                 sort_keys=False,
                 indent=2,
-                default=str,
+                cls=LogJSONEncoder,
             )
         except (TypeError, ValueError):
             body = json.dumps(
@@ -10047,8 +10023,8 @@ class MemoryNodeManager:
             .replace("{query}", str(query or ""))
             .replace("{reference_time}", str(reference_time or ""))
         )
-        result = self._llm_client.call_llm(prompt)
-        parsed = self._llm_client.parse_json_object_from_llm_text(result or "")
+        result = self._llm_client.call_llm(prompt, stage_name='memory_recall_query_analysis')
+        parsed = self._llm_client.parse_json_object_from_llm_text(result or "", stage_name='memory_recall_query_analysis')
         return parsed if isinstance(parsed, dict) else {}
 
     def _build_recall_search_terms(
