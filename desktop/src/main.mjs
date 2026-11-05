@@ -606,15 +606,19 @@ async function finalizeDesktopAmbientRecording() {
   let message = ''
   try {
     let failedBatches = 0
+    let failedTranscriptSaves = 0
     while (true) {
       const result = await drainDesktopAmbientRecording()
       failedBatches = result?.failedBatches || 0
+      failedTranscriptSaves = result?.failedTranscriptSaves || 0
       if (!result?.pendingBatches) break
       await new Promise(resolveDelay => setTimeout(resolveDelay, 1_000))
     }
-    logger.info('desktop.ambient_recording.finalized', { recordingId, failedBatches })
-    message = desktopAmbientCaptureError || (failedBatches
-      ? '环境录音已保存，但部分音轨转写失败，请检查日志。' : '')
+    logger.info('desktop.ambient_recording.finalized', { recordingId, failedBatches, failedTranscriptSaves })
+    message = [desktopAmbientCaptureError,
+      failedBatches ? '环境录音已保存，但部分音轨转写失败，请检查日志。' : '',
+      failedTranscriptSaves ? '部分 ASR 转写结果未能保存为文件，已继续提交记忆处理，请检查日志。' : '',
+    ].filter(Boolean).join(' ')
     if (message) state = 'error'
   } catch (error) {
     logger.error('desktop.ambient_recording.finalize_failed', { recordingId, error })

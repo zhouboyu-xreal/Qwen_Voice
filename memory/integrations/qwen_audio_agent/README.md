@@ -167,6 +167,23 @@ Embedding 的模型、请求地址、维度或归一化策略改变后，仅失�
 不会自动重试或删除已有记忆。测试脚本继续支持 `--parse-only` 和独立测试数据库，解析器
 与页面导入共用 `src/memory/feishu_transcript.py`。
 
+### 环境录音 ASR 结果归档
+
+每个封存的 WAV 完成离线 ASR 后，在同目录原子写入同名 `.asr.json`，例如
+`20261104_181200_microphone_000001_ac35e4.wav` 对应
+`20261104_181200_microphone_000001_ac35e4.asr.json`。文件保存 `_transcribe_batch()` 的完整返回结果，
+包括音频 SHA256、轨道、批次、累计样本时间轴上的起止时间、切分原因和完整 `segments`（含 metadata）。
+新增 `transcriptFile`、`transcriptSaveStatus` 描述归档路径和状态。JSON 为 UTF-8、保留中文并带缩进。
+
+归档在 ASR 后台线程返回结果前完成，不等待 PWM 接收，不阻塞 PCM 写入。无语音的成功结果仍归档
+`segments: []`。先写 `.asr.json.tmp`、flush/fsync，再重命名；最终文件权限为 0600。
+ASR 失败不生成成功结果文件，原始 WAV 保留。JSON 保存失败会记录独立错误，并继续将已识别结果
+传给 PWM；`failed_batches` 只统计 ASR 失败，`failed_transcript_saves` 单独统计归档失败。
+会话清单新增 `transcripts`，按 WAV 列出 `asrStatus`（pending/completed/failed）、
+`saveStatus`（pending/saved/failed/not_generated）、对应文件名和失败代码。桌面收尾会提示归档失败。
+清空记忆保留录音目录，也保留这些转写归档；旧录音不会自动补跑 ASR。进程在 ASR 期间退出时，
+清单中可能保留 pending，不能将其视为已完成。
+
 ### 环境录音的双轨共同静音切分
 
 环境录音启动成功后持续保存收到的 PCM，包含静音和背景声，不等检测到人声才开始写入。
@@ -175,20 +192,24 @@ Embedding 的模型、请求地址、维度或归一化策略改变后，仅失�
 - 默认每批达到 **600 秒后** 才寻找切分点，没有强制时长上限。已有
   `AGENT_MEMORY_AMBIENT_RECORDING_CHUNK_SECONDS` / `--chunk-duration-seconds` 参数继续使用，
   语义改为“开始寻找共同静音的最短批次时长”。每次共同切分后重新计时。
-- 独立分析线程使用每路各自的 Silero VAD 状态，以采集时间戳寻找同一个连续静音区间，
-  不能把不同时间出现的两次静音当成共同静音。默认需连续 **0.8 秒**，且 VAD 未检测到人声、
+- 两路以同一录音开始时间为原点，按各自累计 PCM 样本数 / 采样率推进相对时间轴。
+  不使用音频包的外部 `startedAt` 判断间断或切分；设备重开、时间戳跳变、回调延迟不会
+  单独封存音轨。不补静音、不丢弃重叠时间戳的采样，实际漏采的时间会被略过。
+- 独立分析线程使用每路各自的 Silero VAD 状态，在累计样本相对时间轴上寻找共同静音。
+  两路都保存到相应位置后才可切分，不按包到达顺序判断。默认需连续 **0.8 秒**，且 VAD 未检测到人声、
   原始 PCM 帧的 RMS 不高于 **-35 dBFS**，避免将较响的非人声当成静音。
   开始寻找前预热约一秒，不加载 ASR 或声纹模型，分析复制帧的重采样不改变保存的 PCM。
 - 两路使用相同切分时间点封存。快到达音轨已经写过该点的尾部，在磁盘上按采样边界拆入
   下一文件，保留全部采样，不混音、不重复、不裁剪静音，也不为未到达的音轨补造数据。
   两路采样率不同，实际边界最多存在采样取整误差；正常连续录制时批次编号对应。
 - 只启用麦克风时，仅等待麦克风静音。两路没有共同静音则继续当前文件；主动停止时直接
-  保存尾部，不等待静音。设备格式变化和明显时间间断仍按异常边界封存相关音轨，并重新
-  计时和检测，避免跨缺口匹配静音或将不同格式写入同一个 WAV。
+  保存尾部，不等待静音。两路停止时的时长可能不同；本策略不保证与现实采集时间严格同步。
+  采样率变化仍按 WAV 格式边界封存相关音轨，沿用累计音频时间并重新计时和检测，
+  避免将不同格式写入同一个 WAV。
 - VAD 初始化或推理失败会明确报错，保留已写音频；不会偷偷退回定时硬切。
   `ambient shared batch sealed reason=joint_silence` 日志记录共同切分时间、批次时长和静音阈值。
-  录音清单保存 `split_policy`、`shared_split_events`；转写证据记录
-  `audio_cut_reason` / `audio_shared_cut_at`。未封存的音频仍等待封存后转写。
+  录音清单保存 `split_policy`、`timeline_policy: "sample_count"`、`shared_split_events`；转写证据记录
+  `audio_cut_reason` / `audio_shared_cut_at` / `audio_timeline_policy`。未封存的音频仍等待封存后转写。
 
 可在实际使用的 `AGENT_MEMORY_CONFIG` 中调整内部静音参数：
 

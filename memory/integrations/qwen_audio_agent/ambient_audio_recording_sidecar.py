@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import socket
 import sys
@@ -137,7 +138,7 @@ class _AgentMemoryIpcClient:
 
 
 class AmbientAudioRecordingService:
-    """Persist both tracks; seal together at shared quiet capture timestamps."""
+    """Persist both tracks and ASR artifacts on their shared sample timeline."""
 
     def __init__(
         self,
@@ -204,6 +205,8 @@ class AmbientAudioRecordingService:
         self._recording_started_at: Optional[datetime] = None
         self._manifest_path: Optional[Path] = None
         self._audio_file_names: List[str] = []
+        self._transcript_results: Dict[str, Dict[str, Any]] = {}
+        self._failed_transcript_saves = 0
         self._pending: List[Future[Dict[str, Any]]] = []
         self._completed: List[Dict[str, Any]] = []
         self._failed_batches = 0
@@ -230,6 +233,8 @@ class AmbientAudioRecordingService:
             f"{recording_stamp}_{self._recording_short_id()}.json"
         )
         self._audio_file_names = []
+        self._transcript_results = {}
+        self._failed_transcript_saves = 0
         self._tracks = {source: _AudioTrack(source) for source in sources}
         self._asr_progress = {source: self._recording_started_at for source in sources}
         self._buffered_segments = []
@@ -254,7 +259,7 @@ class AmbientAudioRecordingService:
             raise RuntimeError("Memory is resetting; recording was not started")
         self._logger.info(
             "ambient recording started recording_id=%s split_policy=joint_silence "
-            "split_min_seconds=%.3f silence_seconds=%.3f hard_limit=none",
+            "split_min_seconds=%.3f silence_seconds=%.3f hard_limit=none timeline_policy=sample_count",
             recording_id,
             self._chunk_duration_seconds,
             self._split_silence_seconds,
@@ -280,26 +285,21 @@ class AmbientAudioRecordingService:
             raise ValueError("audio must contain complete PCM16 samples")
         if not payload:
             return self._result()
-        started_at = _parse_timestamp(params["startedAt"]) if params.get("startedAt") else None
-        if started_at and started_at < self._recording_started_at - timedelta(seconds=1):
-            raise ValueError("audio startedAt precedes the recording")
+        # Packet capture timestamps may jump when a device is reopened or a
+        # renderer callback is delayed. Persist all received PCM consecutively;
+        # both sources share the session origin and advance by sample duration.
+        # Deliberately do not insert silence or drop samples to repair gaps.
         self._harvest_split_analysis()
         if track.sample_rate is not None and track.sample_rate != sample_rate:
-            # Format changes are exceptional boundaries, never silence. Keep
-            # the old valid WAV and restart joint detection after the change.
+            # A WAV cannot contain multiple sample rates. Preserve the format
+            # boundary, continuing at the old batch's accumulated audio end.
             self._seal_current_batch(track, reason="sample_rate_change")
             track.sample_rate = None
-            self._reset_splitter(started_at or track.batch_started_at)
+            self._reset_splitter(track.batch_started_at)
         if track.sample_rate is None:
             track.sample_rate = sample_rate
-            track.batch_started_at = started_at or track.batch_started_at or self._recording_started_at
+            track.batch_started_at = track.batch_started_at or self._recording_started_at
             self._logger.info("ambient track capture format source=%s sample_rate=%s", source, sample_rate)
-        expected = track.batch_started_at + timedelta(seconds=track.batch_samples / sample_rate)
-        if started_at is not None and abs((started_at - expected).total_seconds()) > 0.25:
-            self._seal_current_batch(track, reason="discontinuity")
-            track.batch_started_at = started_at
-            self._reset_splitter(started_at)
-            self._logger.info("ambient track discontinuity source=%s started_at=%s", source, started_at)
         actual_start = track.batch_started_at + timedelta(seconds=track.batch_samples / sample_rate)
         self._ensure_writer(track)
         track.writer.writeframes(payload)
@@ -495,6 +495,11 @@ class AmbientAudioRecordingService:
                             ended_at=ended_at, sample_count=sample_count, sample_rate=track.sample_rate,
                             source=track.source, cut_reason=reason, shared_cut_at=cut_at)
         self._audio_file_names.append(final_path.name)
+        self._transcript_results[final_path.name] = {
+            "audioFile": final_path.name, "transcriptFile": final_path.with_suffix(".asr.json").name,
+            "source": track.source, "batchIndex": batch.index,
+            "asrStatus": "pending", "saveStatus": "pending",
+        }
         track.batch_started_at = ended_at
         track.batch_samples = tail_samples
         track.writer = tail_writer
@@ -540,12 +545,13 @@ class AmbientAudioRecordingService:
                 "audio_file": relative_path,
                 "audio_batch_index": batch.index,
                 "audio_cut_reason": batch.cut_reason,
+                "audio_timeline_policy": "sample_count",
                 "audio_shared_cut_at": batch.shared_cut_at.isoformat() if batch.shared_cut_at else None,
                 "audio_sha256": checksum,
             })
             item["metadata"] = metadata
             segments.append(item)
-        return {
+        result = {
             "batchId": f"{self._recording_id}:{batch.source}:{batch.index}",
             "recordingId": self._recording_id,
             "batchIndex": batch.index,
@@ -561,7 +567,40 @@ class AmbientAudioRecordingService:
             "cutReason": batch.cut_reason,
             "sharedCutAt": batch.shared_cut_at.isoformat() if batch.shared_cut_at else None,
             "segments": segments,
+            "transcriptFile": batch.path.with_suffix(".asr.json").name,
+            "transcriptSaveStatus": "saved",
         }
+        # Persist the full result before the main loop pops segments for PWM.
+        # File I/O runs on the ASR worker, never on the PCM append path.
+        try:
+            self._save_transcript_result(batch.path.with_suffix(".asr.json"), result)
+            self._logger.info("ambient ASR result saved recording_id=%s source=%s batch=%s path=%s segments=%s",
+                              self._recording_id, batch.source, batch.index,
+                              result["transcriptFile"], len(segments))
+        except Exception:
+            # Recognition succeeded. Keep its text and coverage available to
+            # PWM even when the independent JSON artifact cannot be written.
+            result["transcriptSaveStatus"] = "failed"
+            result["transcriptSaveError"] = "asr_result_write_failed"
+            self._logger.exception("ambient ASR result save failed recording_id=%s source=%s batch=%s path=%s",
+                                   self._recording_id, batch.source, batch.index, result["transcriptFile"])
+        return result
+
+    def _save_transcript_result(self, path: Path, result: Dict[str, Any]) -> None:
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(result, stream, ensure_ascii=False, indent=2, allow_nan=False)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                self._logger.warning("ambient ASR temporary result cleanup failed path=%s", temporary.name)
 
     def _get_voice_runtime(self) -> VoiceRuntime:
         if self._voice_runtime is None:
@@ -583,6 +622,12 @@ class AmbientAudioRecordingService:
                 continue
             try:
                 completed = future.result()
+                archive = self._transcript_results[completed["audioFile"]]
+                archive.update(asrStatus="completed", saveStatus=completed["transcriptSaveStatus"],
+                               transcriptSegmentCount=completed["transcriptSegmentCount"])
+                if completed["transcriptSaveStatus"] == "failed":
+                    self._failed_transcript_saves += 1
+                    archive["errorCode"] = completed["transcriptSaveError"]
                 self._asr_progress[completed["source"]] = _parse_timestamp(completed["endedAt"])
                 self._buffered_segments.extend(completed.pop("segments"))
                 self._completed.append(completed)
@@ -593,7 +638,10 @@ class AmbientAudioRecordingService:
                     completed["transcriptSegmentCount"],
                 )
             except Exception:
-                failed_start = self._pending_batches[future].started_at
+                failed_batch = self._pending_batches[future]
+                self._transcript_results[failed_batch.path.name].update(
+                    asrStatus="failed", saveStatus="not_generated", errorCode="asr_failed")
+                failed_start = failed_batch.started_at
                 self._failed_until = min(self._failed_until, failed_start) if self._failed_until else failed_start
                 self._failed_batches += 1
                 self._logger.exception(
@@ -699,6 +747,7 @@ class AmbientAudioRecordingService:
             "stopping": bool(self._recording_id and self._stopping),
             "sources": list(self._tracks),
             "splitPolicy": "joint_silence",
+            "timelinePolicy": "sample_count",
             "pendingSplitAnalysis": len(self._split_pending),
             "tracks": {source: {
                 "sampleRate": track.sample_rate or 0,
@@ -706,6 +755,7 @@ class AmbientAudioRecordingService:
             } for source, track in self._tracks.items()},
             "pendingBatches": len(self._pending) + int(self._delivery_payload is not None),
             "failedBatches": self._failed_batches,
+            "failedTranscriptSaves": self._failed_transcript_saves,
             "memoryFinalized": self._memory_finalized,
             "completedBatches": completed,
         }
@@ -723,12 +773,15 @@ class AmbientAudioRecordingService:
             "asr_sample_rate": self._asr_sample_rate,
             "chunk_duration_seconds": self._chunk_duration_seconds,
             "split_policy": "joint_silence",
+            "timeline_policy": "sample_count",
             "split_silence_seconds": self._split_silence_seconds,
             "split_quiet_max_rms_dbfs": self._split_quiet_max_rms_dbfs,
             "shared_split_events": list(self._split_events),
             "stopping": self._stopping,
             "pending_batches": len(self._pending) + int(self._delivery_payload is not None),
             "failed_batches": self._failed_batches,
+            "failed_transcript_saves": self._failed_transcript_saves,
+            "transcripts": list(self._transcript_results.values()),
             "audio_files": list(self._audio_file_names),
         }
         target = self._manifest_path

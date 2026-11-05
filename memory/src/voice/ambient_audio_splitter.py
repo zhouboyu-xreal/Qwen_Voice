@@ -1,4 +1,7 @@
-"""Find shared quiet intervals using capture timestamps, never arrival order.
+"""Find shared quiet intervals on the recorder's sample-count timeline.
+
+The recorder supplies a common session origin plus each source's accumulated
+PCM duration; external packet timestamps and arrival delays do not define cuts.
 
 Only analysis copies are resampled. The recorder keeps every original PCM
 sample, including silence. This module runs on its own serial worker so VAD
