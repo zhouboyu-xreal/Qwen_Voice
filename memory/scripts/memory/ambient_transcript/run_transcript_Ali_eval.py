@@ -89,6 +89,7 @@ def main() -> None:
         task_scheduling_config,
         memory_manager_config,
         user_state_config,
+        logging_config,
     ) = split_memory_config(config)
     if args.disable_llm:
         llm_config["llm_api_key"] = ""
@@ -150,11 +151,7 @@ def main() -> None:
         source_segment_count,
         args.segment_limit,
     )
-    memory_log_path = output_dir / "memory_manager.log"
-    memory_logger, memory_log_handler = configure_memory_logger(
-        memory_log_path,
-        args.log_level,
-    )
+    memory_log_path = output_dir / "logs" / "memory_manager.log"
     db_path = output_dir / args.db_name
     memory_manager_config["user_memory_database_path"] = str(db_path)
     user_state_config["user_model_database_path"] = str(
@@ -184,7 +181,7 @@ def main() -> None:
         embedding_model_config=embedding_config,
         task_scheduling_config=task_scheduling_config,
         operation_reporter=operation_reporter,
-        logger=memory_logger,
+        logging_config={**logging_config, "directory": str((output_dir / "logs").resolve())},
     )
 
     input_report = pwm.accept_memory_input(
@@ -261,8 +258,6 @@ def main() -> None:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     logging.info("Wrote report: %s", report_path)
     pwm.close()
-    memory_logger.removeHandler(memory_log_handler)
-    memory_log_handler.close()
     print(json.dumps(report, ensure_ascii=False, indent=2))
 
 
@@ -307,24 +302,6 @@ def configure_logging(log_path: Path, log_level: str) -> None:
             logging.StreamHandler(),
         ],
     )
-
-
-def configure_memory_logger(
-    log_path: Path,
-    log_level: str,
-) -> Tuple[logging.Logger, logging.Handler]:
-    """Create a non-propagating logger for memory pipeline operations."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    memory_logger = logging.getLogger("memory.pipeline.ambient_transcript")
-    for existing_handler in list(memory_logger.handlers):
-        memory_logger.removeHandler(existing_handler)
-        existing_handler.close()
-    memory_logger.setLevel(getattr(logging, str(log_level or "INFO").upper(), logging.INFO))
-    memory_logger.propagate = False
-    handler = logging.FileHandler(log_path, encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    memory_logger.addHandler(handler)
-    return memory_logger, handler
 
 
 def parse_session_start(value: str) -> datetime:

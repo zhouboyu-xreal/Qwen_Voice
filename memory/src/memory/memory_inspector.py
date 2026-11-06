@@ -255,7 +255,7 @@ class MemoryInspector:
     @staticmethod
     def _record(row: dict[str, Any], section: str) -> dict[str, Any]:
         keys = ("id", "status", "confidence", "created_at", "updated_at")
-        extra = ("object_type", "summary", "primary_domain", "primary_entity_id", "time_start", "time_end") if section == "intents" else (
+        extra = ("object_type", "summary", "primary_domain", "world_owner_entity_id", "time_start", "time_end") if section == "intents" else (
             "state_domain", "state_type", "state_kind", "state_topic", "state_text", "valid_from", "valid_to", "last_observed_at",
         )
         item = {key: row.get(key) for key in (*keys, *extra)}
@@ -279,7 +279,7 @@ class MemoryInspector:
         result["evidence"] = self._page(connection, "memory_user_intent_evidence", "object_type=? AND object_id=?", (row["object_type"], row["id"]), evidence_page)
         result["history"] = self._page(connection, "memory_user_intent_events", "intent_id=?", (row["id"],), history_page)
         self._resolve_evidence(connection, result["evidence"]["items"])
-        entity = connection.execute("SELECT name FROM memory_entity_nodes WHERE id=?", (row["primary_entity_id"],)).fetchone()
+        entity = connection.execute("SELECT name FROM memory_entity_nodes WHERE id=?", (row["world_owner_entity_id"],)).fetchone()
         result["item"]["entity_name"] = entity[0] if entity else ""
         self._events(result["history"]["items"])
 

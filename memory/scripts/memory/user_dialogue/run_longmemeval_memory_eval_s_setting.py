@@ -274,7 +274,8 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config = split_memory_config(config)
+    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
@@ -627,7 +628,8 @@ def prepare_runtime_configs(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
+    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     recall_config = memory_manager_config.setdefault("recall", {})
     recall_config["recall_top_k"] = int(
         args.recall_top_k or recall_config.get("recall_top_k") or 8
@@ -1129,6 +1131,10 @@ def build_instance_memory_context(
             embedding_model_config=embedding_config,
             task_scheduling_config=task_scheduling_config,
             operation_reporter=operation_reporter,
+            logging_config={
+                **getattr(args, "_pwm_logging_config", {}),
+                "directory": str((question_state_dir / "logs").resolve()),
+            },
         )
         db = pwm.database
         manager = pwm.memory_manager

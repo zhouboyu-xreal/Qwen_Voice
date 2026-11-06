@@ -287,8 +287,8 @@ user_intent_signals rules:
 
 7. Entities, topics, and output fields
 - `fact_topic` names the specific aspect discussed by this fact and must be grounded in current evidence. Use a short, specific, searchable topic, not a broad domain, full factual sentence, action, one-off conclusion, emotion, or isolated keyword. Name it conservatively when evidence is limited.
-- `entities` preserves all directly relevant entities for retrieval. `primary_entity` is one object, the single entity mainly described, affected, or associated with the fact, and must come from entities. When context confirms a known or newly confirmed alias as the wearer, include both the mentioned name and user self; never merge a namesake. Keep third-party reports attributed, not rewritten as self-statements.
-- `primary_entity` is the main affiliation or retrieval entity, not the owner of every action, evaluation, or condition in the fact. Explicitly preserve the actual subjects in multi-subject content rather than transferring their circumstances to the primary entity.
+- `entities` preserves all directly relevant entities for retrieval. When context confirms a known or newly confirmed alias as the wearer, include both the mentioned name and user self; never merge a namesake. Keep third-party reports attributed, not rewritten as self-statements.
+- In multi-subject facts, explicitly identify the actual subject of each action, evaluation, or condition in the fact text. Speaking or participating in a discussion does not make someone the subject of other people's circumstances.
 - `fact_type` marks only the primary semantic role: preference, decision, request, recommendation, action, commitment, open_question, risk, error, context, instruction, or other. It neither determines personal-evidence retention nor whether a signal is emitted.
 - `keywords` are short retrieval terms for concrete entities, topics, actions, constraints, and key temporal/order anchors, typically short noun phrases or 2-8 Chinese characters. Do not use full sentences, pleasantries, or generic encouragement.
 The following entity guidance selects semantic anchors in already retained facts; it is not an additional long-term-value retention gate:
@@ -305,7 +305,6 @@ Return JSON only, without markdown or extra explanation. Keep this field structu
       "text": "self-contained factual narrative organized around one concrete issue, decision, or event rather than individual sentence excerpts, preserving actual subjects, content, and necessary background, time, conditions, and changes; no mandatory full-exchange retelling or invented missing elements",
       "keywords": ["keyword1", "keyword2"],
       "entities": [{"name": "entity name", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_entity": {"name": "the single primary entity of this fact", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_topic": "specific aspect discussed by this fact",
       "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "event_time_key": "real-world event occurrence time or representative temporal anchor derived from the dialogue time anchor and fact content; empty when it cannot be determined",
@@ -471,9 +470,10 @@ Express these decisions through save_new_intent, relations, and intent_updates, 
 Only propose evidence-supported decisions. Do not write to the database, predict user behavior, or generate user_state.
 
 2. Meaning of the inputs
-- candidates: the current batch of future_intent_candidates, indexed in their original order. Each candidate is a future goal, arrangement, or bounded responsibility extracted from a new fact. It is an unverified candidate, not an established intention or a mandatory new record; summary and details describe that future object.
+- candidates: the current batch of future_intent_candidates; candidate_index is its original zero-based position. subject_entity preserves the candidate's attributed subject name. Each candidate is a future goal, arrangement, or bounded responsibility extracted from a new fact. It is an unverified candidate, not an established intention or a mandatory new record; summary and details describe that future object.
 - existing_objects: existing intents retrieved for the same user. These are potentially related objects, not confirmed matches, and may be ongoing, blocked, completed, occurred, or cancelled.
-- Use only the candidates, existing objects, and accompanying source evidence actually provided. IDs such as evidence_fact_ids do not supply the contents of missing facts; do not reconstruct or invent facts from IDs.
+- Both new and existing objects use time_start and time_end; for a goal, time_end is its target time, and for a work_item it is the deadline. Type-specific business information appears only in details; plan locations use details.location_text. Omitted optional information means unknown or not provided, not cancelled or cleared.
+- Each candidate's facts retain the source id, summary, event_time, and dialogue_time. Use only the supplied candidates, existing objects, and accompanying evidence; do not reconstruct missing facts from IDs. event_time is when the event occurs; dialogue_time is when the statement was made. Do not confuse them.
 
 user_intent includes only three object types:
 - goal: a desired outcome the user continues to pursue, not a single action or vague wish.
@@ -499,7 +499,7 @@ relations is a list. Return [] when no reliable relationship exists; otherwise r
 - conflicts: new information conflicts with an identifiable existing intent, but replacement or current validity cannot be established. Return intent_updates=[] when there is insufficient evidence to adjudicate the conflict.
 
 Identity and relationship rules:
-1. Similar canonical_key values, topics, places, people, or keywords only help locate potential matches; they do not establish identity or replacement by themselves.
+1. Similar topics, places, people, or keywords only help locate potential matches; they do not establish identity or replacement by themselves.
 2. goal: the core subject and desired_outcome must be compatible and refer to the same ongoing desired result.
 3. plan: the core participants and event_or_activity must be compatible. Similar activities on different dates are normally separate arrangements. Relate them only when evidence explicitly describes rescheduling, supplementation, or adjustment of the original arrangement.
 4. work_item: the responsible person, core action_text, and deliverable must be compatible. Similar actions with different deliverables, responsibilities, or independent instances must not be merged.

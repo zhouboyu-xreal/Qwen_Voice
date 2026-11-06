@@ -252,34 +252,8 @@ def question_memory_logging(
     *,
     manager_log_level: str,
 ) -> Iterable[Tuple[Path, logging.Logger]]:
-    """Capture memory package logs for one benchmark instance.
-
-    The benchmark can run either in one process or multiple worker processes.
-    A per-question handler keeps MemoryNodeManager's internal logs next to that
-    question's database regardless of the execution mode.
-    """
-    question_state_dir.mkdir(parents=True, exist_ok=True)
-    log_path = question_state_dir / "memory_manager.log"
-    memory_logger = logging.getLogger(
-        f"memory.pipeline.longmemeval.{question_state_dir.name}"
-    )
-    manager_level = getattr(logging, str(manager_log_level).upper(), logging.INFO)
-    for existing_handler in list(memory_logger.handlers):
-        memory_logger.removeHandler(existing_handler)
-        existing_handler.close()
-
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setLevel(manager_level)
-    handler.setFormatter(formatter)
-    memory_logger.setLevel(manager_level)
-    memory_logger.addHandler(handler)
-    memory_logger.propagate = False
-    try:
-        yield log_path, memory_logger
-    finally:
-        memory_logger.removeHandler(handler)
-        handler.close()
+    """Expose the module log path; PWM owns handlers, benchmark logs use root."""
+    yield question_state_dir / "logs" / "memory_manager.log", logging.getLogger(__name__)
 
 
 def load_project_config(config_path: Path) -> Dict[str, Any]:
@@ -312,7 +286,8 @@ def _expand_env_refs(value: Any) -> Any:
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
-    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config = split_memory_config(config)
+    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     chat_config = config.get("chat", {}) if isinstance(config.get("chat"), dict) else {}
 
     args.llm_model = (
@@ -623,7 +598,8 @@ def prepare_runtime_configs(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
+    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     recall_config = memory_manager_config.setdefault("recall", {})
     recall_config["recall_top_k"] = int(
         args.recall_top_k or recall_config.get("recall_top_k") or 8
@@ -1145,7 +1121,7 @@ def build_instance_memory_context(
                 embedding_model_config=embedding_config,
                 task_scheduling_config=task_scheduling_config,
                 operation_reporter=operation_reporter,
-                logger=memory_logger,
+                logging_config={**getattr(args, "_pwm_logging_config", {}), "directory": str((question_state_dir / "logs").resolve())},
             )
             db = pwm.database
             manager = pwm.memory_manager

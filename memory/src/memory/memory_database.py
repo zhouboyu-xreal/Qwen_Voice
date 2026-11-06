@@ -644,7 +644,6 @@ class UserMemoryDB:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 object_type TEXT NOT NULL CHECK(object_type IN ('goal', 'plan', 'work_item')),
                 world_owner_entity_id INTEGER NOT NULL,
-                primary_entity_id INTEGER NOT NULL,
                 canonical_key TEXT NOT NULL,
                 summary TEXT NOT NULL,
                 primary_domain TEXT NOT NULL DEFAULT '',
@@ -656,8 +655,7 @@ class UserMemoryDB:
                 metadata TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                FOREIGN KEY(world_owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE,
-                FOREIGN KEY(primary_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
+                FOREIGN KEY(world_owner_entity_id) REFERENCES memory_entity_nodes(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS memory_user_intent_lifecycle_observations (
@@ -759,7 +757,7 @@ class UserMemoryDB:
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_owner_type_status
             ON memory_user_intent_items(world_owner_entity_id, object_type, status, updated_at DESC);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_items_primary_time
-            ON memory_user_intent_items(object_type, primary_entity_id, time_start, time_end);
+            ON memory_user_intent_items(object_type, world_owner_entity_id, time_start, time_end);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_evidence_object
             ON memory_user_intent_evidence(object_type, object_id, role);
             CREATE INDEX IF NOT EXISTS idx_memory_user_intent_events_intent
@@ -2385,7 +2383,7 @@ class UserMemoryDB:
         if normalized not in {"goal", "plan", "work_item"}:
             raise ValueError("object_type must be goal, plan, or work_item")
         return "memory_user_intent_items", (
-            "object_type", "world_owner_entity_id", "primary_entity_id",
+            "object_type", "world_owner_entity_id",
             "canonical_key", "summary", "primary_domain", "status",
             "time_start", "time_end", "confidence", "details", "metadata",
         )
@@ -2397,12 +2395,7 @@ class UserMemoryDB:
     ) -> Dict[str, Any]:
         """Map the typed manager payload onto the unified physical row."""
         normalized = str(object_type or "").strip().lower()
-        entity_field = {
-            "goal": "owner_entity_id",
-            "plan": "actor_entity_id",
-            "work_item": "responsible_entity_id",
-        }.get(normalized)
-        if not entity_field:
+        if normalized not in {"goal", "plan", "work_item"}:
             raise ValueError("object_type must be goal, plan, or work_item")
         details = dict(payload.get("details") or {}) if isinstance(payload.get("details"), dict) else {}
         if normalized == "goal":
@@ -2437,7 +2430,6 @@ class UserMemoryDB:
         return {
             "object_type": normalized,
             "world_owner_entity_id": payload.get("world_owner_entity_id"),
-            "primary_entity_id": payload.get(entity_field),
             "canonical_key": payload.get("canonical_key"),
             "summary": payload.get("summary"),
             "primary_domain": payload.get("primary_domain"),
@@ -2459,17 +2451,16 @@ class UserMemoryDB:
         item["metadata"] = metadata if isinstance(metadata, dict) else {}
         object_type = str(item.get("object_type") or "")
         item["world_owner_entity_id"] = int(item.get("world_owner_entity_id") or 0)
-        item["primary_entity_id"] = int(item.get("primary_entity_id") or 0)
         if object_type == "goal":
             item.update(
-                owner_entity_id=item["primary_entity_id"],
+                owner_entity_id=item["world_owner_entity_id"],
                 desired_outcome=details.get("desired_outcome") or "",
                 success_criteria=details.get("success_criteria") or "",
                 target_at=details.get("target_at") or item.get("time_end") or "",
             )
         elif object_type == "plan":
             item.update(
-                actor_entity_id=item["primary_entity_id"],
+                actor_entity_id=item["world_owner_entity_id"],
                 event_or_activity=details.get("event_or_activity") or "",
                 start_at=item.get("time_start") or "",
                 end_at=item.get("time_end") or "",
@@ -2479,7 +2470,7 @@ class UserMemoryDB:
             )
         elif object_type == "work_item":
             item.update(
-                responsible_entity_id=item["primary_entity_id"],
+                responsible_entity_id=item["world_owner_entity_id"],
                 action_text=details.get("action_text") or "",
                 deliverable=details.get("deliverable") or "",
                 responsibility_type=details.get("responsibility_type") or "personal_action",

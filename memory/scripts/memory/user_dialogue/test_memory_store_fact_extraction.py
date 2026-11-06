@@ -366,7 +366,8 @@ def remove_existing_outputs(db_path: Path, report_path: Path, overwrite: bool) -
 
 def resolve_llm_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
-    llm_config, _embedding_config, _runtime_config, _scheduling_config, _manager_config, _user_state_config = split_memory_config(config)
+    llm_config, _embedding_config, _runtime_config, _scheduling_config, _manager_config, _user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     memory_input_config = _runtime_config.get("memory_context_manager")
     if not isinstance(memory_input_config, dict):
         memory_input_config = {}
@@ -423,31 +424,6 @@ def configure_logging(log_path: Path, log_level: str, manager_log_level: str) ->
     stream_handler = logging.StreamHandler()
     stream_handler.setFormatter(formatter)
     root.addHandler(stream_handler)
-def configure_memory_logger(
-    log_path: Path,
-    manager_log_level: str,
-) -> Tuple[logging.Logger, logging.Handler]:
-    """Create a non-propagating logger for memory pipeline operations."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    memory_logger = logging.getLogger("memory.pipeline.store_fact_test")
-    for existing_handler in list(memory_logger.handlers):
-        memory_logger.removeHandler(existing_handler)
-        existing_handler.close()
-    memory_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
-    memory_logger.propagate = False
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    memory_logger.addHandler(handler)
-    return memory_logger, handler
-
-
-def close_memory_logger(
-    memory_logger: logging.Logger,
-    handler: logging.Handler,
-) -> None:
-    """Close the dedicated memory pipeline logger."""
-    memory_logger.removeHandler(handler)
-    handler.close()
 
 
 def _configured_embedding_api_key_env(embedding_config: Dict[str, Any]) -> str:
@@ -553,6 +529,7 @@ def main() -> int:
         task_scheduling_config,
         memory_manager_config,
         user_state_config,
+        logging_config,
     ) = split_memory_config(config)
     memory_manager_config["user_memory_database_path"] = str(db_path)
     user_state_config["user_model_database_path"] = str(
@@ -573,11 +550,7 @@ def main() -> int:
     llm_config["llm_thinking"] = args.llm_thinking
     llm_config["llm_json_mode"] = args.llm_json_mode
     memory_manager_config["enable_entity_extraction"] = False
-    memory_log_path = args.output_dir / "memory_manager.log"
-    memory_logger, memory_log_handler = configure_memory_logger(
-        memory_log_path,
-        args.manager_log_level,
-    )
+    memory_log_path = args.output_dir / "logs" / "memory_manager.log"
     operation_reporter = TaskOperationReporter()
     pwm = PersonWorldModel(
         memory_runtime_config=memory_runtime_config,
@@ -587,7 +560,7 @@ def main() -> int:
         embedding_model_config=embedding_config,
         task_scheduling_config=task_scheduling_config,
         operation_reporter=operation_reporter,
-        logger=memory_logger,
+        logging_config={**logging_config, "directory": str((args.output_dir / "logs").resolve())},
     )
     db = pwm.database
     manager = pwm.memory_manager
@@ -596,7 +569,6 @@ def main() -> int:
         log_memory_index_state(db, "initialized")
     except Exception:
         pwm.close()
-        close_memory_logger(memory_logger, memory_log_handler)
         raise
 
     stored_turns = 0
@@ -670,7 +642,6 @@ def main() -> int:
     finally:
         log_memory_index_state(db, "finished")
         pwm.close()
-        close_memory_logger(memory_logger, memory_log_handler)
 
     memory_operation_report = operation_reporter.snapshot()
     operation_counts = memory_operation_report.get("counts") or {}

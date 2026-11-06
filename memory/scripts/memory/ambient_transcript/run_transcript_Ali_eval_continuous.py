@@ -28,13 +28,8 @@ from config import split_memory_config
 from pwm_manager import PersonWorldModel
 from task_scheduler import TaskOperationReporter
 from run_transcript_Ali_eval import (
-    TextGridSegment,
-    configure_logging,
-    configure_memory_logger,
-    load_textgrid_segments,
-    parse_session_start,
-    textgrid_segment_to_memory_segment,
-    write_transcript_txt,
+    TextGridSegment, configure_logging, load_textgrid_segments, parse_session_start,
+    textgrid_segment_to_memory_segment, write_transcript_txt,
 )
 
 
@@ -202,9 +197,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sections.memory_manager["user_memory_database_path"] = str(output_dir / "memory.db")
     sections.user_state["user_model_database_path"] = str(output_dir / "user_model.db")
 
-    memory_logger, memory_log_handler = configure_memory_logger(
-        output_dir / "memory_manager.log", args.log_level
-    )
     reporter = TaskOperationReporter(recent_task_limit=10000)
     pwm: Optional[PersonWorldModel] = None
     results: List[Dict[str, Any]] = []
@@ -221,7 +213,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             embedding_model_config=sections.embedding_model,
             task_scheduling_config=sections.task_scheduling,
             operation_reporter=reporter,
-            logger=memory_logger,
+            logging_config={**sections.logging, "directory": str((output_dir / "logs").resolve())},
         )
         for file_index, path in enumerate(files, 1):
             source_segments = load_textgrid_segments(path)
@@ -323,12 +315,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
     finally:
-        try:
-            if pwm is not None:
-                pwm.close()
-        finally:
-            memory_logger.removeHandler(memory_log_handler)
-            memory_log_handler.close()
+        if pwm is not None:
+            pwm.close()
 
 
 if __name__ == "__main__":

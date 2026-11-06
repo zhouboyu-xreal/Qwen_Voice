@@ -40,13 +40,9 @@ from pwm_manager import PersonWorldModel
 from task_scheduler import TaskOperationReporter
 
 try:  # Support both direct CLI execution and package imports in tests.
-    from .run_transcript_Ali_eval import (
-        configure_logging, configure_memory_logger, write_transcript_txt,
-    )
+    from .run_transcript_Ali_eval import (configure_logging, write_transcript_txt)
 except ImportError:
-    from run_transcript_Ali_eval import (
-        configure_logging, configure_memory_logger, write_transcript_txt,
-    )
+    from run_transcript_Ali_eval import (configure_logging, write_transcript_txt)
 
 
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "tmp/ambient_transcript/feishu_meeting"
@@ -250,7 +246,6 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
     for key, value in (("llm_name", args.llm_model), ("llm_base_url", args.llm_base_url)):
         if value is not None:
             sections.llm_model[key] = value
-    logger, handler = configure_memory_logger(output_dir / "memory_manager.log", args.log_level)
     reporter = TaskOperationReporter(recent_task_limit=10000)
     pwm = None
     meeting_reports = [
@@ -277,7 +272,8 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
             llm_model_config=sections.llm_model,
             embedding_model_config=sections.embedding_model,
             task_scheduling_config=sections.task_scheduling,
-            operation_reporter=reporter, logger=logger,
+            operation_reporter=reporter,
+            logging_config={**sections.logging, "directory": str((output_dir / "logs").resolve())},
         )
         register_test_owner(pwm, meetings[0]["owner_name"])
         for index, (meeting, meeting_report) in enumerate(zip(meetings, meeting_reports), 1):
@@ -321,8 +317,6 @@ def run_extraction(args: argparse.Namespace, meetings: Sequence[Dict[str, Any]],
                         report[key] = meeting_reports[0][key]
             report["operations"] = reporter.snapshot()
             write_json(output_dir / "report.json", report)
-            logger.removeHandler(handler)
-            handler.close()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

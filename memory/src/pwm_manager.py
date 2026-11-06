@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from llm_client import LLMClient
+from pwm_logging import PWMLoggingManager
 from memory.memory_database import UserMemoryDB
 from memory.memory_manager import MemoryNodeManager
 from memory.memory_runtime import MemoryRuntime
@@ -31,8 +32,8 @@ class PersonWorldModel:
         task_scheduling_config: Dict[str, Any],
         operation_reporter: Optional[TaskOperationReporter] = None,
         logger: Optional[logging.Logger] = None,
+        logging_config: Optional[Dict[str, Any]] = None,
     ) -> None:
-        self._logger = logger or logging.getLogger(__name__)
         runtime_config = dict(memory_runtime_config)
         manager_config = dict(memory_manager_config)
         llm_config = dict(llm_model_config)
@@ -52,20 +53,25 @@ class PersonWorldModel:
         model_db_path = Path(user_model_db_value).expanduser().resolve()
         if model_db_path == memory_db_path:
             raise ValueError("User memory and user model database paths must be distinct")
+        self._logging_manager = PWMLoggingManager(
+            memory_db_path=memory_db_path, config=logging_config,
+        )
+        # An injected application logger overrides only PWM lifecycle messages.
+        self._logger = logger or self._logging_manager.get_logger("pwm")
         self._operation_reporter = operation_reporter or TaskOperationReporter()
-        self._user_memory_database = UserMemoryDB(memory_db_path)
         try:
+            self._user_memory_database = UserMemoryDB(memory_db_path)
             self._user_model_database = UserModelDB(model_db_path)
             self._llm_client = LLMClient(
                 memory_config={"llm": llm_config},
-                logger=self._logger.getChild("llm_client"),
+                logger=self._logging_manager.get_logger("llm_client"),
             )
             # Both memory and user-state handlers are registered before the
             # shared worker starts processing its FIFO.
             self._task_scheduler = TaskScheduler(
                 operation_reporter=self._operation_reporter,
                 maxsize=int(scheduler_config.get("task_queue_maxsize", 100) or 100),
-                logger=self._logger.getChild("task_scheduler"),
+                logger=self._logging_manager.get_logger("task_scheduler"),
                 claim_state_database=self._user_memory_database,
                 task_scheduling_config=scheduler_config,
                 memory_enabled=manager_config.get("memory_enabled", True),
@@ -78,7 +84,8 @@ class PersonWorldModel:
                 memory_runtime_config=runtime_config,
                 memory_manager_config=manager_config,
                 embedding_config=embedding_config,
-                logger=self._logger.getChild("memory_runtime"),
+                logger=self._logging_manager.get_logger("memory_runtime"),
+                memory_manager_logger=self._logging_manager.get_logger("memory_manager"),
             )
             self._user_state_resolver = UserStateResolver(
                 memory_db=self._user_memory_database,
@@ -89,7 +96,7 @@ class PersonWorldModel:
                 world_owner_entity_name=(
                     self._memory_runtime.manager.world_owner_entity_name
                 ),
-                logger=self._logger.getChild("user_state_resolver"),
+                logger=self._logging_manager.get_logger("user_state"),
             )
             self._user_prediction = UserPrediction(
                 db=self._user_memory_database,
@@ -99,7 +106,7 @@ class PersonWorldModel:
                 world_owner_entity_name=(
                     self._memory_runtime.manager.world_owner_entity_name
                 ),
-                logger=self._logger.getChild("user_prediction"),
+                logger=self._logging_manager.get_logger("user_prediction"),
             )
             self._user_proactive_service = UserProactiveService(
                 memory_db=self._user_memory_database,
@@ -108,19 +115,29 @@ class PersonWorldModel:
                 task_scheduler=self._task_scheduler,
                 llm_client=self._llm_client,
                 world_owner_entity_name=self._memory_runtime.manager.world_owner_entity_name,
-                logger=self._logger.getChild("user_proactive_service"),
+                logger=self._logging_manager.get_logger("user_proactive_service"),
             )
             self._memory_runtime.manager.initialize_embedding_cache()
             self._task_scheduler.start()
         except Exception:
-            if hasattr(self, "_task_scheduler"):
-                self._task_scheduler.shutdown(wait=True, timeout=0)
-            if hasattr(self, "_user_model_database"):
-                self._user_model_database.close()
-            self._user_memory_database.close()
+            self._logger.exception("PWM initialization failed")
+            try:
+                if hasattr(self, "_task_scheduler"):
+                    self._task_scheduler.shutdown(wait=True, timeout=0)
+                if hasattr(self, "_user_model_database"):
+                    self._user_model_database.close()
+                if hasattr(self, "_user_memory_database"):
+                    self._user_memory_database.close()
+            finally:
+                self._logging_manager.close()
             raise
         self._closed = False
         self._memory_inputs_need_flush = False
+        self._logger.info("PWM initialized log_directory=%s", self._logging_manager.directory)
+
+    @property
+    def log_directory(self) -> Path:
+        return self._logging_manager.directory
 
     @property
     def memory_runtime(self) -> MemoryRuntime:
@@ -313,6 +330,10 @@ class PersonWorldModel:
             safe_to_close_database = True
         finally:
             if safe_to_close_database:
-                self._user_model_database.close()
-                self._user_memory_database.close()
-                self._closed = True
+                try:
+                    self._user_model_database.close()
+                    self._user_memory_database.close()
+                    self._closed = True
+                    self._logger.info("PWM closed")
+                finally:
+                    self._logging_manager.close()

@@ -27,6 +27,7 @@ class PersonalWorldModelConfig(NamedTuple):
     task_scheduling: Dict[str, Any]
     memory_manager: Dict[str, Any]
     user_state: Dict[str, Any]
+    logging: Dict[str, Any]
 
 
 def _default_config_path() -> Path:
@@ -125,6 +126,10 @@ def split_memory_config(
                 f"personal_world_model.{module_name} must be a mapping"
             )
         modules[module_name] = deepcopy(value)
+    logging_config = pwm_config.get("logging", {})
+    if not isinstance(logging_config, dict):
+        raise ValueError("personal_world_model.logging must be a mapping")
+    modules["logging"] = deepcopy(logging_config)
     return PersonalWorldModelConfig(**modules)
 
 

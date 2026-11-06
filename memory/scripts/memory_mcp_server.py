@@ -200,6 +200,7 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
         task_scheduling_config,
         memory_manager_config,
         user_state_config,
+        logging_config,
     ) = split_memory_config(config)
     memory_manager_config["user_memory_database_path"] = str(db_path)
     user_state_config["user_model_database_path"] = str(
@@ -225,7 +226,6 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
         asr_result_dir,
     )
     try:
-        person_world_model_logger = logger.getChild("person_world_model")
         person_world_model = PersonWorldModel(
             memory_runtime_config=memory_runtime_config,
             memory_manager_config=memory_manager_config,
@@ -233,8 +233,9 @@ def build_service(config_source: Any = None) -> tuple[MemoryMCPService, logging.
             llm_model_config=llm_model_config,
             embedding_model_config=embedding_model_config,
             task_scheduling_config=task_scheduling_config,
-            logger=person_world_model_logger,
+            logging_config=logging_config,
         )
+        logger.info("PWM module logs directory=%s", person_world_model.log_directory)
         voice_logger = logger.getChild("voice_runtime")
 
         def build_voice_runtime() -> VoiceRuntime:

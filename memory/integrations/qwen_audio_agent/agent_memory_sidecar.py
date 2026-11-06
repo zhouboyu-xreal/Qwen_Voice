@@ -138,6 +138,7 @@ class AgentMemoryRuntime:
         embedding_model_config: Dict[str, Any],
         task_scheduling_config: Dict[str, Any],
         logger: logging.Logger,
+        logging_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._state_dir = state_dir.resolve()
         self._owner_dir = self._state_dir / "owners"
@@ -148,6 +149,7 @@ class AgentMemoryRuntime:
         self._llm_config = dict(llm_model_config)
         self._embedding_config = dict(embedding_model_config)
         self._task_scheduling_config = dict(task_scheduling_config)
+        self._logging_config = dict(logging_config or {})
         self._logger = logger
         self._owners: Dict[str, OwnerRuntime] = {}
         self._operation_lock = threading.RLock()
@@ -266,8 +268,9 @@ class AgentMemoryRuntime:
             embedding_model_config=self._embedding_config,
             task_scheduling_config=self._task_scheduling_config,
             operation_reporter=TaskOperationReporter(recent_task_limit=10000),
-            logger=self._logger.getChild(f"owner.{key[:12]}"),
+            logging_config=self._logging_config,
         )
+        self._logger.info("owner PWM initialized owner=%s log_directory=%s", key, pwm.log_directory)
         created = OwnerRuntime(
             pwm=pwm,
             seen_path=seen_path,
@@ -814,6 +817,7 @@ def main() -> int:
         task_scheduling_config,
         manager_config,
         user_state_config,
+        logging_config,
     ) = split_memory_config(config)
     memory_service = AgentMemoryRuntime(
         state_dir=state_dir,
@@ -824,6 +828,7 @@ def main() -> int:
         embedding_model_config=embedding_config,
         task_scheduling_config=task_scheduling_config,
         logger=logger,
+        logging_config=logging_config,
     )
     ipc_server = _LocalTranscriptIpcServer(
         path=(args.ipc_socket or state_dir / "agent-memory-transcript.sock"),

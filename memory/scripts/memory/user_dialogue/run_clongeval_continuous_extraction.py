@@ -35,10 +35,7 @@ from config import split_memory_config
 from pwm_manager import PersonWorldModel
 from task_scheduler import TaskOperationReporter
 from scripts.memory.user_dialogue.run_clongeval_conversation import (
-    configure_memory_logger,
-    normalize_unique_timestamp,
-    parse_context_days,
-    remove_memory_logger_handler,
+    normalize_unique_timestamp, parse_context_days,
 )
 from scripts.memory.user_dialogue.test_memory_store_fact_extraction import (
     configure_logging,
@@ -402,10 +399,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     manager_config["user_memory_database_path"] = str(output_dir / "memory.db")
     state_config["user_model_database_path"] = str(output_dir / "user_model.db")
 
-    memory_logger, memory_log_handler = configure_memory_logger(
-        output_dir / "memory.log", args.manager_log_level,
-        "memory.pipeline.clongeval_continuous",
-    )
     # Retain rejection reasons across several contexts for accurate diagnostics.
     reporter = TaskOperationReporter(recent_task_limit=10000)
     pwm: Optional[PersonWorldModel] = None
@@ -420,7 +413,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             embedding_model_config=embedding_config,
             task_scheduling_config=scheduler_config,
             operation_reporter=reporter,
-            logger=memory_logger,
+            logging_config={**sections.logging, "directory": str((output_dir / "logs").resolve())},
         )
         if not args.skip_embedding_validation:
             validate_embedding_runtime(pwm.memory_manager, pwm.database, embedding_config)
@@ -498,11 +491,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 0
     finally:
-        try:
-            if pwm is not None:
-                pwm.close()
-        finally:
-            remove_memory_logger_handler(memory_logger, memory_log_handler)
+        if pwm is not None:
+            pwm.close()
 
 
 if __name__ == "__main__":

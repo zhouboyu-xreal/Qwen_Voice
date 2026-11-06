@@ -469,7 +469,9 @@ def prepare_runtime(
         task_scheduling_config,
         memory_manager_config,
         user_state_config,
+        logging_config,
     ) = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     if args.llm_thinking is None:
         args.llm_thinking = str(llm_config.get("llm_thinking") or "disabled")
     if args.llm_json_mode is None:
@@ -551,39 +553,6 @@ def remove_context_log_handler(handler: Optional[logging.Handler]) -> None:
     handler.close()
 
 
-def configure_memory_logger(
-    log_path: Path,
-    log_level: str,
-    logger_name: str,
-) -> Tuple[logging.Logger, logging.Handler]:
-    """Create a non-propagating logger dedicated to memory operations."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    memory_logger = logging.getLogger(logger_name)
-    for existing_handler in list(memory_logger.handlers):
-        memory_logger.removeHandler(existing_handler)
-        existing_handler.close()
-    memory_logger.setLevel(getattr(logging, str(log_level).upper(), logging.INFO))
-    memory_logger.propagate = False
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setLevel(logging.NOTSET)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    memory_logger.addHandler(handler)
-    return memory_logger, handler
-
-
-def remove_memory_logger_handler(
-    memory_logger: Optional[logging.Logger],
-    handler: Optional[logging.Handler],
-) -> None:
-    """Close a context-specific memory logger without affecting root logging."""
-    if memory_logger is None or handler is None:
-        return
-    memory_logger.removeHandler(handler)
-    handler.close()
-
-
 def configure_worker_logging(
     log_path: Path,
     log_level: str,
@@ -661,16 +630,9 @@ def process_context_group(
     )
     days = [] if reused_existing_db else parse_context_days(context)
     context_log_handler = add_context_log_handler(context_log_path)
-    memory_logger: Optional[logging.Logger] = None
-    memory_log_handler: Optional[logging.Handler] = None
     pwm: Optional[PersonWorldModel] = None
     results: List[Dict[str, Any]] = []
     try:
-        memory_logger, memory_log_handler = configure_memory_logger(
-            group_dir / "memory.log",
-            args.manager_log_level,
-            f"memory.pipeline.{group_id}",
-        )
         logging.info(
             "Context processing started id=%s records=%s parsed_days=%s "
             "reused_existing_db=%s db_path=%s",
@@ -689,7 +651,7 @@ def process_context_group(
             embedding_model_config=embedding_config,
             task_scheduling_config=task_scheduling_config,
             operation_reporter=operation_reporter,
-            logger=memory_logger,
+            logging_config={**getattr(args, "_pwm_logging_config", {}), "directory": str((group_dir / "logs").resolve())},
         )
         db = pwm.database
         manager = pwm.memory_manager
@@ -821,7 +783,6 @@ def process_context_group(
         if pwm is not None:
             log_memory_index_state(pwm.database, f"finished_context:{group_id}")
             pwm.close()
-        remove_memory_logger_handler(memory_logger, memory_log_handler)
         remove_context_log_handler(context_log_handler)
 
 

@@ -130,7 +130,6 @@ class UserPrediction:
             raise ValueError("Prediction event references a missing intent")
         if any(
             int(intent.get("world_owner_entity_id") or 0) != owner_id
-            or int(intent.get("primary_entity_id") or 0) != owner_id
             for intent in rows
         ):
             raise ValueError("Prediction events must refer to the world owner's intents")
@@ -731,8 +730,7 @@ class UserPrediction:
                 object_type=intent_type, object_id=intent_id,
             )
             if (not intent or intent.get("status") not in self.ACTIVE_INTENT_STATUSES.get(intent_type, set())
-                    or int(intent.get("world_owner_entity_id") or 0) != owner_id
-                    or int(intent.get("primary_entity_id") or 0) != owner_id):
+                    or int(intent.get("world_owner_entity_id") or 0) != owner_id):
                 self._log_event("active_prediction_skipped", {
                     "prediction_id": row["id"], "intent_id": intent_id,
                     "reason": "source_intent_missing_inactive_or_foreign",

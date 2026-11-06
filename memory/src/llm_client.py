@@ -92,6 +92,10 @@ class LLMClient:
         call_id = uuid.uuid4().hex[:12]
         call_started_at = time.monotonic()
         request_number = 0
+        self._logger.debug(
+            "LLM prompt stage_name=%s call_id=%s prompt_chars=%s\n%s",
+            stage_name, call_id, len(prompt), prompt,
+        )
         for item in attempts:
             marker = json.dumps(sorted(item.keys()), ensure_ascii=False)
             if marker in seen:

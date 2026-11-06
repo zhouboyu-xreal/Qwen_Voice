@@ -59,6 +59,7 @@ class MemoryRuntime:
         memory_manager_config: Optional[Dict[str, Any]] = None,
         embedding_config: Optional[Dict[str, Any]] = None,
         logger: Optional[logging.Logger] = None,
+        memory_manager_logger: Optional[logging.Logger] = None,
     ) -> None:
         """Initialize input batching around already-composed shared resources."""
         self._logger = logger or logging.getLogger(__name__)
@@ -68,7 +69,7 @@ class MemoryRuntime:
             raise ValueError("Injected database path does not match db_path")
         resolved_embedding_config = dict(embedding_config or {})
 
-        manager_logger = self._logger.getChild("memory_manager")
+        manager_logger = memory_manager_logger or logging.getLogger("memory.memory_manager")
         self._llm_client = llm_client
         self._task_scheduler = task_scheduler
         manager = MemoryNodeManager(

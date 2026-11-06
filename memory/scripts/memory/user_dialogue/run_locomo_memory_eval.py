@@ -164,25 +164,8 @@ def sample_memory_logging(
     sample_state_dir: Path,
     manager_log_level: str,
 ) -> Iterator[Tuple[Path, logging.Logger]]:
-    """Write memory pipeline logs beside one LoCoMo sample database."""
-    sample_state_dir.mkdir(parents=True, exist_ok=True)
-    log_path = sample_state_dir / "memory_manager.log"
-    memory_logger = logging.getLogger(
-        f"memory.pipeline.locomo.{sample_state_dir.name}"
-    )
-    for existing_handler in list(memory_logger.handlers):
-        memory_logger.removeHandler(existing_handler)
-        existing_handler.close()
-    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    memory_logger.addHandler(handler)
-    memory_logger.setLevel(getattr(logging, str(manager_log_level).upper(), logging.INFO))
-    memory_logger.propagate = False
-    try:
-        yield log_path, memory_logger
-    finally:
-        memory_logger.removeHandler(handler)
-        handler.close()
+    """Expose the module log path; PWM owns handlers, benchmark logs use root."""
+    yield sample_state_dir / "logs" / "memory_manager.log", logging.getLogger(__name__)
 
 
 def _expand_env_refs(value: Any) -> Any:
@@ -210,7 +193,8 @@ def load_project_config(config_path: Path) -> Dict[str, Any]:
 def resolve_runtime_args(args: argparse.Namespace) -> None:
     config = load_project_config(args.config)
     model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
-    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config = split_memory_config(config)
+    llm_config, _embedding_config, runtime_config, _scheduling_config, manager_config, _user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     chat_config = config.get("chat") if isinstance(config.get("chat"), dict) else {}
     args.llm_model = args.llm_model or str(llm_config.get("llm_name") or model_config.get("default") or DEFAULT_LLM_MODEL)
     args.llm_base_url = args.llm_base_url or str(llm_config.get("llm_base_url") or model_config.get("base_url") or DEFAULT_LLM_BASE_URL)
@@ -245,7 +229,8 @@ def prepare_runtime_configs(
     args: argparse.Namespace,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     config = load_project_config(args.config)
-    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config = split_memory_config(config)
+    llm_config, embedding_config, memory_runtime_config, task_scheduling_config, memory_manager_config, user_state_config, logging_config = split_memory_config(config)
+    args._pwm_logging_config = logging_config
     recall_config = memory_manager_config.setdefault("recall", {})
     recall_config["recall_top_k"] = int(
         args.recall_top_k or recall_config.get("recall_top_k") or 8
@@ -492,7 +477,7 @@ def build_sample_memory_context(
                 embedding_model_config=embedding_config,
                 task_scheduling_config=task_scheduling_config,
                 operation_reporter=operation_reporter,
-                logger=memory_logger,
+                logging_config={**getattr(args, "_pwm_logging_config", {}), "directory": str((sample_state_dir / "logs").resolve())},
             )
             db = pwm.database
             manager = pwm.memory_manager

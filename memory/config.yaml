@@ -139,6 +139,29 @@ memory_mcp_server:
   queue_timeout: 30.0
 
 personal_world_model:
+  logging:
+    directory: null  # 默认 memory.db 同目录下的 logs/；相对路径以数据库目录为基准
+    level: INFO
+    console_enabled: false  # 启用时输出到 stderr，不占用 sidecar 的 stdout 协议
+    max_bytes: 20971520
+    backup_count: 5
+    modules:
+      pwm:
+        filename: pwm.log
+      memory_runtime:
+        filename: memory_runtime.log
+      memory_manager:
+        filename: memory_manager.log
+      user_state:
+        filename: user_state.log
+      user_prediction:
+        filename: user_prediction.log
+      user_proactive_service:
+        filename: user_proactive_service.log
+      task_scheduler:
+        filename: task_scheduler.log
+      llm_client:
+        filename: llm_client.log
   llm_model:
     llm_provider: deepseek
     llm_name: deepseek-v4-flash

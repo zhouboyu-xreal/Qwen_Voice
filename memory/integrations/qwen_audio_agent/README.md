@@ -39,6 +39,12 @@ Sidecar 默认追加运行日志到
 `<AGENT_MEMORY_STATE_DIR>/agent-memory-sidecar.log`；可直接传入
 `--log-path` 覆盖。日志不写入对话正文，仅包含请求数量、任务提交结果、召回字符数和异常。
 
+PWM 各模块的详细日志已独立存放在
+`<AGENT_MEMORY_STATE_DIR>/owners/<owner_key>/logs/`，包括 `memory_runtime.log`、
+`memory_manager.log`、`user_state.log`、`task_scheduler.log`、`llm_client.log` 等。
+通过 `config.yaml` 的 `personal_world_model.logging.modules` 单独设置级别、文件名、
+开关和轮转；详见 [PWM 日志配置](../../LOGGING.md)。详细模块日志可能包含对话正文和个人信息。
+
 ## 生命周期
 
 当前版本实现 qwen-audio-agent `MemoryProvider` v2 的 session-observation 路径：

@@ -312,8 +312,8 @@ user_intent_signals 输出规则：
 
 七、实体、主题与输出字段
 - `fact_topic` 表示当前 fact 讨论的具体方面，必须由本次证据支持。使用简短、具体、可检索的主题名称，不要使用泛领域、完整事实句子、动作、一次性结论、情绪或零散关键词；没有充分依据时保守命名。
-- `entities` 保留所有与 fact 直接相关的实体，用于完整召回；`primary_entity` 表示这条 fact 主要描述、影响或归属的单一实体，必须来自 `entities`。当语境能确认已知别名或本次确认的新别名指向佩戴者时，同时保留原文人名和“用户本人”；同名第三人不能归并。第三方报告仍须保留来源，不能改写为本人自述。
-- `primary_entity` 是主要归属或检索实体，不代表 fact 中每项行为、评价或状态都属于它；多主体内容须分别表达实际主体，不能因为选定一个 primary_entity 就转移其他人的情况。
+- `entities` 保留所有与 fact 直接相关的实体，用于完整召回。当语境能确认已知别名或本次确认的新别名指向佩戴者时，同时保留原文人名和“用户本人”；同名第三人不能归并。第三方报告仍须保留来源，不能改写为本人自述。
+- 多主体内容须在 fact 正文中分别表达每项行为、评价或状态的实际主体，不能因为某人发言或参与讨论，就将其他人的情况归到其身上。
 - `fact_type` 只标记主要语义作用：preference、decision、request、recommendation、action、commitment、open_question、risk、error、context、instruction、other；它不是个人信息的保存资格，也不决定 signal 是否输出。
 - `keywords` 是简短检索词，保留具体实体、主题、行为、约束及关键时间/顺序锚，通常每个词为 2-8 个汉字或短英文短语。不要使用完整句子、寒暄或泛化鼓励语。
 下列实体规则只用于选择已保留 fact 的语义锚点，不是额外的长期价值筛选门槛：
@@ -330,7 +330,6 @@ user_intent_signals 输出规则：
       "text": "围绕同一具体问题、决定或事件组织的自包含事实叙事，而非逐句摘录；保留实际主体、具体内容及必要背景、时间、条件与变化，不强制复述整个exchange，不补造缺失环节",
       "keywords": ["关键词1", "关键词2"],
       "entities": [{"name": "实体名", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"}],
-      "primary_entity": {"name": "这条 fact 主要描述、影响或归属的单一实体", "type": "PERSON|ORGANIZATION|LOCATION|PRODUCT|PROJECT|TECHNOLOGY|CONCEPT|TOPIC|PREFERENCE|OTHER"},
       "fact_topic": "当前 fact 讨论的具体方面",
       "fact_type": "preference|decision|request|recommendation|action|commitment|open_question|risk|error|context|instruction|other",
       "event_time_key": "根据对话时间锚点和 fact 内容推导出的事件实际发生时间或代表性时间锚点；无法判断时为空字符串",
@@ -498,9 +497,10 @@ INTENT_RECONCILIATION_PROMPT_ZH = """你是个人世界模型的 user_intent 保
 本模块只提出有证据支持的裁决，不执行数据库写入，不预测用户行为，也不生成 user_state。
 
 二、输入的含义
-- candidates：本批待裁决的 future_intent_candidates 列表，按原始顺序编号。每个 candidate 都是从新 fact 提炼的未来目标、安排或有界责任，只是待核验候选，不代表它已经成立或必须新增保存；summary 和 details 描述该未来对象。
+- candidates：本批待裁决的 future_intent_candidates 列表，candidate_index 是从 0 开始的原始位置。subject_entity 保留候选归属的主体名称；每个 candidate 都是从新 fact 提炼的未来目标、安排或有界责任，只是待核验候选，不代表它已经成立或必须新增保存；summary 和 details 描述该未来对象。
 - existing_objects：同一用户下检索到的已有 intent。它们是相关候选，不是已经确认的目标，可能处于进行中、受阻、完成、发生或取消等状态。
-- 只能使用实际输入的候选、旧对象及随附来源证据。evidence_fact_ids 等 ID 不代表未提供的事实内容，不得依据 ID 补全或臆测事实。
+- 新旧对象统一使用 time_start、time_end；goal 的 time_end 表示目标时间，work_item 的 time_end 表示截止时间。类型专属业务信息只放在 details，plan 的地点统一为 details.location_text；省略的可选信息表示未知或未提供，不表示已取消或已清空。
+- 每个 candidate 的 facts 保留来源事实的 id、summary、event_time 和 dialogue_time。只能使用实际输入的候选、旧对象及随附来源证据，不能依据 ID 补全或臆测未提供的事实；event_time 是事件时间，dialogue_time 是陈述时间，两者不可混淆。
 
 user_intent 只包括三种对象：
 - goal：用户持续追求的期望结果，不等于单次动作或泛泛愿望。
@@ -526,7 +526,7 @@ relations 为列表。没有可靠关系时返回 []；有关系时只输出一�
 - conflicts：新内容与可明确定位的旧 intent 存在冲突，但无法据此确认替代关系或哪一方当前有效。没有充分裁决依据时，intent_updates 应为 []。
 
 同一性与关联判断规则：
-1. canonical_key、主题、地点、人物或关键词相近只能帮助定位，不能单独证明同一性或替代关系。
+1. 主题、地点、人物或关键词相近只能帮助定位，不能单独证明同一性或替代关系。
 2. goal：核心主体与 desired_outcome 必须相容，指向同一持续性结果。
 3. plan：核心参与主体与 event_or_activity 必须相容。不同日期的相似活动通常是不同安排；明确说明是原安排的改期、补充或调整时，才应关联旧对象。
 4. work_item：负责人、核心 action_text 与交付物必须相容。相似动作但不同交付物、不同责任或独立的一次任务，不应合并。

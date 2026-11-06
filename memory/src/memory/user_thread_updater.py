@@ -64,7 +64,7 @@ class UserThreadUpdater:
         for activity in activities:
             facts = self._db.get_memory_facts_by_ids(activity['evidence_fact_ids'])
             fact_views = [{key: fact.get(key) for key in (
-                'id', 'summary', 'fact_topic', 'entities', 'keywords',
+                'id', 'summary',
                 'dialogue_time_key', 'event_time_key',
             )} for fact in facts]
             search_text = '\n'.join([
@@ -85,30 +85,14 @@ class UserThreadUpdater:
             terms = sorted(set(terms), key=lambda term: (-len(term), term))[:32]
             cases.append({
                 'activity': self._activity_view(activity), 'linked_facts': fact_views,
-                'candidate_threads': self._db.search_user_threads(
-                    terms, activity_id=activity['id'], limit=self._candidate_limit,
-                ),
+                'candidate_threads': [
+                    {key: value for key, value in thread.items() if key != 'creation_key'}
+                    for thread in self._db.search_user_threads(
+                        terms, activity_id=activity['id'], limit=self._candidate_limit,
+                    )
+                ],
             })
         return cases
-
-    def _call_llm(self, stage: str, cases: List[Dict[str, Any]]) -> Dict[str, Any]:
-        text = json.dumps(cases, ensure_ascii=False, default=str)
-        language = self._resolve_language(text)
-        templates = {
-            'membership': (USER_THREAD_MEMBERSHIP_PROMPT_ZH, USER_THREAD_MEMBERSHIP_PROMPT_EN),
-            'update': (USER_THREAD_UPDATE_PROMPT_ZH, USER_THREAD_UPDATE_PROMPT_EN),
-        }
-        template = templates[stage][language == 'en']
-        field = 'activity_cases' if stage == 'membership' else 'thread_cases'
-        self._log('memory_user_thread_update', f'{stage}_input', {
-            'prompt_language': language, field: cases,
-        })
-        response = self._llm_client.call_llm(template.format(**{field: text}), stage_name=f"memory_user_thread_{stage}")
-        result = self._llm_client.parse_json_object_from_llm_text(response or '', stage_name=f"memory_user_thread_{stage}")
-        self._log('memory_user_thread_update', f'{stage}_result', {'result': result})
-        if not isinstance(result, dict):
-            raise ValueError(f'Invalid user thread {stage} response')
-        return result
 
     def _build_thread_cases(
         self, cases: List[Dict[str, Any]], result: Dict[str, Any],
@@ -152,9 +136,12 @@ class UserThreadUpdater:
                 target = grouped.setdefault(ref, {
                     'thread_ref': ref, 'existing_thread': existing.get(ref),
                     'proposed_identity': definitions.get(ref), 'new_activity_cases': [],
-                    'recent_events': self._db.get_user_thread_events(
-                        existing[ref]['id'], limit=self._event_context_limit,
-                    ) if ref in existing else [],
+                    'recent_events': [
+                        {key: value for key, value in event.items() if key != 'event_key'}
+                        for event in self._db.get_user_thread_events(
+                            existing[ref]['id'], limit=self._event_context_limit,
+                        )
+                    ] if ref in existing else [],
                     'reference_time': reference_timestamp,
                 })
                 target['new_activity_cases'].append({
@@ -321,10 +308,52 @@ class UserThreadUpdater:
                     (value for value in source_times if value), default=None,
                     key=lambda value: datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(),
                 ) or datetime.now().astimezone().isoformat()
-                membership = self._call_llm('membership', cases)
+                membership_text = '[\n' + ',\n'.join(
+                    json.dumps(case, ensure_ascii=False, separators=(',', ':'), default=str)
+                    for case in cases
+                ) + '\n]'
+                membership_language = self._resolve_language(membership_text)
+                membership_template = (
+                    USER_THREAD_MEMBERSHIP_PROMPT_EN if membership_language == 'en'
+                    else USER_THREAD_MEMBERSHIP_PROMPT_ZH
+                )
+                self._log('memory_user_thread_update', 'membership_input', {
+                    'prompt_language': membership_language, 'activity_cases': cases,
+                })
+                membership_prompt = membership_template.format(activity_cases=membership_text)
+                response = self._llm_client.call_llm(
+                    membership_prompt, stage_name='memory_user_thread_membership',
+                )
+                membership = self._llm_client.parse_json_object_from_llm_text(
+                    response or '', stage_name='memory_user_thread_membership',
+                )
+                self._log('memory_user_thread_update', 'membership_result', {'result': membership})
+                if not isinstance(membership, dict):
+                    raise ValueError('Invalid user thread membership response')
                 thread_cases = self._build_thread_cases(cases, membership, clock)
                 if thread_cases:
-                    result = self._call_llm('update', thread_cases)
+                    update_text = '[\n' + ',\n'.join(
+                        json.dumps(case, ensure_ascii=False, separators=(',', ':'), default=str)
+                        for case in thread_cases
+                    ) + '\n]'
+                    update_language = self._resolve_language(update_text)
+                    update_template = (
+                        USER_THREAD_UPDATE_PROMPT_EN if update_language == 'en'
+                        else USER_THREAD_UPDATE_PROMPT_ZH
+                    )
+                    self._log('memory_user_thread_update', 'update_input', {
+                        'prompt_language': update_language, 'thread_cases': thread_cases,
+                    })
+                    update_prompt = update_template.format(thread_cases=update_text)
+                    response = self._llm_client.call_llm(
+                        update_prompt, stage_name='memory_user_thread_update',
+                    )
+                    result = self._llm_client.parse_json_object_from_llm_text(
+                        response or '', stage_name='memory_user_thread_update',
+                    )
+                    self._log('memory_user_thread_update', 'update_result', {'result': result})
+                    if not isinstance(result, dict):
+                        raise ValueError('Invalid user thread update response')
                     updates = self._validate_updates(thread_cases, result)
                     saved = self._save_updates(thread_cases, updates)
                     for key, values in saved.items():

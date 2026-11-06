@@ -1340,9 +1340,16 @@ class UserStateResolver:
             prompt = template
             for key in ("reference_time", "state_domain", "new_claim_cases", "state_contexts"):
                 value = update_input[key]
-                prompt = prompt.replace("{" + key + "}", json.dumps(
-                    value, ensure_ascii=False, indent=2,
-                ) if isinstance(value, (dict, list)) else str(value or ""))
+                if key in {"new_claim_cases", "state_contexts"}:
+                    text = "[\n" + ",\n".join(
+                        json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                        for item in value
+                    ) + "\n]" if value else "[]"
+                else:
+                    text = json.dumps(
+                        value, ensure_ascii=False, indent=2,
+                    ) if isinstance(value, (dict, list)) else str(value or "")
+                prompt = prompt.replace("{" + key + "}", text)
             parsed = self._llm_client.parse_json_object_from_llm_text(
                 self._llm_client.call_llm(prompt, stage_name='user_state_update_from_user_claims') or "", stage_name='user_state_update_from_user_claims'
             )
